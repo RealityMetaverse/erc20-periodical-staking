@@ -1,14 +1,16 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024 HB Craft.
-
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2024 Reality Metaverse
 pragma solidity 0.8.20;
 
+import "@openzeppelin/contracts/utils/Strings.sol";
 import "../ComplianceCheck.sol";
 
 abstract contract AdministrativeFunctions is ComplianceCheck {
     // ======================================
     // =     Program Parameter Setters      =
     // ======================================
+    using ArrayLibrary for uint256[];
+
     function transferOwnership(address userAddress) external onlyContractOwner {
         require(userAddress != address(0), "new contract owner cannot be zero");
         require(userAddress != msg.sender, "Same with current owner");
@@ -30,282 +32,189 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit RemoveContractAdmin(userAddress);
     }
 
-    function setDefaultStakingTarget(uint256 newStakingTarget) external onlyContractOwner {
-        defaultStakingTarget = newStakingTarget;
-
-        emit UpdateDefaultStakingTarget(newStakingTarget);
-    }
-
-    function setDefaultMinimumDeposit(uint256 newDefaultMinimumDeposit) external onlyContractOwner {
-        if (newDefaultMinimumDeposit == 0) revert InvalidArgumentValue("Minimum Deposit", 1);
-        defaultMinimumDeposit = newDefaultMinimumDeposit;
-
-        emit UpdateDefaultMinimumDeposit(newDefaultMinimumDeposit);
-    }
-
-    /// @notice Adds a new, empty StakingPool instance to the stakingPoolList
-    function _addStakingPool(
-        PoolType typeToSet,
-        uint256 stakingTargetToSet,
-        uint256 minimumDepositToSet,
-        bool stakingAvailabilityStatus,
-        uint256 APYToSet
-    ) private {
-        StakingPool storage targetPool = stakingPoolList.push();
-        targetPool.poolType = typeToSet;
-        targetPool.stakingTarget = stakingTargetToSet;
-        targetPool.minimumDeposit = minimumDepositToSet;
-        targetPool.isStakingOpen = stakingAvailabilityStatus;
-        targetPool.isWithdrawalOpen = (typeToSet == PoolType.LOCKED) ? false : true;
-        targetPool.isInterestClaimOpen = true;
-        targetPool.APY = APYToSet;
-
-        emit AddStakingPool(
-            stakingPoolList.length - 1,
-            typeToSet,
-            stakingTargetToSet,
-            APYToSet / FIXED_POINT_PRECISION,
-            minimumDepositToSet
-        );
-    }
-
-    /// @dev Adds a pool with custom set properties
-    function addStakingPoolCustom(
-        PoolType typeToSet,
-        uint256 stakingTargetToSet,
-        uint256 minimumDepositToSet,
-        bool stakingAvailabilityStatus,
-        uint256 APYToSet
-    ) external onlyContractOwner {
-        if (minimumDepositToSet == 0) revert InvalidArgumentValue("Minimum Deposit", 1);
-        if (APYToSet == 0) revert InvalidArgumentValue("APY", 1);
-        _addStakingPool(
-            typeToSet,
-            stakingTargetToSet,
-            minimumDepositToSet,
-            stakingAvailabilityStatus,
-            APYToSet * FIXED_POINT_PRECISION
-        );
-    }
-
-    /**
-     * @notice
-     *     - Adds a new empty StakingPool instances
-     *     - Sets its stakingTarget to defaultStakingTarget
-     *     - Sets its minimumDeposit to defaultMinimumDeposit
-     *     - Sets isStakingOpen true
-     *     - Sets isWithdrawalOpen false
-     *     - Sets isInterestClaimOpen true
-     *
-     */
-    function addStakingPoolDefault(PoolType typeToSet, uint256 APYToSet) external onlyContractOwner {
-        if (APYToSet == 0) revert InvalidArgumentValue("APY", 1);
-        _addStakingPool(typeToSet, defaultStakingTarget, defaultMinimumDeposit, true, APYToSet * FIXED_POINT_PRECISION);
-    }
-
-    /**
-     * @dev
-     *     - Changes availabilty properties of all the staking pools to the predefined property settings except the ones ended
-     *     - The function is used in resumeProgram
-     *
-     */
-    function _resetProgramSettings() private {
-        for (uint256 poolNumber = 0; poolNumber < stakingPoolList.length; poolNumber++) {
-            if (!_checkIfPoolEnded(poolNumber, true)) {
-                changePoolAvailabilityStatus(poolNumber, 0, true);
-                changePoolAvailabilityStatus(poolNumber, 2, true);
-                if (stakingPoolList[poolNumber].poolType == PoolType.LOCKED) {
-                    changePoolAvailabilityStatus(poolNumber, 1, false);
-                } else {
-                    changePoolAvailabilityStatus(poolNumber, 1, true);
-                }
-            }
-        }
-    }
-
-    // ======================================
-    // =     Program Control Functions      =
-    // ======================================
-    /// @dev Functions to easily pause or resume the program
-
-    /**
-     * @notice
-     *     - Sets isStakingOpen parameter of all the staking pools to false
-     *     - Sets isWithdrawalOpen parameter of all the staking pools to false
-     *     - Sets isInterestClaimOpen parameter of all the staking pools to false
-     *
-     */
-    function pauseProgram() external onlyContractOwner {
-        _changeAllPoolAvailabilityStatus(0, false);
-        _changeAllPoolAvailabilityStatus(1, false);
-        _changeAllPoolAvailabilityStatus(2, false);
-
-        emit PauseProgram();
-    }
-
-    /**
-     * @notice
-     *     - Sets isStakingOpen parameter of all the staking pools to true
-     *     - Sets isWithdrawalOpen parameter of all LOCKED staking pools to false
-     *     - Sets isWithdrawalOpen parameter of all FLEXIBLE staking pools to true
-     *     - Sets isInterestClaimOpen parameter of all the staking pools to true
-     *
-     */
-    function resumeProgram() external onlyContractOwner {
-        _resetProgramSettings();
-
-        emit ResumeProgram();
-    }
-
-    // ======================================
-    // =       Pool Parameter Setters       =
-    // ======================================
-    function setPoolStakingTarget(uint256 poolID, uint256 newStakingTarget)
+    function pushStakingPhase(uint256[] memory apyForEachStakingPeriod, uint256[] memory targetForEachStakingPeriod)
         external
         onlyContractOwner
-        ifPoolExists(poolID)
-        ifPoolEnded(poolID)
     {
-        stakingPoolList[poolID].stakingTarget = newStakingTarget;
+        uint256 stakingPeriodCount = stakingPeriodList.length;
+        if (apyForEachStakingPeriod.length != stakingPeriodCount) revert ArrayLengthDoesntMatch("apyForEachStakingPeriod", stakingPeriodCount);
+        if (targetForEachStakingPeriod.length != stakingPeriodCount) revert ArrayLengthDoesntMatch("targetForEachStakingPeriod", stakingPeriodCount);
 
-        emit UpdateStakingTarget(poolID, newStakingTarget);
+        uint256 newStakingPhaseIndex = stakingPhaseCount;
+        for (uint256 i = 0; i < stakingPeriodCount; i++) {
+            if (apyForEachStakingPeriod[i] == 0) revert InvalidArgumentValue("APY", 1);
+            phasePeriodDataList[DataType.APY][newStakingPhaseIndex][stakingPeriodList[i]] = apyForEachStakingPeriod[i];
+            phasePeriodDataList[DataType.STAKING_TARGET][newStakingPhaseIndex][stakingPeriodList[i]] = targetForEachStakingPeriod[i];
+        }
+        
+        stakingPhaseCount += 1;
+
+        emit AddStakingPhase(
+            newStakingPhaseIndex
+        );
     }
 
-    function changePoolAvailabilityStatus(uint256 poolID, uint256 parameterToChange, bool valueToAssign)
+    function popStakingPhase() external onlyContractOwner {
+        uint256 lastStakingPhase = stakingPhaseCount - 1;
+
+        for (uint256 periodIndex = 0; periodIndex < stakingPeriodList.length; periodIndex++) {
+            delete phasePeriodDataList[DataType.APY][lastStakingPhase][stakingPeriodList[periodIndex]];
+            delete phasePeriodDataList[DataType.STAKING_TARGET][lastStakingPhase][stakingPeriodList[periodIndex]];
+        }
+
+        stakingPhaseCount -= 1;
+        if (currentStakingPhase != 0 && currentStakingPhase == stakingPhaseCount) currentStakingPhase -= 1;
+        
+        emit RemoveStakingPhase(
+            lastStakingPhase
+        );
+    }
+
+    function addStakingPeriod(uint256 newStakingPeriod, uint256[] memory apyForEachStakingPhase, uint256[] memory targetForEachStakingPhase)
+        external
+        onlyContractOwner
+    {
+        if (stakingPhaseCount == 0) revert NoStakingPhasesAddedYet();
+        if (_checkIfStakingPeriodExists(newStakingPeriod)) revert StakingPeriodExists(newStakingPeriod);
+
+        if (apyForEachStakingPhase.length != stakingPhaseCount) revert ArrayLengthDoesntMatch("apyForEachStakingPhase", stakingPhaseCount);
+        if (targetForEachStakingPhase.length != stakingPhaseCount) revert ArrayLengthDoesntMatch("targetForEachStakingPhase", stakingPhaseCount);
+
+        stakingPeriodList.push(newStakingPeriod);
+        stakingPeriodList.sortStorage();
+
+        for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
+            if (apyForEachStakingPhase[phase] == 0) revert InvalidArgumentValue("APY", 1);
+            phasePeriodDataList[DataType.APY][phase][newStakingPeriod] = apyForEachStakingPhase[phase];
+            phasePeriodDataList[DataType.STAKING_TARGET][phase][newStakingPeriod] = targetForEachStakingPhase[phase];
+        }
+
+        emit AddStakingPeriod(newStakingPeriod);
+    }
+
+    function removeStakingPeriod(uint256 stakingPeriod) external onlyContractOwner {
+        if (_checkIfStakingPeriodExists(stakingPeriod)) {
+            for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
+                delete phasePeriodDataList[DataType.APY][phase][stakingPeriod];
+                delete phasePeriodDataList[DataType.STAKING_TARGET][phase][stakingPeriod];
+            }
+
+            stakingPeriodList.removeElementByIndex(
+                stakingPeriodList.findElementIndex(stakingPeriod)
+            );
+        } else revert StakingPeriodDoesNotExist(stakingPeriod);
+
+        emit RemoveStakingPeriod(stakingPeriod);
+    }
+
+    function setStakingTarget(uint256 stakingPhase, uint256 stakingPeriod, uint256 newStakingTarget)
+        external
+        onlyContractOwner
+    {
+        if(!_checkIfStakingPhaseExists(stakingPhase)) revert StakingPhaseDoesNotExist(stakingPhase);
+        if (!_checkIfStakingPeriodExists(stakingPeriod)) revert StakingPeriodDoesNotExist(stakingPeriod);
+        phasePeriodDataList[DataType.STAKING_TARGET][stakingPhase][stakingPeriod] = newStakingTarget;
+
+        emit UpdateStakingTarget(stakingPhase, stakingPeriod, newStakingTarget);
+    }
+
+    function setAPY(uint256 stakingPhase, uint256 stakingPeriod, uint256 newAPY)
         public
         onlyContractOwner
-        ifPoolExists(poolID)
-        ifPoolEnded(poolID)
+    {
+        if (!_checkIfStakingPhaseExists(stakingPhase)) revert StakingPhaseDoesNotExist(stakingPhase);
+        if (!_checkIfStakingPeriodExists(stakingPeriod)) revert StakingPeriodDoesNotExist(stakingPeriod);
+
+        if (newAPY == 0) revert InvalidArgumentValue("APY", 1);
+
+        phasePeriodDataList[DataType.APY][stakingPhase][stakingPeriod] = newAPY;
+        emit UpdateAPY(stakingPhase, stakingPeriod, newAPY);
+    }
+
+    function setMiniumumDeposit(uint256 newMinimumDeposit)
+        external
+        onlyContractOwner
+    {
+        if (newMinimumDeposit == 0) revert InvalidArgumentValue("Minimum Deposit", 1);
+        minimumDeposit = newMinimumDeposit;
+
+        emit UpdateMinimumDeposit(newMinimumDeposit);
+    }
+
+    function changeAvailabilityStatus(uint256 parameterToChange, bool valueToAssign)
+        external
+        onlyContractOwner
     {
         require(parameterToChange < 3, "Invalid Parameter");
 
         if (parameterToChange == 0) {
-            stakingPoolList[poolID].isStakingOpen = valueToAssign;
+            isStakingOpen = valueToAssign;
 
-            emit UpdateStakingStatus(msg.sender, poolID, valueToAssign);
+            emit UpdateStakingStatus(msg.sender, valueToAssign);
         } else if (parameterToChange == 1) {
-            stakingPoolList[poolID].isWithdrawalOpen = valueToAssign;
+            isWithdrawalOpen = valueToAssign;
 
-            emit UpdateWithdrawalStatus(msg.sender, poolID, valueToAssign);
+            emit UpdateWithdrawalStatus(msg.sender, valueToAssign);
         } else if (parameterToChange == 2) {
-            stakingPoolList[poolID].isInterestClaimOpen = valueToAssign;
+            isClaimOpen = valueToAssign;
 
-            emit UpdateInterestClaimStatus(msg.sender, poolID, valueToAssign);
+            emit UpdateClaimStatus(msg.sender, valueToAssign);
         }
     }
 
-    /// @dev Changes availabilty properties of all the staking pools except the ones ended
-    function _changeAllPoolAvailabilityStatus(uint256 parameterToChange, bool valueToAssign) private {
-        for (uint256 poolNumber = 0; poolNumber < stakingPoolList.length; poolNumber++) {
-            if (!_checkIfPoolEnded(poolNumber, true)) {
-                changePoolAvailabilityStatus(poolNumber, parameterToChange, valueToAssign);
-            }
-        }
-    }
-
-    function setPoolAPY(uint256 poolID, uint256 newAPY)
-        public
-        onlyContractOwner
-        ifPoolExists(poolID)
-        ifPoolEnded(poolID)
-    {
-        if (newAPY == 0) revert InvalidArgumentValue("APY", 1);
-
-        uint256 APYValueToWei = newAPY * FIXED_POINT_PRECISION;
-        require(APYValueToWei != stakingPoolList[poolID].APY, "The same as current APY");
-
-        stakingPoolList[poolID].APY = APYValueToWei;
-        emit UpdateAPY(poolID, newAPY);
-    }
-
-    function setPoolMiniumumDeposit(uint256 poolID, uint256 newMinimumDeposit)
-        external
-        onlyContractOwner
-        ifPoolExists(poolID)
-        ifPoolEnded(poolID)
-    {
-        if (newMinimumDeposit == 0) revert InvalidArgumentValue("Minimum Deposit", 1);
-        stakingPoolList[poolID].minimumDeposit = newMinimumDeposit;
-
-        emit UpdateMinimumDeposit(poolID, newMinimumDeposit);
-    }
-
-    /**
-     * @notice
-     *     - Sets endDate property of a StakingPool to the date and time the function called
-     *     - Sets isStakingOpen property of the StakingPoll to false
-     *     - Sets isWithDrawal property of the StakingPoll to true
-     *     - Sets isInterestClaimOpen property of the StakingPoll to true
-     *
-     */
-    function endStakingPool(uint256 poolID, uint256 _confirmationCode)
-        external
-        onlyContractOwner
-        ifPoolExists(poolID)
-        ifPoolEnded(poolID)
-    {
-        require(_confirmationCode == CONFIRMATION_CODE, "Incorrect Code");
-        changePoolAvailabilityStatus(poolID, 0, false);
-        changePoolAvailabilityStatus(poolID, 1, true);
-        changePoolAvailabilityStatus(poolID, 2, true);
-        stakingPoolList[poolID].endDate = block.timestamp;
-
-        emit EndStakingPool(poolID);
+    function changeStakingPhase(uint256 phaseToSwitch) external onlyContractOwner {
+        if (stakingPhaseCount == 0) revert NoStakingPhasesAddedYet();
+        if (phaseToSwitch >= stakingPhaseCount) revert StakingPhaseDoesNotExist(phaseToSwitch);
+        currentStakingPhase = phaseToSwitch;
     }
 
     // ======================================
     // =     FUND MANAGEMENT FUNCTIONS      =
     // ======================================
-    /// @dev Collects staked funds from the target StakingPool
-    function collectFunds(uint256 poolID, uint256 tokenAmount)
+    /// @dev Collects staked funds
+    function collectFunds(uint256 tokenAmount)
         external
         nonReentrant
         onlyContractOwner
-        ifPoolExists(poolID)
-        ifPoolEnded(poolID)
-        enoughFundsAvailable(poolID, tokenAmount)
     {
-        StakingPool storage targetPool = stakingPoolList[poolID];
-        targetPool.totalList[DataType.FUNDS_COLLECTED] += tokenAmount;
+        _checkIfEnoughFundsAvailable(tokenAmount);
+        totalDataList[DataType.FUNDS_COLLECTED] += tokenAmount;
 
-        emit CollectFunds(msg.sender, poolID, tokenAmount);
+        emit CollectFunds(msg.sender, tokenAmount);
         _sendToken(msg.sender, tokenAmount);
     }
 
-    /// @dev Restores funds collected from the target StakingPool
-    function restoreFunds(uint256 poolID, uint256 tokenAmount) external nonReentrant ifPoolExists(poolID) onlyAdmins {
-        StakingPool storage targetPool = stakingPoolList[poolID];
+    /// @dev Restores funds collected
+    function restoreFunds(uint256 tokenAmount) external nonReentrant onlyAdmins {
         uint256 remainingFundsToRestore =
-            targetPool.totalList[DataType.FUNDS_COLLECTED] - targetPool.totalList[DataType.FUNDS_RESTORED];
+            totalDataList[DataType.FUNDS_COLLECTED] - totalDataList[DataType.FUNDS_RESTORED];
 
-        if (tokenAmount > remainingFundsToRestore) {
-            revert RestorationExceedsCollected(tokenAmount, remainingFundsToRestore);
-        }
+        if (tokenAmount > remainingFundsToRestore) revert RestorationExceedsCollected(tokenAmount, remainingFundsToRestore);
 
-        targetPool.fundRestorerList[msg.sender] += tokenAmount;
-        targetPool.totalList[DataType.FUNDS_RESTORED] += tokenAmount;
+        userDataList[DataType.FUNDS_RESTORED][msg.sender] += tokenAmount;
+        totalDataList[DataType.FUNDS_RESTORED] += tokenAmount;
 
-        emit RestoreFunds(msg.sender, poolID, tokenAmount);
+        emit RestoreFunds(msg.sender, tokenAmount);
         _receiveToken(tokenAmount);
     }
 
-    function collectInterestPoolFunds(uint256 tokenAmount)
+    function collectRewardPoolFunds(uint256 tokenAmount)
         external
         nonReentrant
         onlyContractOwner
-        enoughFundsInInterestPool(tokenAmount)
     {
-        interestPool -= tokenAmount;
+        _checkIfEnoughFundsInRewardPool(tokenAmount, true);
+        rewardPool -= tokenAmount;
 
-        emit CollectInterest(msg.sender, tokenAmount);
+        emit CollectReward(msg.sender, tokenAmount);
         _sendToken(msg.sender, tokenAmount);
     }
 
-    function provideInterest(uint256 tokenAmount) external nonReentrant onlyAdmins {
-        interestProviderList[msg.sender] += tokenAmount;
-        interestPool += tokenAmount;
+    function provideReward(uint256 tokenAmount) external nonReentrant onlyAdmins {
+        rewardProviderList[msg.sender] += tokenAmount;
+        rewardPool += tokenAmount;
 
-        emit ProvideInterest(msg.sender, tokenAmount);
+        emit ProvideReward(msg.sender, tokenAmount);
         _receiveToken(tokenAmount);
     }
 }

@@ -1,110 +1,127 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024 HB Craft.
-
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2024 Reality Metaverse
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+import "./AuxiliaryLibraries.sol";
 
 contract ProgramManager {
     // ======================================
     // =          State Variables           =
     // ======================================
-    IERC20Metadata public immutable STAKING_TOKEN;
-    uint256 internal constant FIXED_POINT_PRECISION = 10 ** 18;
-
-    // Default value to set the stakingTarget property for the new StakingPool if not specified
-    uint256 internal defaultStakingTarget;
-    // Default value to set the minimumDeposit property for the new StakingPool if not specified
-    uint256 internal defaultMinimumDeposit;
-
-    /**
-     *     - For preventing accidentally ending a stakingPool
-     *     - Set when the contract is deployed
-     *     - Asked when endPool() function is called
-     */
-    uint256 internal immutable CONFIRMATION_CODE;
-
-    /// Program token balance for paying interests
-    uint256 internal interestPool;
-    /**
-     *   - The list of users who donated/provided tokens to the interestPool
-     *   - Direct token transactions (via receive function) ends up in the interestPool
-     */
-    mapping(address => uint256) internal interestProviderList;
+    using ArrayLibrary for uint256[];
 
     /**
      *   - Each user can make infinite amount of deposits
-     *   - A user's data for each deposit is kept seperately in stakingPoolList[poolID].stakerDepositList[userAddress]
+     *   - A user's data for each deposit is kept seperately in stakerDepositList[userAddress]
      */
     struct TokenDeposit {
-        uint256 stakingDate;
-        uint256 withdrawalDate;
+        uint256 stakingPhase;
+        uint256 stakingPeriod;
+        uint256 stakingStartDate;
+        uint256 stakingEndDate;
+        uint256 claimOrWithdrawalDate;
         uint256 amount;
         uint256 APY;
-        uint256 claimedInterest;
+        uint256 rewardGenerated;
     }
 
-    /**
-     *     - The contract has ability to create 2 types of staking pools: LOCKED, FLEXIBLE
-     *     - LOCKED staking pools' isWithdrawalOpen parameter is false by default
-     *     - FLEXIBLE staking pools' isWithdrawalOpen parameter is true by default
-     */
-    enum PoolType {
-        LOCKED,
-        FLEXIBLE
+    enum DepositStatus {
+        WITHDRAWN,
+        CLAIMED,
+        TIME_LEFT,
+        READY_TO_CLAIM,
+        INDEFINITE
     }
 
-    // DataType and PoolDataType are used for cleaner communication among the contract functions
     enum DataType {
+        STAKING_TARGET,
+        APY,
         STAKED,
-        WITHDREW,
-        INTEREST_CLAIMED,
+        PERIODICAL_STAKED,
+        PERIODICAL_WITHDRAWN,
+        PERIODICAL_STAKING_CLAIMED,
+        PERIODICAL_REWARD_EXPECTED,
+        PERIODICAL_REWARD_CLAIMED,
+        INDEFINITE_STAKED,
+        INDEFINITE_WITHDRAWN,
+        INDEFINITE_REWARD_CLAIMED,
         FUNDS_COLLECTED,
         FUNDS_RESTORED
     }
-    enum PoolDataType {
-        IS_STAKING_OPEN,
-        IS_WITHDRAWAL_OPEN,
-        IS_INTEREST_CLAIM_OPEN
-    }
 
-    enum ActionType {
-        STAKING,
-        WITHDRAWAL,
-        INTEREST_CLAIM
-    }
+
+    IERC20Metadata public immutable STAKING_TOKEN;
+    uint256 internal constant FIXED_POINT_PRECISION = 10 ** 18;
+
+    uint256 public minimumDeposit;
+    // Program token balance for paying rewards
+    uint256 public rewardPool;
+    
+    bool public isStakingOpen;
+    bool public isWithdrawalOpen;
+    bool public isClaimOpen;
+
+    uint256 currentStakingPhase;
+    uint256 stakingPhaseCount;
+    // Staking periods are in days
+    uint256[] stakingPeriodList;
+    address[] stakerAddressList;
+    
+    // The list of users who donated/provided tokens to the rewardPool
+    mapping(address => uint256) internal rewardProviderList;
+    mapping(address => TokenDeposit[]) stakerDepositList;
+    mapping(address => uint256) stakerActiveDepositStartIndex;
+    mapping(DataType => mapping(uint256 => mapping(uint256 => uint256))) phasePeriodDataList;
+    mapping(DataType => mapping(address => uint256)) userDataList;
+    mapping(DataType => uint256) totalDataList;
+
 
     /**
-     *     - Contract owners create as many pools as they want for different purposes
-     *     - StakingPool's totalList[DataType.STAKED] parameter value can not be higher than stakingTarget
+     * @dev
+     *     - Exception raised when 0 is provided as pool minimum deposit
+     *     - Exception raised when 0 is provided as APY
+     *
      */
-    /**
-     *     - The endDate is set via endPool function when no more interest is intended to be paid after certain period of time
-     *     - If the current time has passed the endDate, endDate is used when calculating the interests
-     */
-    struct StakingPool {
-        uint256 stakingTarget;
-        uint256 minimumDeposit;
-        uint256 APY;
-        uint256 endDate;
-        bool isStakingOpen;
-        bool isWithdrawalOpen;
-        bool isInterestClaimOpen;
-        PoolType poolType;
-        address[] stakerAddressList;
-        mapping(address => uint256) stakerList;
-        mapping(address => TokenDeposit[]) stakerDepositList;
-        mapping(address => uint256) withdrawerList;
-        mapping(address => uint256) interestClaimerList;
-        mapping(address => uint256) fundRestorerList;
-        mapping(DataType => uint256) totalList;
-    }
+    error InvalidArgumentValue(string argument, uint256 minValue);
+    /// @dev Exception raised if an array has a repetitve element
+    error ArrayHasRepetitiveElement(string arrayName);
+    /// @dev Exception raised if the length of an array does not match the expected length
+    error ArrayLengthDoesntMatch(string arrayName, uint256 expectedLength);
+    
+    constructor(
+        IERC20Metadata _stakingToken,
+        uint256 _stakingPhaseCount,
+        uint256[] memory stakingPeriods,
+        uint256[][] memory phasePeriodAPYs,
+        uint256[][] memory phasePeriodStakingTargets
+        ) {
+        if (stakingPeriods.hasRepetitions()) revert ArrayHasRepetitiveElement("stakingPeriods");
+        if (phasePeriodAPYs.length != _stakingPhaseCount) revert ArrayLengthDoesntMatch("phasePeriodAPYs", _stakingPhaseCount);
+        if (phasePeriodStakingTargets.length != _stakingPhaseCount) revert ArrayLengthDoesntMatch("phasePeriodStakingTargets", _stakingPhaseCount);
 
-    // The list holding all the created pools
-    StakingPool[] internal stakingPoolList;
+        stakingPeriods.sortMemory();
 
-    constructor(IERC20Metadata _stakingToken, uint256 _confirmationCode) {
+        for (uint256 phase = 0; phase < _stakingPhaseCount; phase++) {
+            if (phasePeriodAPYs[phase].length != stakingPeriods.length) revert ArrayLengthDoesntMatch(string.concat("phasePeriodAPYs[",Strings.toString(phase),"]"), stakingPeriods.length);
+            if (phasePeriodStakingTargets[phase].length != stakingPeriods.length) revert ArrayLengthDoesntMatch(string.concat("phasePeriodStakingTargets[",Strings.toString(phase),"]"), stakingPeriods.length);
+
+            for (uint256 period = 0; period < stakingPeriods.length; period++) {
+                if (phasePeriodAPYs[phase][period] == 0) revert InvalidArgumentValue("APY", 1);
+                phasePeriodDataList[DataType.APY][phase][stakingPeriods[period]] = phasePeriodAPYs[phase][period];
+                phasePeriodDataList[DataType.STAKING_TARGET][phase][stakingPeriods[period]] = phasePeriodStakingTargets[phase][period];
+            }
+        }
+
         STAKING_TOKEN = _stakingToken;
-        CONFIRMATION_CODE = _confirmationCode;
+        minimumDeposit = 1;
+
+        isStakingOpen = true;
+        isWithdrawalOpen = true;
+        isClaimOpen = true;
+
+        stakingPhaseCount = _stakingPhaseCount;
+        stakingPeriodList = stakingPeriods;
     }
 }

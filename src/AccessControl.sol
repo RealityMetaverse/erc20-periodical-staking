@@ -1,6 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024 HB Craft.
-
+// SPDX-License-Identifier: BUSL-1.1
+// Copyright 2024 Reality Metaverse
 pragma solidity 0.8.20;
 
 import "./ProgramManager.sol";
