@@ -10,7 +10,7 @@ abstract contract AccessControl is ProgramManager {
     // ======================================
     /**
      *     - Certain functions can be called only if you have the matching AccessTier requirement
-     *     - Tier 2 - Contract Owner, Tier 1 - Contract Admins, Tier 0 - Users
+     *     - Tier 1 - Contract Owner, Tier 0 - Contract Admins
      *     - Check ComplianceCheck.sol for more info
      */
     enum AccessTier {

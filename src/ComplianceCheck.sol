@@ -8,22 +8,30 @@ import "./AccessControl.sol";
 
 abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20Metadata;
+    using ArrayLibrary for uint256[];
 
     // ======================================
     // =              Errors                =
     // ======================================
-    error NotOpen(string _action);
+    error NotOpen(DataType action);
     error NoStakingPhasesAddedYet();
-    error StakingPeriodExists(uint256 stakingPeriod);
+    error IncorrectStakingPhase(uint256 expectedPhase, uint256 currentPhase);
     error StakingPhaseDoesNotExist(uint256 stakingPhase);
+    error StakingPeriodExists(uint256 stakingPeriod);
     error StakingPeriodDoesNotExist(uint256 stakingPeriod);
     error DepositDoesNotExist(uint256 depositNumber);
     error AmountExceedsTarget(uint256 stakingPhase, uint256 stakingPeriod, uint256 stakingTarget);
-    error RestorationExceedsCollected(uint256 _tokenSent, uint256 _RemainingAmountToRestore);
     error InsufficentDeposit(uint256 _tokenSent, uint256 _requiredAmount);
-    error NotEnoughFunds(uint256 requestedAmount, uint256 availableAmount);
-    error NotEnoughFundsInRewardPool(uint256 requestedAmount, uint256 availableAmount);    
-    error IncorrectStakingPhase(uint256 expectedPhase, uint256 currentPhase);
+    error PhasePeriodAPYChanged(uint256 stakingPhase, uint256 stakingPeriod, uint256 currentAPY);
+    error NotEnoughFundsInRewardPool(uint256 requestedAmount, uint256 availableAmount);
+    error NoRewardToClaim(uint256 depositNumber);
+    error InvalidAPY(uint256 providedValue, uint256 minValue);
+    error InvalidMinimumDeposit(uint256 providedValue, uint256 minValue);
+    error InvalidDataType();
+    error NotWithdrawable(uint256 depositNumber);
+    error NotClaimable(uint256 depositNumber);
+    error ArrayLengthDoesntMatch(uint256 expectedLength);
+    error ZeroAddressProvided();
 
     // ======================================
     // =             Functions              =
@@ -35,75 +43,94 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
     }
 
     function _checkIfTargetReached(uint256 stakingPhase, uint256 stakinPeriod, uint256 amountToStake) internal view {
-        uint256 stakingTarget = phasePeriodDataList[DataType.STAKING_TARGET][stakingPhase][stakinPeriod];
-        uint256 totalStaked = phasePeriodDataList[DataType.STAKED][stakingPhase][stakinPeriod];
+        uint256 stakingTarget = phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][stakingPhase][stakinPeriod];
+        uint256 totalStaked = phasePeriodDataList[PhasePeriodDataType.STAKED][stakingPhase][stakinPeriod];
 
-        if ((amountToStake + totalStaked) > totalStaked) revert AmountExceedsTarget(stakingPhase, stakinPeriod, stakingTarget);
+        if ((amountToStake + totalStaked) > stakingTarget) {
+            revert AmountExceedsTarget(stakingPhase, stakinPeriod, stakingTarget);
+        }
     }
 
-    function _checkIfEnoughFundsAvailable(uint256 amountToCheck) internal view {
-        uint256 fundAvailableToClaim = totalDataList[DataType.PERIODICAL_STAKED] + totalDataList[DataType.INDEFINITE_STAKED] - (totalDataList[DataType.FUNDS_COLLECTED] - totalDataList[DataType.FUNDS_RESTORED]);
-        if (amountToCheck > fundAvailableToClaim) revert NotEnoughFunds(amountToCheck, fundAvailableToClaim);
-        
-    }
-
-    function _checkIfEnoughFundsInRewardPool(uint256 amountToCheck, bool mustRevert) internal view returns(bool) {
+    function _checkIfEnoughFundsInRewardPool(uint256 amountToCheck, bool mustRevert) internal view returns (bool) {
         if (amountToCheck > rewardPool) {
-            if(mustRevert) revert NotEnoughFundsInRewardPool(amountToCheck, rewardPool);
+            if (mustRevert) revert NotEnoughFundsInRewardPool(amountToCheck, rewardPool);
             else return false;
-        } else return true;
+        } else {
+            return true;
+        }
     }
 
-    function _checkIfStakingPhaseExists(uint256 stakingPhase) internal view returns (bool) {
+    function checkIfStakingPhaseExists(uint256 stakingPhase) public view returns (bool) {
         if (stakingPhase < stakingPhaseCount) return true;
         return false;
     }
 
-    function _checkIfStakingPeriodExists(uint256 stakingPeriod) internal view returns (bool) {
-        if (phasePeriodDataList[DataType.APY][0][stakingPeriod] != 0) return true;
-        return false;
+    function checkIfStakingPeriodExists(uint256 stakingPeriod) public view returns (bool) {
+        if (stakingPeriodList.length == stakingPeriodList.findElementIndex(stakingPeriod)) return false;
+        else return true;
+    }
+
+    function _checkIfStakingPhasePeriodExists(uint256 stakingPhase, uint256 stakingPeriod) internal view {
+        if (!checkIfStakingPhaseExists(stakingPhase)) revert StakingPhaseDoesNotExist(stakingPhase);
+        if (!checkIfStakingPeriodExists(stakingPeriod)) revert StakingPeriodDoesNotExist(stakingPeriod);
     }
 
     function checkDepositStatus(address userAddress, uint256 depositNumber) public view returns (DepositStatus) {
         TokenDeposit memory targetDeposit = stakerDepositList[userAddress][depositNumber];
-        if (targetDeposit.claimOrWithdrawalDate == 0){
-            if (targetDeposit.stakingEndDate == 0) return DepositStatus.INDEFINITE;
-            
-            if (block.timestamp >= targetDeposit.stakingEndDate) return DepositStatus.READY_TO_CLAIM;
-            else return DepositStatus.TIME_LEFT;
+        if (targetDeposit.withdrawalDate == 0) {
+            return (targetDeposit.stakingEndDate == 0)
+                ? DepositStatus.INDEFINITE
+                : (
+                    (block.timestamp >= targetDeposit.stakingEndDate)
+                        ? DepositStatus.READY_TO_CLAIM
+                        : DepositStatus.TIME_LEFT
+                );
         }
-        else if (targetDeposit.claimOrWithdrawalDate < targetDeposit.stakingEndDate) return DepositStatus.WITHDRAWN;
-        else if (targetDeposit.claimOrWithdrawalDate >= targetDeposit.stakingEndDate) return DepositStatus.CLAIMED;
+        return (targetDeposit.withdrawalDate < targetDeposit.stakingEndDate)
+            ? DepositStatus.WITHDRAWN
+            : DepositStatus.CLAIMED;
+    }
+
+    function checkActionAvailability(DataType action) public view returns (bool) {
+        uint8 enumIndex = uint8(action);
+        if (enumIndex > 2) revert InvalidDataType();
+
+        return actionAvailabilityStatuses[action];
+    }
+
+    function _checkIfLegitStakeRequest(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount)
+        internal
+        view
+    {
+        if (tokenAmount < minimumDeposit) revert InsufficentDeposit(tokenAmount, minimumDeposit);
+
+        if (stakingPhase != currentStakingPhase) revert IncorrectStakingPhase(stakingPhase, currentStakingPhase);
+        _checkIfStakingPhasePeriodExists(stakingPhase, stakingPeriod);
+
+        _checkIfTargetReached(stakingPhase, stakingPeriod, tokenAmount);
     }
 
     // ======================================
     // =             Modifiers              =
     // ======================================
+    modifier ifAvailable(DataType action) {
+        if (!checkActionAvailability(action)) revert NotOpen(action);
+        _;
+    }
+
     modifier ifDepositExists(uint256 depositNumber) {
         _checkDepositExistence(depositNumber);
         _;
     }
 
-    /// @dev Checks if the deposit amount is higher the minimum required amount, raises exception if not
-    modifier enoughTokenSent(uint256 tokenSent, uint256 _minimumDeposit) {
-        if (tokenSent < _minimumDeposit) {
-            revert InsufficentDeposit(tokenSent, _minimumDeposit);
-        }
+    modifier ifLegitStakeRequest(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount) {
+        _checkIfLegitStakeRequest(stakingPhase, stakingPeriod, tokenAmount);
         _;
     }
-
 
     // ======================================
     // =              Events                =
     // ======================================
-    event CreateProgram(
-        address stakingTokenAddress,
-        uint256 _stakingPhaseCount,
-        uint256[] stakingPeriods,
-        uint256[][] phasePeriodAPYs,
-        uint256[][] phasePeriodStakingTargets
-    );
-
     event TransferOwnership(address from, address to);
 
     event AddContractAdmin(address indexed user);
@@ -117,36 +144,25 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
         uint256 tokenAmount,
         uint256 depositNumber
     );
-    event WithdrawPeriodical(
-        address indexed by, uint256 depositNumber, uint256 stakedAmount, uint256 rewardLost
-    );
-    event WithdrawIndefinite(
-        address indexed by, uint256 depositNumber, uint256 stakedAmount, uint256 rewardClaimed
-    );
-
-    event ClaimPeriodical(
-        address indexed by, uint256 depositNumber, uint256 stakedAmount, uint256 reward
-    );
-    event ClaimIndefinite(
-        address indexed by, uint256 depositNumber, uint256 reward
-    );
-
-    event CollectFunds(address indexed by, uint256 tokenAmount);
-    event RestoreFunds(address indexed by, uint256 tokenAmount);
+    event Withdraw(address indexed by, uint256 indexed depositNumber, uint256 stakedAmount);
+    event Claim(address indexed by, uint256 indexed depositNumber, uint256 reward);
 
     event ProvideReward(address indexed by, uint256 tokenAmount);
     event CollectReward(address indexed by, uint256 tokenAmount);
 
-    event UpdateStakingTarget(uint256 indexed stakingPhase, uint256 indexed stakingPeriod, uint256 newStakingTarget);
-    event UpdateMinimumDeposit(uint256 newMinimumDeposit);
-    event UpdateAPY(uint256 indexed stakingPhase, uint256 indexed stakingPeriod, uint256 newAPY);
+    event UpdatePhasePeriodData(
+        PhasePeriodDataType indexed dataType,
+        uint256 indexed stakingPhase,
+        uint256 indexed stakingPeriod,
+        uint256 newValue
+    );
 
-    event UpdateStakingStatus(address indexed by, bool isOpen);
-    event UpdateWithdrawalStatus(address indexed by, bool isOpen);
-    event UpdateClaimStatus(address indexed by, bool isOpen);
+    event UpdateMinimumDeposit(uint256 newMinimumDeposit);
+    event UpdateActionAvailability(DataType action, bool isOpen);
 
     event AddStakingPhase(uint256 indexed newStakingPhase);
     event RemoveStakingPhase(uint256 indexed stakingPhase);
+    event ChangeStakingPhase(uint256 indexed to);
 
     event AddStakingPeriod(uint256 indexed newStakingPeriod);
     event RemoveStakingPeriod(uint256 indexed stakingPeriod);
