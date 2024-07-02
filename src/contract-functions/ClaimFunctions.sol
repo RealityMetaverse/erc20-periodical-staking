@@ -10,34 +10,37 @@ abstract contract ClaimFunctions is ReadFunctions, WriteFunctions {
         DepositStatus depositStatus = checkDepositStatus(msg.sender, depositNumber);
         TokenDeposit storage targetDeposit = stakerDepositList[msg.sender][depositNumber];
 
-        uint256 depositAmount;
-        uint256 depositReward;
+        uint256 depositAmount = 0;
+        uint256 depositReward = 0;
+
+        if (depositStatus != DepositStatus.READY_TO_CLAIM && depositStatus != DepositStatus.INDEFINITE) {
+            if (!isBatchClaim) revert NotClaimable(depositNumber);
+            return;
+        }
 
         if (depositStatus == DepositStatus.READY_TO_CLAIM) {
-            targetDeposit.withdrawalDate = block.timestamp;
-
             depositAmount = targetDeposit.amount;
             depositReward = targetDeposit.rewardGenerated;
-
-            userDataList[DataType.REWARD_EXPECTED][msg.sender] -= depositReward;
-            totalDataList[DataType.REWARD_EXPECTED] -= depositReward;
-        } else if (depositStatus == DepositStatus.INDEFINITE) {
+        } else {
             depositReward = _calculateIndefiniteDepositReward(targetDeposit);
 
             if (depositReward == 0) {
                 if (!isBatchClaim) revert NoRewardToClaim(depositNumber);
-                else return;
+                return;
             }
-            
-            targetDeposit.rewardGenerated += depositReward;
-        } else {
-            if (!isBatchClaim) revert NotClaimable(depositNumber);
-            return;
         }
 
         if (!_checkIfEnoughFundsInRewardPool(depositReward, false)) {
             if (!isBatchClaim) revert NotEnoughFundsInRewardPool(depositReward, rewardPool);
             return;
+        }
+
+        if (depositStatus == DepositStatus.READY_TO_CLAIM) {
+            targetDeposit.withdrawalDate = block.timestamp;
+            userDataList[DataType.REWARD_EXPECTED][msg.sender] -= depositReward;
+            totalDataList[DataType.REWARD_EXPECTED] -= depositReward;
+        } else {
+            targetDeposit.rewardGenerated += depositReward;
         }
 
         rewardPool -= depositReward;

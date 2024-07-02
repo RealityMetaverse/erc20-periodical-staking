@@ -38,11 +38,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     function changeActionAvailability(DataType action, bool changeTo) external onlyContractOwner {
-        uint8 enumIndex = uint8(action);
-        if (enumIndex > 2) revert InvalidDataType();
-
         actionAvailabilityStatuses[action] = changeTo;
-
         emit UpdateActionAvailability(action, changeTo);
     }
 
@@ -79,7 +75,6 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         for (uint256 periodIndex = 0; periodIndex < stakingPeriodList.length; periodIndex++) {
             delete phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][lastStakingPhase][stakingPeriodList[periodIndex]];
             delete phasePeriodDataList[PhasePeriodDataType.APY][lastStakingPhase][stakingPeriodList[periodIndex]];
-            delete phasePeriodDataList[PhasePeriodDataType.STAKED][lastStakingPhase][stakingPeriodList[periodIndex]];
         }
 
         stakingPhaseCount -= 1;
@@ -117,7 +112,6 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
             for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
                 delete phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][phase][stakingPeriod];
                 delete phasePeriodDataList[PhasePeriodDataType.APY][phase][stakingPeriod];
-                delete phasePeriodDataList[PhasePeriodDataType.STAKED][phase][stakingPeriod];
             }
 
             stakingPeriodList.removeElementByIndex(stakingPeriodList.findElementIndex(stakingPeriod));

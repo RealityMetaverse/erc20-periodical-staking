@@ -62,7 +62,7 @@ contract ClaimFunctions is AuxiliaryFunctions {
             assertEq(targetDeposit.withdrawalDate, withdrawalDate);
 
             if (stakingPeriod == 0) rewardGenerated = 0;
-            
+
             assertEq(rewardGenerated, targetDeposit.rewardGenerated);
         }
 
@@ -76,7 +76,8 @@ contract ClaimFunctions is AuxiliaryFunctions {
             vm.expectRevert();
             _claimAll();
         } else {
-            (uint256 claimableStaking, uint256 claimablePeriodicalReward, uint256 claimableIndefiniteReward) = stakingContract.checkTotalClaimableData();
+            (uint256 claimableStaking, uint256 claimablePeriodicalReward, uint256 claimableIndefiniteReward) =
+                stakingContract.checkTotalClaimableData();
 
             uint256[] memory currentData = _getCurrentData(userAddress, 0, 0);
 

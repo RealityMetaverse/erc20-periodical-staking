@@ -47,7 +47,7 @@ contract ClaimScenarios is ClaimFunctions {
 
         _claimTokenWithTest(userOne, 0, true);
     }
-    
+
     function test_Claim_Indefinite() external {
         _addPhasesAndPeriods();
         _increaseAllowance(address(this), amountToProvide);
@@ -63,7 +63,7 @@ contract ClaimScenarios is ClaimFunctions {
         _addPhasesAndPeriods();
         _increaseAllowance(address(this), amountToProvide);
         stakingContract.provideReward(amountToProvide);
-        
+
         _stakeTokenWithAllowance(userOne, 0, 0, amountToStake);
         skip(90 days);
 
@@ -86,7 +86,6 @@ contract ClaimScenarios is ClaimFunctions {
         _stakeTokenWithAllowance(userOne, 0, 0, amountToStake);
         _claimTokenWithTest(userOne, 0, true);
     }
-
 
     function test_Claim_ClaimAll() external {
         _addPhasesAndPeriods();

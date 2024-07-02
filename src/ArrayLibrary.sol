@@ -20,13 +20,18 @@ library ArrayLibrary {
     }
 
     function sortStorage(uint256[] storage targetArray) public {
-        uint256 n = targetArray.length;
-        for (uint256 i = 0; i < n - 1; i++) {
-            for (uint256 j = 0; j < n - i - 1; j++) {
-                if (targetArray[j] > targetArray[j + 1]) {
-                    (targetArray[j], targetArray[j + 1]) = (targetArray[j + 1], targetArray[j]);
-                }
-            }
+        uint256 arrayLength = targetArray.length;
+        if (arrayLength <= 1) return;
+
+        uint256 lastElement = targetArray[arrayLength - 1];
+        uint256 i = arrayLength - 2;
+
+        while (i >= 0 && targetArray[i] > lastElement) {
+            targetArray[i + 1] = targetArray[i];
+            if (i == 0) break;
+            i--;
         }
+
+        targetArray[i + 1] = lastElement;
     }
 }

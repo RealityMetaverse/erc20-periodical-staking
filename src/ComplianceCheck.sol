@@ -92,9 +92,6 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
     }
 
     function checkActionAvailability(DataType action) public view returns (bool) {
-        uint8 enumIndex = uint8(action);
-        if (enumIndex > 2) revert InvalidDataType();
-
         return actionAvailabilityStatuses[action];
     }
 

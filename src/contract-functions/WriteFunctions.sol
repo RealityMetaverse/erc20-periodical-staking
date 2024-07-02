@@ -7,7 +7,11 @@ import "../ComplianceCheck.sol";
 abstract contract WriteFunctions is ComplianceCheck {
     function _updateActiveDepositStartIndex(address userAddress) internal {
         uint256 userDepositCount = stakerDepositList[userAddress].length;
+
+        if (userDepositCount == 0) return;
+
         uint256 currentIndex = stakerActiveDepositStartIndex[userAddress];
+        uint256 newStartIndex = userDepositCount - 1;
 
         for (uint256 i = currentIndex; i < userDepositCount; i++) {
             DepositStatus status = checkDepositStatus(userAddress, i);
@@ -15,9 +19,13 @@ abstract contract WriteFunctions is ComplianceCheck {
                 status == DepositStatus.TIME_LEFT || status == DepositStatus.READY_TO_CLAIM
                     || status == DepositStatus.INDEFINITE
             ) {
-                stakerActiveDepositStartIndex[userAddress] = i;
-                return;
+                newStartIndex = i;
+                break;
             }
+        }
+
+        if (newStartIndex != currentIndex) {
+            stakerActiveDepositStartIndex[userAddress] = newStartIndex;
         }
     }
 

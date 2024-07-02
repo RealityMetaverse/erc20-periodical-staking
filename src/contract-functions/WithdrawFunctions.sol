@@ -21,7 +21,7 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
 
         targetDeposit.withdrawalDate = block.timestamp;
         uint256 amountToSend = targetDeposit.amount;
-        uint256 depositReward;
+        uint256 depositReward = 0;
 
         if (depositStatus == DepositStatus.TIME_LEFT) {
             userDataList[DataType.REWARD_EXPECTED][msg.sender] -= targetDeposit.rewardGenerated;

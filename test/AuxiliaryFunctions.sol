@@ -185,7 +185,8 @@ contract AuxiliaryFunctions is ReadFunctions {
             uint256[] memory currentData = _getCurrentData(userAddress, stakingPhase, stakingPeriod);
             uint256 userDepositCountBefore = _getUserDepositCount(userAddress);
 
-            uint256 rewardExpected = (stakingPeriod == 0) ? 0 : stakingContract.calculateReward(tokenAmount, phasePeriodAPY, stakingPeriod);
+            uint256 rewardExpected =
+                (stakingPeriod == 0) ? 0 : stakingContract.calculateReward(tokenAmount, phasePeriodAPY, stakingPeriod);
 
             uint256[] memory expectedData = new uint256[](10);
             expectedData[0] = currentData[0] + tokenAmount;

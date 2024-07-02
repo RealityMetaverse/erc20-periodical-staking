@@ -1,4 +1,4 @@
-# ERC20 Periodical Staking v0.2.0
+# ERC20 Periodical Staking v0.2.1
 
 ## Dependencies
 This project uses the Foundry framework with the OpenZeppelin contracts (v5.0.1) for enhanced security and standardized features. You need to install necessary dependencies.
