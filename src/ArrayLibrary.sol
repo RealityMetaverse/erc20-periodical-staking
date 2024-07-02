@@ -24,14 +24,12 @@ library ArrayLibrary {
         if (arrayLength <= 1) return;
 
         uint256 lastElement = targetArray[arrayLength - 1];
-        uint256 i = arrayLength - 2;
-
-        while (i >= 0 && targetArray[i] > lastElement) {
-            targetArray[i + 1] = targetArray[i];
-            if (i == 0) break;
+        int256 i = int256(arrayLength) - 2;
+        while (i >= 0 && targetArray[uint256(i)] > lastElement) {
+            targetArray[uint256(i + 1)] = targetArray[uint256(i)];
             i--;
         }
 
-        targetArray[i + 1] = lastElement;
+        targetArray[uint256(i + 1)] = lastElement;
     }
 }
