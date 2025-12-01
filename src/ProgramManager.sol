@@ -55,6 +55,10 @@ contract ProgramManager {
     // Program token balance for paying rewards
     uint256 public rewardPool;
 
+    // Whitelist control for staking
+    bool public whitelistEnabled;
+    mapping(address => bool) public isWhitelisted;
+
     uint256 public currentStakingPhase;
     uint256 public stakingPhaseCount;
     // Staking periods are in days

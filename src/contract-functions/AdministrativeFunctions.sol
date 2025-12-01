@@ -145,6 +145,38 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     // ======================================
+    // =           Whitelist Control        =
+    // ======================================
+    /// @notice Enable or disable the staking whitelist.
+    /// @dev When disabled, anyone can stake. When enabled, only whitelisted addresses can stake.
+    function setWhitelistEnabled(bool enabled) external onlyContractOwner {
+        whitelistEnabled = enabled;
+        emit UpdateWhitelistStatus(enabled);
+    }
+
+    /// @notice Add or remove an address from the staking whitelist.
+    function setWhitelistAddress(address userAddress, bool allowed) external onlyContractOwner {
+        _setWhitelistAddress(userAddress, allowed);
+    }
+
+    /// @notice Batch add or remove multiple addresses from the staking whitelist.
+    /// @param userAddresses List of addresses to update.
+    /// @param allowed Whitelist status to apply to all provided addresses.
+    function setWhitelistAddresses(address[] calldata userAddresses, bool allowed) external onlyContractOwner {
+        uint256 length = userAddresses.length;
+        for (uint256 i = 0; i < length; i++) {
+            _setWhitelistAddress(userAddresses[i], allowed);
+        }
+    }
+
+    /// @dev Internal helper to update whitelist mapping and emit event.
+    function _setWhitelistAddress(address userAddress, bool allowed) internal {
+        if (userAddress == address(0)) revert ZeroAddressProvided();
+        isWhitelisted[userAddress] = allowed;
+        emit UpdateWhitelist(userAddress, allowed);
+    }
+
+    // ======================================
     // =           Fund Management          =
     // ======================================
     function collectReward(uint256 tokenAmount) external nonReentrant onlyContractOwner {

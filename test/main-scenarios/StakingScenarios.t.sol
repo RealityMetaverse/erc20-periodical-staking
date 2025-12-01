@@ -50,4 +50,27 @@ contract StakingScenarious is AuxiliaryFunctions {
         _increaseAllowance(userOne, amountToStake);
         _stakeTokenWithTest(userOne, 0, 0, amountToStake, true);
     }
+
+    function test_Staking_WhitelistEnabled_NotWhitelisted() external {
+        _addPhasesAndPeriods();
+
+        // Enable whitelist and do not whitelist userOne
+        stakingContract.setWhitelistEnabled(true);
+
+        _increaseAllowance(userOne, amountToStake);
+        // Expect revert because userOne is not whitelisted
+        _stakeTokenWithTest(userOne, 0, 0, amountToStake, true);
+    }
+
+    function test_Staking_WhitelistEnabled_Whitelisted() external {
+        _addPhasesAndPeriods();
+
+        // Enable whitelist and whitelist userOne
+        stakingContract.setWhitelistEnabled(true);
+        stakingContract.setWhitelistAddress(userOne, true);
+
+        _increaseAllowance(userOne, amountToStake);
+        // Should stake successfully when whitelisted
+        _stakeTokenWithTest(userOne, 0, 0, amountToStake, false);
+    }
 }

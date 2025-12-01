@@ -14,20 +14,15 @@ contract MainManagementScenarios is AuxiliaryFunctions {
         REMOVE_PERIOD
     }
 
-    function _performAction(Action action, address userAddress) internal {
-        if (userAddress != address(this)) vm.startPrank(userAddress);
-
-        if (action == Action.PUSH_PHASE) _pushStakingPhase(userAddress);
-        else if (action == Action.ADD_PERIOD) _addStakingPeriod(userAddress);
-        else if (action == Action.POP_PHASE) _popStakingPhase(userAddress);
-        else if (action == Action.REMOVE_PERIOD) _removeStakingPeriod(userAddress);
-
-        if (userAddress != address(this)) vm.stopPrank();
+    function _performAction(Action action, address userAddress, bool ifRevertExpected) internal {
+        if (action == Action.PUSH_PHASE) _pushStakingPhase(userAddress, ifRevertExpected);
+        else if (action == Action.ADD_PERIOD) _addStakingPeriod(userAddress, ifRevertExpected);
+        else if (action == Action.POP_PHASE) _popStakingPhase(userAddress, ifRevertExpected);
+        else if (action == Action.REMOVE_PERIOD) _removeStakingPeriod(userAddress, ifRevertExpected);
     }
 
     function _checkAccesControl(address userAddress, Action action) internal {
-        vm.expectRevert();
-        _performAction(action, userAddress);
+        _performAction(action, userAddress, true);
     }
 
     function test_AccessControl_RevertProgramControlAccess() external {
@@ -92,13 +87,13 @@ contract MainManagementScenarios is AuxiliaryFunctions {
             _pushStakingPhaseWithTest(address(this));
         }
         for (uint8 No = 0; No < x; No++) {
-            _popStakingPhase(address(this));
+            _popStakingPhase(address(this), false);
         }
         for (uint8 No = 0; No < y; No++) {
             _pushStakingPhaseWithTest(address(this));
         }
         for (uint8 No = 0; No < y; No++) {
-            _popStakingPhase(address(this));
+            _popStakingPhase(address(this), false);
         }
     }
 
@@ -110,13 +105,13 @@ contract MainManagementScenarios is AuxiliaryFunctions {
             _addStakingPeriodWithTest(address(this));
         }
         for (uint8 No = 0; No < x; No++) {
-            _removeStakingPeriod(address(this));
+            _removeStakingPeriod(address(this), false);
         }
         for (uint8 No = 0; No < y; No++) {
             _addStakingPeriodWithTest(address(this));
         }
         for (uint8 No = 0; No < y; No++) {
-            _removeStakingPeriod(address(this));
+            _removeStakingPeriod(address(this), false);
         }
     }
 
@@ -151,10 +146,10 @@ contract MainManagementScenarios is AuxiliaryFunctions {
             _addStakingPeriodWithTest(address(this));
         }
         for (uint8 No = 0; No < x; No++) {
-            _popStakingPhase(address(this));
+            _popStakingPhase(address(this), false);
         }
         for (uint8 No = 0; No < y; No++) {
-            _removeStakingPeriod(address(this));
+            _removeStakingPeriod(address(this), false);
         }
     }
 
@@ -189,5 +184,49 @@ contract MainManagementScenarios is AuxiliaryFunctions {
 
         vm.expectRevert();
         stakingContract.collectReward(amountToProvide);
+    }
+
+    // ======================================
+    // =       Whitelist Management Test    =
+    // ======================================
+    function test_WhitelistManagement_AccessControl() external {
+        // Non-owner should not be able to change whitelist settings
+        vm.startPrank(userOne);
+        vm.expectRevert();
+        stakingContract.setWhitelistEnabled(true);
+        vm.expectRevert();
+        stakingContract.setWhitelistAddress(userOne, true);
+        vm.expectRevert();
+        address[] memory addrs = new address[](1);
+        addrs[0] = userOne;
+        stakingContract.setWhitelistAddresses(addrs, true);
+        vm.stopPrank();
+    }
+
+    function test_WhitelistManagement_SingleAndBatch() external {
+        // Initially whitelist is disabled
+        assertEq(stakingContract.whitelistEnabled(), false);
+
+        // Enable whitelist
+        stakingContract.setWhitelistEnabled(true);
+        assertEq(stakingContract.whitelistEnabled(), true);
+
+        // Single address update
+        assertEq(stakingContract.isWhitelisted(userOne), false);
+        stakingContract.setWhitelistAddress(userOne, true);
+        assertEq(stakingContract.isWhitelisted(userOne), true);
+
+        // Batch update for userTwo and userThree
+        address[] memory addrs = new address[](2);
+        addrs[0] = userTwo;
+        addrs[1] = userThree;
+        stakingContract.setWhitelistAddresses(addrs, true);
+        assertEq(stakingContract.isWhitelisted(userTwo), true);
+        assertEq(stakingContract.isWhitelisted(userThree), true);
+
+        // Batch removal
+        stakingContract.setWhitelistAddresses(addrs, false);
+        assertEq(stakingContract.isWhitelisted(userTwo), false);
+        assertEq(stakingContract.isWhitelisted(userThree), false);
     }
 }

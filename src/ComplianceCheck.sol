@@ -32,6 +32,7 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
     error NotClaimable(uint256 depositNumber);
     error ArrayLengthDoesntMatch(uint256 expectedLength);
     error ZeroAddressProvided();
+    error NotWhitelisted(address user);
 
     // ======================================
     // =             Functions              =
@@ -99,6 +100,11 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
         internal
         view
     {
+        // If whitelist is enabled, only whitelisted addresses can stake
+        if (whitelistEnabled && !isWhitelisted[msg.sender]) {
+            revert NotWhitelisted(msg.sender);
+        }
+
         if (tokenAmount < minimumDeposit) revert InsufficentDeposit(tokenAmount, minimumDeposit);
 
         if (stakingPhase != currentStakingPhase) revert IncorrectStakingPhase(stakingPhase, currentStakingPhase);
@@ -163,6 +169,9 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
 
     event AddStakingPeriod(uint256 indexed newStakingPeriod);
     event RemoveStakingPeriod(uint256 indexed stakingPeriod);
+
+    event UpdateWhitelistStatus(bool enabled);
+    event UpdateWhitelist(address indexed user, bool isWhitelisted);
 
     // ======================================
     // =    Token Management Functions      =

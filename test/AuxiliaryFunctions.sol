@@ -4,7 +4,7 @@ pragma solidity 0.8.20;
 import "./ReadFunctions.sol";
 
 contract AuxiliaryFunctions is ReadFunctions {
-    function _pushStakingPhase(address userAddress) internal {
+    function _pushStakingPhase(address userAddress, bool ifRevertExpected) internal {
         if (userAddress != address(this)) vm.startPrank(userAddress);
         uint256[] memory _stakingPeriods = stakingContract.getStakingPeriods();
 
@@ -20,6 +20,7 @@ contract AuxiliaryFunctions is ReadFunctions {
             _refStakingTarget += _refStakingTargetModifier;
         }
 
+        if (ifRevertExpected) vm.expectRevert();
         stakingContract.pushStakingPhase(_apyForEachStakingPeriod, _targetForEachStakingPeriod);
 
         if (userAddress != address(this)) vm.stopPrank();
@@ -36,7 +37,7 @@ contract AuxiliaryFunctions is ReadFunctions {
             assertEq(_getPhasePeriodStakingTarget(_targetStakingPhase, _stakingPeriods[index]), 0);
         }
 
-        _pushStakingPhase(userAddress);
+        _pushStakingPhase(userAddress, false);
 
         assertEq(stakingContract.stakingPhaseCount(), _targetStakingPhase + 1);
 
@@ -52,9 +53,10 @@ contract AuxiliaryFunctions is ReadFunctions {
         }
     }
 
-    function _popStakingPhase(address userAddress) internal {
+    function _popStakingPhase(address userAddress, bool ifRevertExpected) internal {
         if (userAddress != address(this)) vm.startPrank(userAddress);
 
+        if (ifRevertExpected) vm.expectRevert();
         stakingContract.popStakingPhase();
 
         if (userAddress != address(this)) vm.stopPrank();
@@ -63,7 +65,7 @@ contract AuxiliaryFunctions is ReadFunctions {
     function _popStakingPhaseWithTest(address userAddress) internal {
         uint256 _targetStakingPhase = stakingContract.stakingPhaseCount();
 
-        _popStakingPhase(userAddress);
+        _popStakingPhase(userAddress, false);
 
         uint256[] memory _stakingPeriods = stakingContract.getStakingPeriods();
         uint256 _stakingPeriodCount = _stakingPeriods.length;
@@ -76,7 +78,7 @@ contract AuxiliaryFunctions is ReadFunctions {
         }
     }
 
-    function _addStakingPeriod(address userAddress) internal {
+    function _addStakingPeriod(address userAddress, bool ifRevertExpected) internal {
         if (userAddress != address(this)) vm.startPrank(userAddress);
 
         uint256 _stakingPhaseCount = stakingContract.stakingPhaseCount();
@@ -91,6 +93,7 @@ contract AuxiliaryFunctions is ReadFunctions {
             _refStakingTarget += _refStakingTargetModifier;
         }
 
+        if (ifRevertExpected) vm.expectRevert();
         stakingContract.addStakingPeriod(_refPeriod, _apyForEachStakingPhase, _targetForEachStakingPhase);
         _refPeriod += _refPeriodModifier;
 
@@ -107,7 +110,7 @@ contract AuxiliaryFunctions is ReadFunctions {
             assertEq(_getPhasePeriodStakingTarget(index, _targetStakingPeriod), 0);
         }
 
-        _addStakingPeriod(userAddress);
+        _addStakingPeriod(userAddress, false);
 
         assertEq(stakingContract.getStakingPeriods().length, _stakingPeriodCount + 1);
 
@@ -123,10 +126,12 @@ contract AuxiliaryFunctions is ReadFunctions {
         }
     }
 
-    function _removeStakingPeriod(address userAddress) internal {
+    function _removeStakingPeriod(address userAddress, bool ifRevertExpected) internal {
         if (userAddress != address(this)) vm.startPrank(userAddress);
 
         _refPeriod -= _refPeriodModifier;
+
+        if (ifRevertExpected) vm.expectRevert();
         stakingContract.removeStakingPeriod(_refPeriod);
 
         if (userAddress != address(this)) vm.stopPrank();
@@ -137,7 +142,7 @@ contract AuxiliaryFunctions is ReadFunctions {
         uint256 _stakingPeriodCount = stakingContract.getStakingPeriods().length;
         uint256 _targetStakingPeriod = _refPeriod;
 
-        _removeStakingPeriod(userAddress);
+        _removeStakingPeriod(userAddress, false);
 
         assertEq(stakingContract.getStakingPeriods().length, _stakingPeriodCount - 1);
 
