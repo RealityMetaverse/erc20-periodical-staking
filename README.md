@@ -39,4 +39,6 @@ After removing period 7 in production, all deposits in that period became perman
 | Staked in removed + other periods | Can claim/withdraw other periods normally; removed period deposit is locked |
 | Never staked in removed period    | No impact                                                                   |
 
+**Recovery:** The only way to unstick a deposit is to recreate the period with the exact same configuration, have the user stake the same amount again, and then claim the old deposit. Because the new stake repopulates the per-period tracking data, the old claim's subtractions no longer underflow. The user receives their old principal + reward back, but since they had to lock the same principal again in the new deposit, the net gain is only the old interest minus gas fees.
+
 **Workaround:** Do NOT remove a staking period or pop a staking phase. Instead, set the staking target to 0 for the period you want to disable.
