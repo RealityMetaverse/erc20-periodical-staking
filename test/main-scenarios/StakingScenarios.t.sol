@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "../AuxiliaryFunctions.sol";
+import "../../src/common/Types.sol";
 
 contract StakingScenarious is AuxiliaryFunctions {
     function test_Staking_BeforeLaunch() external {
@@ -25,7 +26,7 @@ contract StakingScenarious is AuxiliaryFunctions {
         _tryMultiUserMultiStake();
     }
 
-    function test_Staking_InsufficentDeposit() external {
+    function test_Staking_InsufficientDeposit() external {
         _addPhasesAndPeriods();
 
         _increaseAllowance(userOne, 1);
@@ -45,7 +46,7 @@ contract StakingScenarious is AuxiliaryFunctions {
 
     function test_Staking_NotOpen() external {
         _addPhasesAndPeriods();
-        stakingContract.changeActionAvailability(ProgramManager.DataType.STAKING, false);
+        stakingContract.changeActionAvailability(Types.DataType.STAKING, false);
 
         _increaseAllowance(userOne, amountToStake);
         _stakeTokenWithTest(userOne, 0, 0, amountToStake, true);

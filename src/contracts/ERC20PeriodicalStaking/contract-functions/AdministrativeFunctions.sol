@@ -3,6 +3,7 @@
 pragma solidity 0.8.20;
 
 import "../ComplianceCheck.sol";
+import "../../../common/Types.sol";
 
 abstract contract AdministrativeFunctions is ComplianceCheck {
     // ======================================
@@ -37,7 +38,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit UpdateMinimumDeposit(newMinimumDeposit);
     }
 
-    function changeActionAvailability(DataType action, bool changeTo) external onlyContractOwner {
+    function changeActionAvailability(Types.DataType action, bool changeTo) external onlyContractOwner {
         actionAvailabilityStatuses[action] = changeTo;
         emit UpdateActionAvailability(action, changeTo);
     }
@@ -53,14 +54,21 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         if (
             apyForEachStakingPeriod.length != stakingPeriodCount
                 || targetForEachStakingPeriod.length != stakingPeriodCount
-        ) revert ArrayLengthDoesntMatch(stakingPeriodCount);
+        ) {
+            revert LengthMismatch(
+                stakingPeriodCount,
+                apyForEachStakingPeriod.length != stakingPeriodCount
+                    ? apyForEachStakingPeriod.length
+                    : targetForEachStakingPeriod.length
+            );
+        }
 
         uint256 newStakingPhaseIndex = stakingPhaseCount;
         for (uint256 i = 0; i < stakingPeriodCount; i++) {
             if (apyForEachStakingPeriod[i] == 0) revert InvalidAPY(0, 1);
-            phasePeriodDataList[PhasePeriodDataType.APY][newStakingPhaseIndex][stakingPeriodList[i]] =
+            phasePeriodDataList[Types.PhasePeriodDataType.APY][newStakingPhaseIndex][stakingPeriodList[i]] =
                 apyForEachStakingPeriod[i];
-            phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][newStakingPhaseIndex][stakingPeriodList[i]] =
+            phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][newStakingPhaseIndex][stakingPeriodList[i]] =
                 targetForEachStakingPeriod[i];
         }
 
@@ -73,8 +81,9 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         uint256 lastStakingPhase = stakingPhaseCount - 1;
 
         for (uint256 periodIndex = 0; periodIndex < stakingPeriodList.length; periodIndex++) {
-            delete phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][lastStakingPhase][stakingPeriodList[periodIndex]];
-            delete phasePeriodDataList[PhasePeriodDataType.APY][lastStakingPhase][stakingPeriodList[periodIndex]];
+            uint256 stakingPeriod = stakingPeriodList[periodIndex];
+            _clearPhasePeriodData(lastStakingPhase, stakingPeriod);
+            _clearPhasePeriodUserData(lastStakingPhase, stakingPeriod);
         }
 
         stakingPhaseCount -= 1;
@@ -92,15 +101,20 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
 
         if (apyForEachStakingPhase.length != stakingPhaseCount || targetForEachStakingPhase.length != stakingPhaseCount)
         {
-            revert ArrayLengthDoesntMatch(stakingPhaseCount);
+            revert LengthMismatch(
+                stakingPhaseCount,
+                apyForEachStakingPhase.length != stakingPhaseCount
+                    ? apyForEachStakingPhase.length
+                    : targetForEachStakingPhase.length
+            );
         }
         stakingPeriodList.push(newStakingPeriod);
         stakingPeriodList.sortStorage();
 
         for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
             if (apyForEachStakingPhase[phase] == 0) revert InvalidAPY(0, 1);
-            phasePeriodDataList[PhasePeriodDataType.APY][phase][newStakingPeriod] = apyForEachStakingPhase[phase];
-            phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][phase][newStakingPeriod] =
+            phasePeriodDataList[Types.PhasePeriodDataType.APY][phase][newStakingPeriod] = apyForEachStakingPhase[phase];
+            phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][phase][newStakingPeriod] =
                 targetForEachStakingPhase[phase];
         }
 
@@ -110,8 +124,8 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     function removeStakingPeriod(uint256 stakingPeriod) external onlyContractOwner {
         if (checkIfStakingPeriodExists(stakingPeriod)) {
             for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
-                delete phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][phase][stakingPeriod];
-                delete phasePeriodDataList[PhasePeriodDataType.APY][phase][stakingPeriod];
+                _clearPhasePeriodData(phase, stakingPeriod);
+                _clearPhasePeriodUserData(phase, stakingPeriod);
             }
 
             stakingPeriodList.removeElementByIndex(stakingPeriodList.findElementIndex(stakingPeriod));
@@ -123,13 +137,13 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     function setPhasePeriodData(
-        PhasePeriodDataType dataType,
+        Types.PhasePeriodDataType dataType,
         uint256 stakingPhase,
         uint256 stakingPeriod,
         uint256 newValue
     ) external onlyContractOwner {
-        if (dataType == PhasePeriodDataType.STAKED) revert InvalidDataType();
-        if (dataType == PhasePeriodDataType.APY && newValue == 0) revert InvalidAPY(newValue, 1);
+        if (dataType == Types.PhasePeriodDataType.STAKED) revert InvalidDataType();
+        if (dataType == Types.PhasePeriodDataType.APY && newValue == 0) revert InvalidAPY(newValue, 1);
         _checkIfStakingPhasePeriodExists(stakingPhase, stakingPeriod);
         phasePeriodDataList[dataType][stakingPhase][stakingPeriod] = newValue;
 
@@ -142,6 +156,26 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         currentStakingPhase = phaseToSwitch;
 
         emit ChangeStakingPhase(phaseToSwitch);
+    }
+
+    /// @dev Remove all user-scoped data tied to a specific phase/period pair across every DataType.
+    function _clearPhasePeriodUserData(uint256 stakingPhase, uint256 stakingPeriod) internal {
+        uint256 dataTypeCount = uint256(type(Types.DataType).max) + 1;
+        uint256 stakerCount = stakerAddressList.length;
+
+        for (uint256 i = 0; i < dataTypeCount; i++) {
+            for (uint256 j = 0; j < stakerCount; j++) {
+                delete userPhasePeriodDataList[Types.DataType(i)][stakingPhase][stakingPeriod][stakerAddressList[j]];
+            }
+        }
+    }
+
+    /// @dev Remove all phase/period data across every PhasePeriodDataType.
+    function _clearPhasePeriodData(uint256 stakingPhase, uint256 stakingPeriod) internal {
+        uint256 dataTypeCount = uint256(type(Types.PhasePeriodDataType).max) + 1;
+        for (uint256 i = 0; i < dataTypeCount; i++) {
+            delete phasePeriodDataList[Types.PhasePeriodDataType(i)][stakingPhase][stakingPeriod];
+        }
     }
 
     // ======================================
@@ -177,6 +211,26 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     // ======================================
+    // =        Staking Limit Control       =
+    // ======================================
+    /// @notice Set the limit controller contract address; zero disables limit checks.
+    /// @param controllerAddress The address of the LimitController contract or zero to disable
+    function setLimitController(address controllerAddress) external onlyContractOwner {
+        limitController = controllerAddress;
+        emit UpdateLimitController(controllerAddress);
+    }
+
+    // ======================================
+    // =        Requirement Control         =
+    // ======================================
+    /// @notice Set the external requirement checker contract address; zero disables requirement checks.
+    /// @param checkerAddress The address of the RequirementChecker contract or zero to disable
+    function setRequirementChecker(address checkerAddress) external onlyContractOwner {
+        requirementChecker = checkerAddress;
+        emit UpdateRequirementChecker(checkerAddress);
+    }
+
+    // ======================================
     // =           Fund Management          =
     // ======================================
     function collectReward(uint256 tokenAmount) external nonReentrant onlyContractOwner {
@@ -188,8 +242,8 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     function provideReward(uint256 tokenAmount) external nonReentrant onlyAdmins {
-        userDataList[DataType.REWARD_PROVIDED][msg.sender] += tokenAmount;
-        totalDataList[DataType.REWARD_PROVIDED] += tokenAmount;
+        userDataList[Types.DataType.REWARD_PROVIDED][msg.sender] += tokenAmount;
+        totalDataList[Types.DataType.REWARD_PROVIDED] += tokenAmount;
         rewardPool += tokenAmount;
 
         emit ProvideReward(msg.sender, tokenAmount);

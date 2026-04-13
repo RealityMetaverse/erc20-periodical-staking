@@ -1,6 +1,7 @@
 pragma solidity 0.8.20;
 
 import "../main-test-functions/ClaimFunctions.sol";
+import "../../src/common/Types.sol";
 
 contract ClaimScenarios is ClaimFunctions {
     function test_Claim_NotOpen() external {
@@ -11,7 +12,7 @@ contract ClaimScenarios is ClaimFunctions {
         _stakeTokenWithAllowance(userOne, 0, 90, amountToStake);
         skip(90 days);
 
-        stakingContract.changeActionAvailability(ProgramManager.DataType.CLAIM, false);
+        stakingContract.changeActionAvailability(Types.DataType.CLAIM, false);
 
         _claimTokenWithTest(userOne, 0, true);
     }

@@ -192,7 +192,6 @@ contract AuxiliaryFunctions is ReadFunctions {
 
             uint256 rewardExpected =
                 (stakingPeriod == 0) ? 0 : stakingContract.calculateReward(tokenAmount, phasePeriodAPY, stakingPeriod);
-
             uint256[] memory expectedData = new uint256[](10);
             expectedData[0] = currentData[0] + tokenAmount;
             expectedData[1] = currentData[1] - tokenAmount;
@@ -201,11 +200,9 @@ contract AuxiliaryFunctions is ReadFunctions {
             expectedData[4] = currentData[4] + tokenAmount;
             expectedData[8] = currentData[8] + rewardExpected;
             expectedData[9] = currentData[9] + rewardExpected;
-
             stakingContract.safeStake(stakingPhase, stakingPeriod, tokenAmount, phasePeriodAPY);
 
             currentData = _getCurrentData(userAddress, stakingPhase, stakingPeriod);
-
             assertEq(currentData[0], expectedData[0]);
             assertEq(currentData[1], expectedData[1]);
             assertEq(currentData[2], expectedData[2]);

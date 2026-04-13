@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "../main-test-functions/WithdrawalFunctions.sol";
+import "../../src/common/Types.sol";
 
 contract WithdrawalScenarious is WithdrawalFunctions {
     function test_Withdrawal_Periodical() external {
@@ -97,7 +98,7 @@ contract WithdrawalScenarious is WithdrawalFunctions {
 
     function test_Withdrawal_NotOpen() external {
         _addPhasesAndPeriods();
-        stakingContract.changeActionAvailability(ProgramManager.DataType.WITHDRAWAL, false);
+        stakingContract.changeActionAvailability(Types.DataType.WITHDRAWAL, false);
 
         _stakeTokenWithAllowance(userOne, 0, 0, amountToStake);
         _withdrawTokenWithTest(userOne, 0, true);

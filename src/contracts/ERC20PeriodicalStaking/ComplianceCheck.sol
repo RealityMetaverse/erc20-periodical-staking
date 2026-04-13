@@ -5,50 +5,39 @@ pragma solidity 0.8.20;
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./AccessControl.sol";
+import "../../interfaces/ILimitController.sol";
+import "../../interfaces/IRequirementChecker.sol";
+import "../../common/Events.sol";
+import "../../common/Types.sol";
 
-abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
+abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
     using SafeERC20 for IERC20Metadata;
     using ArrayLibrary for uint256[];
 
     // ======================================
-    // =              Errors                =
-    // ======================================
-    error NotOpen(DataType action);
-    error NoStakingPhasesAddedYet();
-    error IncorrectStakingPhase(uint256 expectedPhase, uint256 currentPhase);
-    error StakingPhaseDoesNotExist(uint256 stakingPhase);
-    error StakingPeriodExists(uint256 stakingPeriod);
-    error StakingPeriodDoesNotExist(uint256 stakingPeriod);
-    error DepositDoesNotExist(uint256 depositNumber);
-    error AmountExceedsTarget(uint256 stakingPhase, uint256 stakingPeriod, uint256 stakingTarget);
-    error InsufficentDeposit(uint256 _tokenSent, uint256 _requiredAmount);
-    error PhasePeriodAPYChanged(uint256 stakingPhase, uint256 stakingPeriod, uint256 currentAPY);
-    error NotEnoughFundsInRewardPool(uint256 requestedAmount, uint256 availableAmount);
-    error NoRewardToClaim(uint256 depositNumber);
-    error InvalidAPY(uint256 providedValue, uint256 minValue);
-    error InvalidMinimumDeposit(uint256 providedValue, uint256 minValue);
-    error InvalidDataType();
-    error NotWithdrawable(uint256 depositNumber);
-    error NotClaimable(uint256 depositNumber);
-    error ArrayLengthDoesntMatch(uint256 expectedLength);
-    error ZeroAddressProvided();
-    error NotWhitelisted(address user);
-
-    // ======================================
     // =             Functions              =
     // ======================================
+    function getPhasePeriodData(Types.PhasePeriodDataType dataType, uint256 phase, uint256 period)
+        public
+        view
+        returns (uint256)
+    {
+        return phasePeriodDataList[dataType][phase][period];
+    }
+
     function _checkDepositExistence(uint256 depositNumber) private view {
         if (!(depositNumber < (stakerDepositList[msg.sender].length))) {
             revert DepositDoesNotExist(depositNumber);
         }
     }
 
-    function _checkIfTargetReached(uint256 stakingPhase, uint256 stakinPeriod, uint256 amountToStake) internal view {
-        uint256 stakingTarget = phasePeriodDataList[PhasePeriodDataType.STAKING_TARGET][stakingPhase][stakinPeriod];
-        uint256 totalStaked = phasePeriodDataList[PhasePeriodDataType.STAKED][stakingPhase][stakinPeriod];
+    function _checkIfTargetReached(uint256 stakingPhase, uint256 stakingPeriod, uint256 amountToStake) internal view {
+        uint256 stakingTarget =
+            phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][stakingPhase][stakingPeriod];
+        uint256 totalStaked = phasePeriodDataList[Types.PhasePeriodDataType.STAKED][stakingPhase][stakingPeriod];
 
         if ((amountToStake + totalStaked) > stakingTarget) {
-            revert AmountExceedsTarget(stakingPhase, stakinPeriod, stakingTarget);
+            revert AmountExceedsTarget(stakingPhase, stakingPeriod, stakingTarget);
         }
     }
 
@@ -92,8 +81,76 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
             : DepositStatus.CLAIMED;
     }
 
-    function checkActionAvailability(DataType action) public view returns (bool) {
+    function checkActionAvailability(Types.DataType action) public view returns (bool) {
         return actionAvailabilityStatuses[action];
+    }
+
+    function _checkIfUserMeetsRequirements(
+        address userAddress,
+        uint256 stakingPhase,
+        uint256 stakingPeriod,
+        bool ifRevertExpected
+    ) internal view returns (bool) {
+        if (requirementChecker != address(0)) {
+            IRequirementChecker checker = IRequirementChecker(requirementChecker);
+            if (!checker.meetsRequirement(userAddress, stakingPhase, stakingPeriod)) {
+                if (ifRevertExpected) {
+                    uint256 totalWorth = checker.getTotalWorth(userAddress);
+                    uint256 requiredWorth = checker.getRequiredWorth(stakingPhase, stakingPeriod);
+                    revert RequirementNotMet(requiredWorth, totalWorth);
+                } else {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    function checkIfUserMeetsRequirements(address userAddress, uint256 stakingPhase, uint256 stakingPeriod)
+        public
+        view
+        returns (bool)
+    {
+        return _checkIfUserMeetsRequirements(userAddress, stakingPhase, stakingPeriod, false);
+    }
+
+    function _checkIfUserExceedsLimit(
+        address userAddress,
+        uint256 stakingPhase,
+        uint256 stakingPeriod,
+        uint256 tokenAmount,
+        bool ifRevertExpected
+    ) private view returns (bool, uint256) {
+        if (limitController != address(0)) {
+            ILimitController controller = ILimitController(limitController);
+            uint256 remaining = controller.getRemaining(userAddress, stakingPhase, stakingPeriod);
+            if (remaining < tokenAmount) {
+                if (ifRevertExpected) {
+                    revert StakingLimitExceeded(userAddress, stakingPhase, stakingPeriod, tokenAmount, remaining);
+                } else {
+                    return (true, remaining);
+                }
+            } else {
+                return (false, remaining);
+            }
+        }
+
+        uint256 stakingTarget =
+            getPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, stakingPhase, stakingPeriod);
+        uint256 totalStaked = getPhasePeriodData(Types.PhasePeriodDataType.STAKED, stakingPhase, stakingPeriod);
+        if (totalStaked >= stakingTarget) {
+            return (false, 0);
+        }
+        return (false, stakingTarget - totalStaked);
+    }
+
+    function checkIfUserExceedsLimit(
+        address userAddress,
+        uint256 stakingPhase,
+        uint256 stakingPeriod,
+        uint256 tokenAmount
+    ) public view returns (bool, uint256) {
+        return _checkIfUserExceedsLimit(userAddress, stakingPhase, stakingPeriod, tokenAmount, false);
     }
 
     function _checkIfLegitStakeRequest(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount)
@@ -105,18 +162,24 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
             revert NotWhitelisted(msg.sender);
         }
 
-        if (tokenAmount < minimumDeposit) revert InsufficentDeposit(tokenAmount, minimumDeposit);
+        // If requirement checker is set, check if the sender meets the requirement
+        _checkIfUserMeetsRequirements(msg.sender, stakingPhase, stakingPeriod, true);
+
+        if (tokenAmount < minimumDeposit) revert InsufficientDeposit(tokenAmount, minimumDeposit);
 
         if (stakingPhase != currentStakingPhase) revert IncorrectStakingPhase(stakingPhase, currentStakingPhase);
         _checkIfStakingPhasePeriodExists(stakingPhase, stakingPeriod);
 
         _checkIfTargetReached(stakingPhase, stakingPeriod, tokenAmount);
+
+        // If staking limit is enabled, call LimitController to check remaining allowance before staking
+        _checkIfUserExceedsLimit(msg.sender, stakingPhase, stakingPeriod, tokenAmount, true);
     }
 
     // ======================================
     // =             Modifiers              =
     // ======================================
-    modifier ifAvailable(DataType action) {
+    modifier ifAvailable(Types.DataType action) {
         if (!checkActionAvailability(action)) revert NotOpen(action);
         _;
     }
@@ -130,48 +193,6 @@ abstract contract ComplianceCheck is AccessControl, ReentrancyGuard {
         _checkIfLegitStakeRequest(stakingPhase, stakingPeriod, tokenAmount);
         _;
     }
-
-    // ======================================
-    // =              Events                =
-    // ======================================
-    event TransferOwnership(address from, address to);
-
-    event AddContractAdmin(address indexed user);
-    event RemoveContractAdmin(address indexed user);
-
-    event Stake(
-        address indexed by,
-        uint256 indexed stakingPhase,
-        uint256 indexed stakingPeriod,
-        uint256 APY,
-        uint256 tokenAmount,
-        uint256 depositNumber
-    );
-    event Withdraw(address indexed by, uint256 indexed depositNumber, uint256 stakedAmount);
-    event Claim(address indexed by, uint256 indexed depositNumber, uint256 reward);
-
-    event ProvideReward(address indexed by, uint256 tokenAmount);
-    event CollectReward(address indexed by, uint256 tokenAmount);
-
-    event UpdatePhasePeriodData(
-        PhasePeriodDataType indexed dataType,
-        uint256 indexed stakingPhase,
-        uint256 indexed stakingPeriod,
-        uint256 newValue
-    );
-
-    event UpdateMinimumDeposit(uint256 newMinimumDeposit);
-    event UpdateActionAvailability(DataType action, bool isOpen);
-
-    event AddStakingPhase(uint256 indexed newStakingPhase);
-    event RemoveStakingPhase(uint256 indexed stakingPhase);
-    event ChangeStakingPhase(uint256 indexed to);
-
-    event AddStakingPeriod(uint256 indexed newStakingPeriod);
-    event RemoveStakingPeriod(uint256 indexed stakingPeriod);
-
-    event UpdateWhitelistStatus(bool enabled);
-    event UpdateWhitelist(address indexed user, bool isWhitelisted);
 
     // ======================================
     // =    Token Management Functions      =

@@ -1,3 +1,6 @@
+/.local
 /cache
 /lib
 /out
+*.local.json
+*.Identifier

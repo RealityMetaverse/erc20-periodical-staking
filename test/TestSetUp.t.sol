@@ -6,8 +6,8 @@ import "forge-std/console.sol";
 
 import {MockToken} from "./MockToken.sol";
 
-import {ERC20PeriodicalStaking} from "../src/ERC20PeriodicalStaking.sol";
-import "../src/ProgramManager.sol";
+import {ERC20PeriodicalStaking} from "../src/contracts/ERC20PeriodicalStaking/ERC20PeriodicalStaking.sol";
+import "../src/contracts/ERC20PeriodicalStaking/ProgramManager.sol";
 
 contract TestSetUp is Test {
     MockToken myToken;

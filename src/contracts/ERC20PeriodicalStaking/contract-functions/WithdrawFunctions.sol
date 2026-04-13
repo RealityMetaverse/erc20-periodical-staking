@@ -4,12 +4,13 @@ pragma solidity 0.8.20;
 
 import "./ReadFunctions.sol";
 import "./WriteFunctions.sol";
+import "../../../common/Types.sol";
 
 abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
     function withdrawDeposit(uint256 depositNumber)
         external
         nonReentrant
-        ifAvailable(DataType.WITHDRAWAL)
+        ifAvailable(Types.DataType.WITHDRAWAL)
         ifDepositExists(depositNumber)
     {
         DepositStatus depositStatus = checkDepositStatus(msg.sender, depositNumber);
@@ -24,8 +25,10 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
         uint256 depositReward = 0;
 
         if (depositStatus == DepositStatus.TIME_LEFT) {
-            userDataList[DataType.REWARD_EXPECTED][msg.sender] -= targetDeposit.rewardGenerated;
-            totalDataList[DataType.REWARD_EXPECTED] -= targetDeposit.rewardGenerated;
+            userDataList[Types.DataType.REWARD_EXPECTED][msg.sender] -= targetDeposit.rewardGenerated;
+            totalDataList[Types.DataType.REWARD_EXPECTED] -= targetDeposit.rewardGenerated;
+            userPhasePeriodDataList[Types.DataType.REWARD_EXPECTED][targetDeposit.stakingPhase][targetDeposit
+                .stakingPeriod][msg.sender] -= targetDeposit.rewardGenerated;
             targetDeposit.rewardGenerated = 0;
         } else {
             // DepositStatus.INDEFINITE
@@ -40,7 +43,7 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
         }
 
         _updateAllDataAfterAction(
-            DataType.WITHDRAWAL,
+            Types.DataType.WITHDRAWAL,
             targetDeposit.stakingPhase,
             targetDeposit.stakingPeriod,
             targetDeposit.amount,
@@ -48,6 +51,7 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
         );
         _updateActiveDepositStartIndex(msg.sender);
 
+        emit Withdraw(msg.sender, depositNumber, targetDeposit.amount, depositReward);
         _sendToken(msg.sender, amountToSend);
     }
 }

@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "./AuxiliaryFunctions.sol";
+import "../src/common/Types.sol";
 
 contract MainManagementScenarios is AuxiliaryFunctions {
     // ======================================
@@ -169,7 +170,7 @@ contract MainManagementScenarios is AuxiliaryFunctions {
 
         vm.startPrank(contractAdmin);
         stakingContract.provideReward(amountToProvide);
-        assertEq(stakingContract.getUserData(ProgramManager.DataType.REWARD_PROVIDED, contractAdmin), amountToProvide);
+        assertEq(stakingContract.getUserData(Types.DataType.REWARD_PROVIDED, contractAdmin), amountToProvide);
         vm.expectRevert();
         stakingContract.collectReward(amountToProvide);
         vm.stopPrank();

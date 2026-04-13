@@ -2,35 +2,35 @@
 pragma solidity 0.8.20;
 
 import "./TestSetUp.t.sol";
-import "../src/ProgramManager.sol";
+import "../src/common/Types.sol";
 
 contract ReadFunctions is TestSetUp {
     function _getTotalStaked() internal view returns (uint256) {
-        return stakingContract.getTotalData(ProgramManager.DataType.STAKING);
+        return stakingContract.getTotalData(Types.DataType.STAKING);
     }
 
     function _getTotalWithdrawn() internal view returns (uint256) {
-        return stakingContract.getTotalData(ProgramManager.DataType.WITHDRAWAL);
+        return stakingContract.getTotalData(Types.DataType.WITHDRAWAL);
     }
 
     function _getTotalRewardExpected() internal view returns (uint256) {
-        return stakingContract.getTotalData(ProgramManager.DataType.REWARD_EXPECTED);
+        return stakingContract.getTotalData(Types.DataType.REWARD_EXPECTED);
     }
 
     function _getTotalStakedBy(address userAddress) internal view returns (uint256) {
-        return stakingContract.getUserData(ProgramManager.DataType.STAKING, userAddress);
+        return stakingContract.getUserData(Types.DataType.STAKING, userAddress);
     }
 
     function _getTotalWithdrawnBy(address userAddress) internal view returns (uint256) {
-        return stakingContract.getUserData(ProgramManager.DataType.WITHDRAWAL, userAddress);
+        return stakingContract.getUserData(Types.DataType.WITHDRAWAL, userAddress);
     }
 
     function _getTotalClaimedBy(address userAddress) internal view returns (uint256) {
-        return stakingContract.getUserData(ProgramManager.DataType.CLAIM, userAddress);
+        return stakingContract.getUserData(Types.DataType.CLAIM, userAddress);
     }
 
     function _getTotalRewardExpectedBy(address userAddress) internal view returns (uint256) {
-        return stakingContract.getUserData(ProgramManager.DataType.REWARD_EXPECTED, userAddress);
+        return stakingContract.getUserData(Types.DataType.REWARD_EXPECTED, userAddress);
     }
 
     function _getUserDepositCount(address userAddress) internal view returns (uint256) {
@@ -46,13 +46,12 @@ contract ReadFunctions is TestSetUp {
         view
         returns (uint256)
     {
-        return stakingContract.phasePeriodDataList(
-            ProgramManager.PhasePeriodDataType.STAKING_TARGET, stakingPhase, stakingPeriod
-        );
+        return
+            stakingContract.phasePeriodDataList(Types.PhasePeriodDataType.STAKING_TARGET, stakingPhase, stakingPeriod);
     }
 
     function _getPhasePeriodAPY(uint256 stakingPhase, uint256 stakingPeriod) internal view returns (uint256) {
-        return stakingContract.phasePeriodDataList(ProgramManager.PhasePeriodDataType.APY, stakingPhase, stakingPeriod);
+        return stakingContract.phasePeriodDataList(Types.PhasePeriodDataType.APY, stakingPhase, stakingPeriod);
     }
 
     function _getPhasePeriodStakingStaked(uint256 stakingPhase, uint256 stakingPeriod)
@@ -60,8 +59,7 @@ contract ReadFunctions is TestSetUp {
         view
         returns (uint256)
     {
-        return
-            stakingContract.phasePeriodDataList(ProgramManager.PhasePeriodDataType.STAKED, stakingPhase, stakingPeriod);
+        return stakingContract.phasePeriodDataList(Types.PhasePeriodDataType.STAKED, stakingPhase, stakingPeriod);
     }
 
     function _getCurrentData(address userAddress, uint256 stakingPhase, uint256 stakingPeriod)
