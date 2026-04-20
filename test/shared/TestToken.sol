@@ -3,9 +3,9 @@ pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-contract MockToken is ERC20 {
-    constructor(uint256 tokenDecimals) ERC20("MockToken", "MKT") {
-        _mint(msg.sender, 10000000 * (10 ** tokenDecimals)); // Mint 1 million tokens for the deployer
+contract TestToken is ERC20 {
+    constructor(uint256 tokenDecimals) ERC20("TestToken", "TEST") {
+        _mint(msg.sender, 10000000 * (10 ** tokenDecimals)); // Mint 10M tokens for the deployer
     }
 
     function decimals() public view virtual override returns (uint8) {

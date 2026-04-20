@@ -11,10 +11,10 @@ interface IRequirementChecker {
 
     function getTotalWorth(address user) external view returns (uint256);
 
-    function worthBreakdown(address user, uint256 phase, uint256 period)
+    function worthBreakdown(address user)
         external
         view
-        returns (uint256 erc20Balance, uint256 stakingWorth, uint256 periodicalStakingWorth, uint256 nftWorth);
+        returns (uint256 erc20Balance, uint256 poolStakingWorth, uint256 periodicalStakingWorth, uint256 nftWorth);
 
     function getRequiredWorth(uint256 phase, uint256 period) external view returns (uint256);
 
@@ -22,4 +22,20 @@ interface IRequirementChecker {
         external
         view
         returns (uint256[] memory requiredWorths);
+
+    // ===== V2 additions =====
+    function getRawTotalWorth(address user) external view returns (uint256);
+
+    function rawWorthBreakdown(address user)
+        external
+        view
+        returns (uint256 erc20Balance, uint256 poolStakingWorth, uint256 periodicalStakingWorth, uint256 nftWorth);
+
+    function getAppliedOffsetsWorth(address user) external view returns (int256);
+
+    /// @notice Returns the wallet's total worth excluding ERC1155 NFT contribution (ERC20 + staking + periodical).
+    function getTokenWorth(address user) external view returns (uint256);
+
+    /// @notice Returns the raw (offset-ignoring) total worth excluding ERC1155 NFT contribution.
+    function getRawTokenWorth(address user) external view returns (uint256);
 }

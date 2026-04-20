@@ -1,7 +1,7 @@
 pragma solidity 0.8.20;
 
-import "../main-test-functions/ClaimFunctions.sol";
-import "../../src/common/Types.sol";
+import "../functions/ClaimFunctions.sol";
+import "../../../src/common/Types.sol";
 
 contract ClaimScenarios is ClaimFunctions {
     function test_Claim_NotOpen() external {

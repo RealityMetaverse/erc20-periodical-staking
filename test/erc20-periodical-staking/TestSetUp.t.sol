@@ -4,13 +4,13 @@ pragma solidity 0.8.20;
 import {Test, console} from "forge-std/Test.sol";
 import "forge-std/console.sol";
 
-import {MockToken} from "./MockToken.sol";
+import {TestToken} from "../shared/TestToken.sol";
 
-import {ERC20PeriodicalStaking} from "../src/contracts/ERC20PeriodicalStaking/ERC20PeriodicalStaking.sol";
-import "../src/contracts/ERC20PeriodicalStaking/ProgramManager.sol";
+import {ERC20PeriodicalStaking} from "../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
+import "../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
 
 contract TestSetUp is Test {
-    MockToken myToken;
+    TestToken myToken;
 
     uint256 myTokenDecimal = 18;
     uint256 myTokenDecimals = 10 ** myTokenDecimal;
@@ -40,7 +40,7 @@ contract TestSetUp is Test {
     uint256 tokenToDistribute = 1000 * myTokenDecimals;
 
     function setUp() external {
-        myToken = new MockToken(myTokenDecimal);
+        myToken = new TestToken(myTokenDecimal);
         stakingContract = new ERC20PeriodicalStaking(address(myToken));
         stakingContract.addContractAdmin(contractAdmin);
 

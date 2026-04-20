@@ -1,5 +1,7 @@
 /.local
+/broadcast
 /cache
+/docs
 /lib
 /out
 *.local.json

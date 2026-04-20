@@ -2,7 +2,7 @@
 pragma solidity 0.8.20;
 
 import "./TestSetUp.t.sol";
-import "../src/common/Types.sol";
+import "../../src/common/Types.sol";
 
 contract ReadFunctions is TestSetUp {
     function _getTotalStaked() internal view returns (uint256) {

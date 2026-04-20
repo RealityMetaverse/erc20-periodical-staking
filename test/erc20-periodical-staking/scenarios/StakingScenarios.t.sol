@@ -2,7 +2,7 @@
 pragma solidity 0.8.20;
 
 import "../AuxiliaryFunctions.sol";
-import "../../src/common/Types.sol";
+import "../../../src/common/Types.sol";
 
 contract StakingScenarious is AuxiliaryFunctions {
     function test_Staking_BeforeLaunch() external {

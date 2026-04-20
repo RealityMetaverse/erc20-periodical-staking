@@ -2,7 +2,7 @@
 pragma solidity 0.8.20;
 
 import "./AuxiliaryFunctions.sol";
-import "../src/common/Types.sol";
+import "../../src/common/Types.sol";
 
 contract MainManagementScenarios is AuxiliaryFunctions {
     // ======================================

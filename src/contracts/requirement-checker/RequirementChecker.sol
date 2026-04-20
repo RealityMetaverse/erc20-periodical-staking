@@ -5,15 +5,15 @@ pragma solidity 0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
-import "../common/Errors.sol";
-import "../interfaces/IPeriodicalStakingContract.sol";
-import "../interfaces/IStakingContract.sol";
+import "../../common/Errors.sol";
+import "../../interfaces/IPeriodicalStakingContract.sol";
+import "../../interfaces/IStakingContract.sol";
 
 /// @title RequirementChecker
 /// @notice Aggregates a user's worth from several staking contracts, ERC20 balance, and ERC1155 NFTs.
 contract RequirementChecker is Ownable, Errors {
     event DefaultRequiredWorthUpdated(uint256 newDefaultRequiredWorth);
-    event RequiredWorthPhasePeriodSet(uint256 indexed phase, uint256 indexed period, uint256 requiredWorth);
+    event RequiredPhasePeriodWorthSet(uint256 indexed phase, uint256 indexed period, uint256 requiredWorth);
     event StakingContractsUpdated(address[] newContracts);
     event PeriodicalStakingContractsUpdated(address[] newContracts);
     event ERC1155ConfigUpdated(address indexed token, uint256[] ids, uint256[] worths);
@@ -295,7 +295,7 @@ contract RequirementChecker is Ownable, Errors {
     // ======================================
     function _setRequiredWorthPhasePeriod(uint256 phase, uint256 period, uint256 requiredWorth) private {
         requiredWorthPhasePeriod[phase][period] = requiredWorth;
-        emit RequiredWorthPhasePeriodSet(phase, period, requiredWorth);
+        emit RequiredPhasePeriodWorthSet(phase, period, requiredWorth);
     }
 
     /// @dev Internal helper to validate and set staking contracts array

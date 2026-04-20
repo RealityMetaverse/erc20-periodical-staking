@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "../main-test-functions/LimitControllerFunctions.sol";
-import "../../src/common/Errors.sol";
-import "../../src/common/Types.sol";
+import "../functions/LimitControllerFunctions.sol";
+import "../../../src/common/Errors.sol";
+import "../../../src/common/Types.sol";
 
 contract LimitControllerScenarios is LimitControllerFunctions, Errors {
     // ======================================

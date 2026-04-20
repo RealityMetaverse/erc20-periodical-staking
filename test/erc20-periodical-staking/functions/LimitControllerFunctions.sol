@@ -2,8 +2,8 @@
 pragma solidity 0.8.20;
 
 import "../AuxiliaryFunctions.sol";
-import "../../src/contracts/LimitController.sol";
-import "../../src/common/Errors.sol";
+import "../../../src/contracts/LimitController.sol";
+import "../../../src/common/Errors.sol";
 
 contract LimitControllerFunctions is AuxiliaryFunctions {
     LimitController limitController;

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "../main-test-functions/WithdrawalFunctions.sol";
-import "../../src/common/Types.sol";
+import "../functions/WithdrawalFunctions.sol";
+import "../../../src/common/Types.sol";
 
 contract WithdrawalScenarious is WithdrawalFunctions {
     function test_Withdrawal_Periodical() external {
