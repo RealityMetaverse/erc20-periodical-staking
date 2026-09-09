@@ -55,12 +55,12 @@ contract WithdrawalFunctions is AuxiliaryFunctions {
             assertEq(currentData[9], expectedData[9]);
 
             targetDeposit = stakingContract.getDeposit(userAddress, _depositNo);
-            assertEq(targetDeposit.withdrawalDate, block.timestamp);
+            assertEq(targetDeposit.withdrawalDate, _now());
 
             rewardGenerated = 0;
 
             if (stakingPeriod == 0) {
-                uint256 daysPassed = (block.timestamp - targetDeposit.stakingStartDate) / (1 days);
+                uint256 daysPassed = (_now() - targetDeposit.stakingStartDate) / (1 days);
                 rewardGenerated = stakingContract.calculateReward(targetDeposit.amount, targetDeposit.APY, daysPassed);
             }
 

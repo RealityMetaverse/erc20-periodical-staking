@@ -52,8 +52,20 @@ contract MainManagementScenarios is AuxiliaryFunctions {
 
         assertEq(stakingContract.contractOwner(), address(this));
 
+        // v0.3.0: two-step ownership. Proposing does not move ownership.
         stakingContract.transferOwnership(userOne);
+        assertEq(stakingContract.contractOwner(), address(this));
+        assertEq(stakingContract.pendingOwner(), userOne);
+
+        vm.startPrank(userTwo);
+        vm.expectRevert();
+        stakingContract.acceptOwnership();
+        vm.stopPrank();
+
+        vm.prank(userOne);
+        stakingContract.acceptOwnership();
         assertEq(stakingContract.contractOwner(), userOne);
+        assertEq(stakingContract.pendingOwner(), address(0));
     }
 
     function test_ProgramManagement_AddRemoveAdmin() external {

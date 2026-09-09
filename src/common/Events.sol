@@ -7,7 +7,10 @@ import "./Types.sol";
 /// @title Events
 /// @notice Centralized event definitions for the staking system
 abstract contract Events {
+    /// @notice Emitted when ownership transfer completes (pending owner accepted).
     event TransferOwnership(address from, address to);
+    /// @notice Emitted when the owner proposes a new owner; transfer completes on acceptOwnership.
+    event OwnershipTransferStarted(address indexed from, address indexed to);
 
     event AddContractAdmin(address indexed user);
     event RemoveContractAdmin(address indexed user);
@@ -25,6 +28,7 @@ abstract contract Events {
 
     event ProvideReward(address indexed by, uint256 tokenAmount);
     event CollectReward(address indexed by, uint256 tokenAmount);
+    event RescueTokens(address indexed token, address indexed to, uint256 tokenAmount);
 
     event UpdatePhasePeriodData(
         Types.PhasePeriodDataType indexed dataType,

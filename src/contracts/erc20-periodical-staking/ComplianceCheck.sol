@@ -26,7 +26,12 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
     }
 
     function _checkDepositExistence(uint256 depositNumber) private view {
-        if (!(depositNumber < (stakerDepositList[msg.sender].length))) {
+        _checkDepositExistenceFor(msg.sender, depositNumber);
+    }
+
+    /// @dev Reverts with DepositDoesNotExist instead of an opaque out-of-bounds panic.
+    function _checkDepositExistenceFor(address userAddress, uint256 depositNumber) internal view {
+        if (depositNumber >= stakerDepositList[userAddress].length) {
             revert DepositDoesNotExist(depositNumber);
         }
     }
@@ -41,13 +46,10 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
         }
     }
 
-    function _checkIfEnoughFundsInRewardPool(uint256 amountToCheck, bool mustRevert) internal view returns (bool) {
-        if (amountToCheck > rewardPool) {
-            if (mustRevert) revert NotEnoughFundsInRewardPool(amountToCheck, rewardPool);
-            else return false;
-        } else {
-            return true;
-        }
+    /// @notice Reward pool amount not committed to open periodical deposits (0 when the pool is short).
+    function getCollectableReward() public view returns (uint256) {
+        uint256 reserved = totalDataList[Types.DataType.REWARD_EXPECTED];
+        return rewardPool > reserved ? rewardPool - reserved : 0;
     }
 
     function checkIfStakingPhaseExists(uint256 stakingPhase) public view returns (bool) {
@@ -66,6 +68,7 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
     }
 
     function checkDepositStatus(address userAddress, uint256 depositNumber) public view returns (DepositStatus) {
+        _checkDepositExistenceFor(userAddress, depositNumber);
         TokenDeposit memory targetDeposit = stakerDepositList[userAddress][depositNumber];
         if (targetDeposit.withdrawalDate == 0) {
             return (targetDeposit.stakingEndDate == 0)
@@ -197,8 +200,13 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
     // ======================================
     // =    Token Management Functions      =
     // ======================================
+    /// @dev Strict accounting: the balance delta must equal tokenAmount exactly.
+    ///      Fee-on-transfer and rebasing tokens are unsupported by design.
     function _receiveToken(uint256 tokenAmount) internal {
+        uint256 balanceBefore = STAKING_TOKEN.balanceOf(address(this));
         STAKING_TOKEN.safeTransferFrom(msg.sender, address(this), tokenAmount);
+        uint256 received = STAKING_TOKEN.balanceOf(address(this)) - balanceBefore;
+        if (received != tokenAmount) revert UnexpectedTokenAmount(tokenAmount, received);
     }
 
     function _sendToken(address toAddress, uint256 tokenAmount) internal {

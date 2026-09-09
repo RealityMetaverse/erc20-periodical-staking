@@ -19,6 +19,8 @@ abstract contract AccessControl is ProgramManager {
     }
 
     address public contractOwner;
+    /// @notice Address proposed via transferOwnership; becomes owner on acceptOwnership.
+    address public pendingOwner;
     mapping(address => bool) public contractAdmins;
 
     // ======================================

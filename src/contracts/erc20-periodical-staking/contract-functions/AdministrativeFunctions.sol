@@ -10,12 +10,29 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     // =         Program Management         =
     // ======================================
     using ArrayLibrary for uint256[];
+    using SafeERC20 for IERC20;
 
+    /// @notice Propose a new owner. Ownership only moves once the proposed address calls acceptOwnership.
+    /// @dev Two-step transfer: a mistyped address cannot brick administration. Passing address(0) cancels
+    ///      a pending proposal.
+    /// @param userAddress The proposed new owner (or address(0) to cancel)
     function transferOwnership(address userAddress) external onlyContractOwner {
-        if (userAddress == address(0)) revert ZeroAddressProvided();
-        contractOwner = userAddress;
+        pendingOwner = userAddress;
 
-        emit TransferOwnership(msg.sender, userAddress);
+        emit OwnershipTransferStarted(msg.sender, userAddress);
+    }
+
+    /// @notice Complete an ownership transfer proposed via transferOwnership.
+    /// @dev Only the pending owner may call. Clears pendingOwner.
+    function acceptOwnership() external {
+        address newOwner = pendingOwner;
+        if (newOwner == address(0) || msg.sender != newOwner) revert NotPendingOwner(msg.sender, newOwner);
+
+        address previousOwner = contractOwner;
+        contractOwner = newOwner;
+        pendingOwner = address(0);
+
+        emit TransferOwnership(previousOwner, newOwner);
     }
 
     function addContractAdmin(address userAddress) external onlyContractOwner {
@@ -77,13 +94,16 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit AddStakingPhase(newStakingPhaseIndex);
     }
 
+    /// @notice Remove the last staking phase's configuration (APY and target for every period).
+    /// @dev Accounting (STAKED, user/total data, rewardPool) is never touched: deposits opened on the
+    ///      removed phase stay claimable and withdrawable. Gas is O(periods), independent of staker count.
     function popStakingPhase() external onlyContractOwner {
+        if (stakingPhaseCount == 0) revert NoStakingPhasesAddedYet();
         uint256 lastStakingPhase = stakingPhaseCount - 1;
 
-        for (uint256 periodIndex = 0; periodIndex < stakingPeriodList.length; periodIndex++) {
-            uint256 stakingPeriod = stakingPeriodList[periodIndex];
-            _clearPhasePeriodData(lastStakingPhase, stakingPeriod);
-            _clearPhasePeriodUserData(lastStakingPhase, stakingPeriod);
+        uint256 periodCount = stakingPeriodList.length;
+        for (uint256 periodIndex = 0; periodIndex < periodCount; periodIndex++) {
+            _clearPhasePeriodConfig(lastStakingPhase, stakingPeriodList[periodIndex]);
         }
 
         stakingPhaseCount -= 1;
@@ -121,17 +141,21 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit AddStakingPeriod(newStakingPeriod);
     }
 
+    /// @notice Remove a staking period's configuration (APY and target for every phase).
+    /// @dev Accounting (STAKED, user/total data, rewardPool) is never touched: deposits opened on the
+    ///      removed period stay claimable and withdrawable, and if the period is re-added the tokens still
+    ///      staked there keep counting toward the new target. Gas is O(phases), independent of staker count.
+    /// @param stakingPeriod The period (in days) to remove
     function removeStakingPeriod(uint256 stakingPeriod) external onlyContractOwner {
-        if (checkIfStakingPeriodExists(stakingPeriod)) {
-            for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
-                _clearPhasePeriodData(phase, stakingPeriod);
-                _clearPhasePeriodUserData(phase, stakingPeriod);
-            }
+        uint256 periodIndex = stakingPeriodList.findElementIndex(stakingPeriod);
+        if (periodIndex == stakingPeriodList.length) revert StakingPeriodDoesNotExist(stakingPeriod);
 
-            stakingPeriodList.removeElementByIndex(stakingPeriodList.findElementIndex(stakingPeriod));
-        } else {
-            revert StakingPeriodDoesNotExist(stakingPeriod);
+        uint256 phaseCount = stakingPhaseCount;
+        for (uint256 phase = 0; phase < phaseCount; phase++) {
+            _clearPhasePeriodConfig(phase, stakingPeriod);
         }
+
+        stakingPeriodList.removeElementByIndex(periodIndex);
 
         emit RemoveStakingPeriod(stakingPeriod);
     }
@@ -158,24 +182,11 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit ChangeStakingPhase(phaseToSwitch);
     }
 
-    /// @dev Remove all user-scoped data tied to a specific phase/period pair across every DataType.
-    function _clearPhasePeriodUserData(uint256 stakingPhase, uint256 stakingPeriod) internal {
-        uint256 dataTypeCount = uint256(type(Types.DataType).max) + 1;
-        uint256 stakerCount = stakerAddressList.length;
-
-        for (uint256 i = 0; i < dataTypeCount; i++) {
-            for (uint256 j = 0; j < stakerCount; j++) {
-                delete userPhasePeriodDataList[Types.DataType(i)][stakingPhase][stakingPeriod][stakerAddressList[j]];
-            }
-        }
-    }
-
-    /// @dev Remove all phase/period data across every PhasePeriodDataType.
-    function _clearPhasePeriodData(uint256 stakingPhase, uint256 stakingPeriod) internal {
-        uint256 dataTypeCount = uint256(type(Types.PhasePeriodDataType).max) + 1;
-        for (uint256 i = 0; i < dataTypeCount; i++) {
-            delete phasePeriodDataList[Types.PhasePeriodDataType(i)][stakingPhase][stakingPeriod];
-        }
+    /// @dev Delete only the configuration cells (APY, STAKING_TARGET) of a phase/period pair.
+    ///      STAKED is accounting and must survive removal (see the v0.2.4 incident in README).
+    function _clearPhasePeriodConfig(uint256 stakingPhase, uint256 stakingPeriod) internal {
+        delete phasePeriodDataList[Types.PhasePeriodDataType.APY][stakingPhase][stakingPeriod];
+        delete phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][stakingPhase][stakingPeriod];
     }
 
     // ======================================
@@ -233,20 +244,53 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     // ======================================
     // =           Fund Management          =
     // ======================================
+    /// @notice Withdraw uncommitted reward tokens from the pool.
+    /// @dev Cannot reduce rewardPool below totalDataList[REWARD_EXPECTED], the reward already promised to
+    ///      open periodical deposits. Records REWARD_COLLECTED for symmetry with REWARD_PROVIDED.
+    /// @param tokenAmount Amount to collect
     function collectReward(uint256 tokenAmount) external nonReentrant onlyContractOwner {
-        _checkIfEnoughFundsInRewardPool(tokenAmount, true);
+        if (tokenAmount == 0) revert ZeroAmountProvided();
+        uint256 collectable = getCollectableReward();
+        if (tokenAmount > collectable) revert RewardPoolBelowReserved(tokenAmount, collectable);
+
         rewardPool -= tokenAmount;
+        userDataList[Types.DataType.REWARD_COLLECTED][msg.sender] += tokenAmount;
+        totalDataList[Types.DataType.REWARD_COLLECTED] += tokenAmount;
 
         emit CollectReward(msg.sender, tokenAmount);
         _sendToken(msg.sender, tokenAmount);
     }
 
+    /// @notice Fund the reward pool.
+    /// @param tokenAmount Amount to provide (caller must have approved the contract)
     function provideReward(uint256 tokenAmount) external nonReentrant onlyAdmins {
+        if (tokenAmount == 0) revert ZeroAmountProvided();
         userDataList[Types.DataType.REWARD_PROVIDED][msg.sender] += tokenAmount;
         totalDataList[Types.DataType.REWARD_PROVIDED] += tokenAmount;
         rewardPool += tokenAmount;
 
         emit ProvideReward(msg.sender, tokenAmount);
         _receiveToken(tokenAmount);
+    }
+
+    /// @notice Recover tokens sent to the contract by mistake.
+    /// @dev Any token other than STAKING_TOKEN can be rescued in full. For STAKING_TOKEN only the excess
+    ///      over totalDataList[STAKING] + rewardPool (staked principal plus the reward pool) is rescuable,
+    ///      so user funds and committed rewards can never be extracted through this path.
+    /// @param token Token to rescue
+    /// @param amount Amount to send to the owner
+    function rescueTokens(address token, uint256 amount) external nonReentrant onlyContractOwner {
+        if (token == address(0)) revert ZeroAddressProvided();
+        if (amount == 0) revert ZeroAmountProvided();
+
+        uint256 excess = IERC20(token).balanceOf(address(this));
+        if (token == address(STAKING_TOKEN)) {
+            uint256 reserved = totalDataList[Types.DataType.STAKING] + rewardPool;
+            excess = excess > reserved ? excess - reserved : 0;
+        }
+        if (amount > excess) revert RescueAmountExceedsExcess(amount, excess);
+
+        emit RescueTokens(token, msg.sender, amount);
+        IERC20(token).safeTransfer(msg.sender, amount);
     }
 }

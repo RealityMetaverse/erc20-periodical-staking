@@ -35,6 +35,8 @@ contract StakingScenarious is AuxiliaryFunctions {
 
     function test_Staking_AmountExceedsTarget() external {
         _addPhasesAndPeriods();
+        _increaseAllowance(address(this), amountToProvide);
+        stakingContract.provideReward(amountToProvide);
         _stakeTokenWithAllowance(userThree, 0, 0, _getPhasePeriodStakingTarget(0, 0));
 
         _increaseAllowance(userOne, amountToStake);

@@ -58,7 +58,7 @@ contract ClaimFunctions is AuxiliaryFunctions {
             assertEq(currentData[9], expectedData[9]);
 
             targetDeposit = stakingContract.getDeposit(userAddress, _depositNo);
-            uint256 withdrawalDate = (stakingPeriod == 0) ? 0 : block.timestamp;
+            uint256 withdrawalDate = (stakingPeriod == 0) ? 0 : _now();
             assertEq(targetDeposit.withdrawalDate, withdrawalDate);
 
             if (stakingPeriod == 0) rewardGenerated = 0;

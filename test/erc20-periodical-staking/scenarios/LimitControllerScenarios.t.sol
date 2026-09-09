@@ -359,6 +359,8 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
     function test_LimitController_Staking_DifferentPhasesPeriods() external {
         _deployLimitController(address(stakingContract));
         _addPhasesAndPeriods();
+        _increaseAllowance(address(this), amountToProvide);
+        stakingContract.provideReward(amountToProvide);
         uint256 limit1 = 100 * myTokenDecimals;
         uint256 limit2 = 200 * myTokenDecimals;
         uint256 stakeAmount1 = 50 * myTokenDecimals;

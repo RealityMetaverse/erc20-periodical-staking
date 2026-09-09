@@ -7,6 +7,8 @@ import "../../../src/common/Types.sol";
 contract WithdrawalScenarious is WithdrawalFunctions {
     function test_Withdrawal_Periodical() external {
         _addPhasesAndPeriods();
+        _increaseAllowance(address(this), amountToProvide);
+        stakingContract.provideReward(amountToProvide);
 
         _stakeTokenWithAllowance(userOne, 0, 90, amountToStake);
         _withdrawTokenWithTest(userOne, 0, false);
@@ -14,6 +16,8 @@ contract WithdrawalScenarious is WithdrawalFunctions {
 
     function test_Withdrawal_PeriodicalMultiple() external {
         _addPhasesAndPeriods();
+        _increaseAllowance(address(this), amountToProvide);
+        stakingContract.provideReward(amountToProvide);
 
         _stakeTokenWithAllowance(userOne, 0, 90, amountToStake);
         _stakeTokenWithAllowance(userOne, 0, 90, amountToStake);
@@ -25,6 +29,8 @@ contract WithdrawalScenarious is WithdrawalFunctions {
 
     function test_Withdrawal_PeriodicalSameDeposit() external {
         _addPhasesAndPeriods();
+        _increaseAllowance(address(this), amountToProvide);
+        stakingContract.provideReward(amountToProvide);
 
         _stakeTokenWithAllowance(userOne, 0, 90, amountToStake);
         _withdrawTokenWithTest(userOne, 0, false);
@@ -71,6 +77,9 @@ contract WithdrawalScenarious is WithdrawalFunctions {
 
     function test_Withdrawal_MultiplePhasesPeriods() external {
         _addPhasesAndPeriods();
+        // Fund the pool up front so the matured periodical claims below can be paid.
+        _increaseAllowance(address(this), amountToProvide);
+        stakingContract.provideReward(amountToProvide);
 
         uint256 timesStaked;
         uint256 skipDays = 5 days;
@@ -84,10 +93,7 @@ contract WithdrawalScenarious is WithdrawalFunctions {
         timesStaked += _tryMultiUserMultiStake();
         skip(skipDays);
 
-        console.log(block.timestamp);
-
-        _increaseAllowance(address(this), amountToProvide);
-        stakingContract.provideReward(amountToProvide);
+        console.log(_now());
 
         for (uint256 i = 0; i < timesStaked; i++) {
             for (uint256 userNo = 0; userNo < addressList.length; userNo++) {

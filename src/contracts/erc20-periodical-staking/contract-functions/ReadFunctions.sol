@@ -289,6 +289,52 @@ abstract contract ReadFunctions is ComplianceCheck {
         return phasePeriodData;
     }
 
+    /// @notice Reward the pool must still be able to pay for every configured periodical cell to fill.
+    /// @dev Sum over every (phase < stakingPhaseCount, period in stakingPeriodList, period != 0) of
+    ///      `calculateReward(target - staked, apy, period)` (0 when the cell is already at or above target).
+    ///      Stakes are never blocked by pool state; this is an ops view so the pool can be funded before
+    ///      deposits mature (a matured periodical claim reverts `NotEnoughFundsInRewardPool` while the pool
+    ///      is short).
+    function getRewardRequiredForTargets() public view returns (uint256 required) {
+        uint256 phaseCount = stakingPhaseCount;
+        uint256 periodCount = stakingPeriodList.length;
+
+        for (uint256 phase = 0; phase < phaseCount;) {
+            for (uint256 periodIndex = 0; periodIndex < periodCount;) {
+                uint256 period = stakingPeriodList[periodIndex];
+                if (period != 0) {
+                    uint256 target = getPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, phase, period);
+                    uint256 staked = getPhasePeriodData(Types.PhasePeriodDataType.STAKED, phase, period);
+                    if (target > staked) {
+                        uint256 apy = getPhasePeriodData(Types.PhasePeriodDataType.APY, phase, period);
+                        required += calculateReward(target - staked, apy, period);
+                    }
+                }
+                unchecked {
+                    ++periodIndex;
+                }
+            }
+            unchecked {
+                ++phase;
+            }
+        }
+    }
+
+    /// @notice Extra reward-pool funding needed so that every already-open periodical deposit AND every
+    ///         open target, once filled, can be paid at maturity.
+    /// @dev `deficit = max(0, totalDataList[REWARD_EXPECTED] - rewardPool)` is what already-open deposits are
+    ///      missing today; `required` is what the remaining target capacity would add.
+    /// @return shortfall `max(0, getRewardRequiredForTargets() + deficit - getCollectableReward())`
+    function getRewardPoolShortfall() external view returns (uint256 shortfall) {
+        uint256 required = getRewardRequiredForTargets();
+        uint256 reserved = totalDataList[Types.DataType.REWARD_EXPECTED];
+        uint256 pool = rewardPool;
+        uint256 deficit = reserved > pool ? reserved - pool : 0;
+        uint256 collectable = pool > reserved ? pool - reserved : 0;
+        uint256 needed = required + deficit;
+        return needed > collectable ? needed - collectable : 0;
+    }
+
     function checkTotalClaimableData() external view returns (uint256, uint256, uint256) {
         uint256 totalClaimableStaking;
         uint256 totalClaimablePeriodicalReward;
@@ -314,9 +360,11 @@ abstract contract ReadFunctions is ComplianceCheck {
         return stakerDepositList[userAddress].length;
     }
 
+    /// @notice Get a deposit. For INDEFINITE deposits `rewardGenerated` is the currently claimable reward.
+    /// @dev Reverts DepositDoesNotExist instead of panicking on an out-of-range index.
     function getDeposit(address userAddress, uint256 depositNumber) public view returns (TokenDeposit memory) {
-        TokenDeposit memory targetDeposit = stakerDepositList[userAddress][depositNumber];
         DepositStatus depositStatus = checkDepositStatus(userAddress, depositNumber);
+        TokenDeposit memory targetDeposit = stakerDepositList[userAddress][depositNumber];
         if (depositStatus == DepositStatus.INDEFINITE) {
             uint256 reward = _calculateIndefiniteDepositReward(targetDeposit);
             return TokenDeposit(
@@ -334,11 +382,16 @@ abstract contract ReadFunctions is ComplianceCheck {
         }
     }
 
+    /// @notice Get deposits [fromIndex, toIndex) of a user.
+    /// @dev Reverts InvalidRange when fromIndex > toIndex or toIndex exceeds the deposit count.
     function getDepositsInRangeBy(address userAddress, uint256 fromIndex, uint256 toIndex)
         external
         view
         returns (TokenDeposit[] memory)
     {
+        if (fromIndex > toIndex || toIndex > stakerDepositList[userAddress].length) {
+            revert InvalidRange(fromIndex, toIndex);
+        }
         TokenDeposit[] memory userDepositsInRange = new TokenDeposit[](toIndex - fromIndex);
 
         for (uint256 i = fromIndex; i < toIndex; i++) {
@@ -426,10 +479,13 @@ abstract contract ReadFunctions is ComplianceCheck {
         );
     }
 
+    /// @dev Saturating: if an APY reduction makes the accrued total smaller than what was already paid
+    ///      (rewardGenerated), the claimable reward is 0 rather than an underflow that locks the deposit.
     function _calculateIndefiniteDepositReward(TokenDeposit memory targetDeposit) internal view returns (uint256) {
         uint256 timePassed = block.timestamp - targetDeposit.stakingStartDate;
         uint256 daysPassed = timePassed / (1 days);
 
-        return calculateReward(targetDeposit.amount, targetDeposit.APY, daysPassed) - targetDeposit.rewardGenerated;
+        uint256 accrued = calculateReward(targetDeposit.amount, targetDeposit.APY, daysPassed);
+        return accrued > targetDeposit.rewardGenerated ? accrued - targetDeposit.rewardGenerated : 0;
     }
 }

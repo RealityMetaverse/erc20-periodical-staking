@@ -6,3 +6,5 @@
 /out
 *.local.json
 *.Identifier
+/out-*
+/cache-*

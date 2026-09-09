@@ -6,13 +6,15 @@ import "../ComplianceCheck.sol";
 import "../../../common/Types.sol";
 
 abstract contract WriteFunctions is ComplianceCheck {
+    /// @dev Advance the user's active-deposit cursor past every closed (WITHDRAWN/CLAIMED) deposit.
+    ///      When every deposit is closed the cursor equals the deposit count, so later loops are empty.
     function _updateActiveDepositStartIndex(address userAddress) internal {
         uint256 userDepositCount = stakerDepositList[userAddress].length;
 
         if (userDepositCount == 0) return;
 
         uint256 currentIndex = stakerActiveDepositStartIndex[userAddress];
-        uint256 newStartIndex = userDepositCount - 1;
+        uint256 newStartIndex = userDepositCount;
 
         for (uint256 i = currentIndex; i < userDepositCount; i++) {
             DepositStatus status = checkDepositStatus(userAddress, i);

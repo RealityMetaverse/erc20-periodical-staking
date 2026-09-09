@@ -19,7 +19,9 @@ library ArrayLibrary {
         targetArray.pop();
     }
 
-    function sortStorage(uint256[] storage targetArray) public {
+    /// @dev Deliberately internal: keeps the library inlined so the staking contract has no link references and
+    ///      never DELEGATECALLs an externally deployed library.
+    function sortStorage(uint256[] storage targetArray) internal {
         uint256 arrayLength = targetArray.length;
         if (arrayLength <= 1) return;
 

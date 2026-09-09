@@ -11,7 +11,13 @@ abstract contract Errors {
     // =        Common Errors               =
     // ======================================
     error ZeroAddressProvided();
+    error ZeroAmountProvided();
     error LengthMismatch(uint256 expectedLength, uint256 actualLength);
+    /// @notice The token balance delta observed on transfer-in differs from the requested amount
+    ///         (fee-on-transfer / rebasing tokens are unsupported).
+    error UnexpectedTokenAmount(uint256 expectedAmount, uint256 receivedAmount);
+    /// @notice Rescue would touch staked principal or the reward pool.
+    error RescueAmountExceedsExcess(uint256 requestedAmount, uint256 excessAmount);
 
     // ======================================
     // =    Staking Phase/Period Errors     =
@@ -26,6 +32,7 @@ abstract contract Errors {
     // =        Deposit Errors              =
     // ======================================
     error DepositDoesNotExist(uint256 depositNumber);
+    error InvalidRange(uint256 fromIndex, uint256 toIndex);
     error NotWithdrawable(uint256 depositNumber);
     error NotClaimable(uint256 depositNumber);
     error InsufficientDeposit(uint256 _tokenSent, uint256 _requiredAmount);
@@ -41,6 +48,8 @@ abstract contract Errors {
     // ======================================
     error NotEnoughFundsInRewardPool(uint256 requestedAmount, uint256 availableAmount);
     error NoRewardToClaim(uint256 depositNumber);
+    /// @notice Collecting this amount would leave the pool below the reward already committed to open deposits.
+    error RewardPoolBelowReserved(uint256 requestedAmount, uint256 collectableAmount);
 
     // ======================================
     // =        Validation Errors           =
@@ -54,6 +63,7 @@ abstract contract Errors {
     // =        Access Control Errors       =
     // ======================================
     error NotOpen(Types.DataType action);
+    error NotPendingOwner(address caller, address pendingOwner);
     error NotWhitelisted(address user);
     error RequirementNotMet(uint256 requiredWorth, uint256 actualWorth);
 

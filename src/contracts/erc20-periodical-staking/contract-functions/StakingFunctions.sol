@@ -7,6 +7,16 @@ import "./WriteFunctions.sol";
 import "../../../common/Types.sol";
 
 abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
+    /// @notice Open a deposit on (stakingPhase, stakingPeriod).
+    /// @dev No reward-pool check is performed at stake time. Periodical deposits (period != 0)
+    ///      add their full reward to `totalDataList[REWARD_EXPECTED]`, which `collectReward` can never take from
+    ///      the pool; if the pool is short when the deposit matures, `claimDeposit` reverts
+    ///      `NotEnoughFundsInRewardPool` until the owner tops up (no loss). Indefinite deposits (period 0)
+    ///      are not reserved and are paid only from `getCollectableReward()`.
+    /// @param stakingPhase Must equal currentStakingPhase
+    /// @param stakingPeriod Period in days; 0 for an indefinite deposit
+    /// @param tokenAmount Amount to stake (caller must have approved the contract)
+    /// @param expectedAPY Must equal the configured APY (front-running guard)
     function safeStake(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount, uint256 expectedAPY)
         external
         nonReentrant

@@ -7,12 +7,15 @@ import "./WriteFunctions.sol";
 import "../../../common/Types.sol";
 
 abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
-    function withdrawDeposit(uint256 depositNumber)
-        external
-        nonReentrant
-        ifAvailable(Types.DataType.WITHDRAWAL)
-        ifDepositExists(depositNumber)
-    {
+    /// @dev Shared body of withdrawDeposit / withdrawDepositPartial.
+    ///      - TIME_LEFT: returns principal only and releases the reward reserved at stake time.
+    ///      - INDEFINITE: returns principal plus the accrued reward, paid from the unreserved part of the pool
+    ///        (`getCollectableReward()`, never the reserve promised to periodical deposits). When the free pool
+    ///        cannot cover the whole accrued reward the payout is reduced to what is available, but only if
+    ///        that reduced reward is at least `minReward`; otherwise the call reverts
+    ///        `NotEnoughFundsInRewardPool(accrued, available)` and the deposit stays open and keeps accruing.
+    ///        The unpaid remainder is never forfeited silently.
+    function _withdrawDeposit(uint256 depositNumber, uint256 minReward) private {
         DepositStatus depositStatus = checkDepositStatus(msg.sender, depositNumber);
         if (depositStatus != DepositStatus.TIME_LEFT && depositStatus != DepositStatus.INDEFINITE) {
             revert NotWithdrawable(depositNumber);
@@ -34,8 +37,15 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
             // DepositStatus.INDEFINITE
             targetDeposit.stakingEndDate = block.timestamp + 1;
 
+            // The accrued reward is paid from the unreserved pool only (never the reserve promised to
+            // periodical deposits). A shortfall is reduced to what is available, but never silently: the
+            // caller's minReward floor decides whether a reduced payout is acceptable.
             depositReward = _calculateIndefiniteDepositReward(targetDeposit);
-            _checkIfEnoughFundsInRewardPool(depositReward, true);
+            uint256 available = getCollectableReward();
+            if (depositReward > available) {
+                if (available < minReward) revert NotEnoughFundsInRewardPool(depositReward, available);
+                depositReward = available;
+            }
 
             targetDeposit.rewardGenerated += depositReward;
             rewardPool -= depositReward;
@@ -53,5 +63,40 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
 
         emit Withdraw(msg.sender, depositNumber, targetDeposit.amount, depositReward);
         _sendToken(msg.sender, amountToSend);
+    }
+
+    /// @notice Withdraw an open deposit in full.
+    /// @dev TIME_LEFT (periodical, not yet matured): returns principal only; the reward reserved at stake time
+    ///      is released. INDEFINITE: returns principal plus the whole accrued reward, paid from
+    ///      `getCollectableReward()` (the unreserved part of the pool). If the free pool cannot cover the
+    ///      accrued reward the call reverts `NotEnoughFundsInRewardPool(accrued, collectable)` and the deposit
+    ///      stays open and keeps accruing; retry after a top-up, or use `withdrawDepositPartial` to close it
+    ///      with a reduced reward. Reverts `NotWithdrawable` for matured or already closed deposits.
+    /// @param depositNumber Index of the deposit in the caller's deposit list
+    function withdrawDeposit(uint256 depositNumber)
+        external
+        nonReentrant
+        ifAvailable(Types.DataType.WITHDRAWAL)
+        ifDepositExists(depositNumber)
+    {
+        _withdrawDeposit(depositNumber, type(uint256).max);
+    }
+
+    /// @notice Withdraw an open deposit, accepting a reduced indefinite reward when the free pool is short.
+    /// @dev Same as `withdrawDeposit`, except that an INDEFINITE deposit whose accrued reward exceeds
+    ///      `getCollectableReward()` is closed with `min(accrued, collectable)` reward instead of reverting,
+    ///      provided that reduced reward is at least `minReward`; otherwise the call reverts
+    ///      `NotEnoughFundsInRewardPool(accrued, collectable)` and nothing changes. `minReward = 0` always
+    ///      succeeds (principal is never locked behind an unpayable reward). The unpaid remainder stays in the
+    ///      pool. For TIME_LEFT deposits `minReward` is ignored (they never pay a reward).
+    /// @param depositNumber Index of the deposit in the caller's deposit list
+    /// @param minReward Lowest reward the caller is willing to close the deposit for
+    function withdrawDepositPartial(uint256 depositNumber, uint256 minReward)
+        external
+        nonReentrant
+        ifAvailable(Types.DataType.WITHDRAWAL)
+        ifDepositExists(depositNumber)
+    {
+        _withdrawDeposit(depositNumber, minReward);
     }
 }

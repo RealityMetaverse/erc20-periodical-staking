@@ -5,11 +5,21 @@ import {Test, console} from "forge-std/Test.sol";
 import "forge-std/console.sol";
 
 import {TestToken} from "../shared/TestToken.sol";
+import {Clock} from "../shared/Clock.sol";
 
 import {ERC20PeriodicalStaking} from "../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 import "../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
 
 contract TestSetUp is Test {
+    /// @dev Live-timestamp source. With `via_ir` a raw `block.timestamp` read after `skip` / `vm.warp` inside
+    ///      the same test function can be CSE-d to the pre-warp value (see test/shared/ClockHazard.t.sol), so
+    ///      every test that compares against the current time must go through `_now()`.
+    Clock internal clock = new Clock();
+
+    function _now() internal view returns (uint256) {
+        return clock.now();
+    }
+
     TestToken myToken;
 
     uint256 myTokenDecimal = 18;
