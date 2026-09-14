@@ -6,11 +6,22 @@ import "./contract-functions/AdministrativeFunctions.sol";
 import "./contract-functions/StakingFunctions.sol";
 import "./contract-functions/WithdrawFunctions.sol";
 import "./contract-functions/ClaimFunctions.sol";
+import "./contract-functions/EnforcementFunctions.sol";
 
 /// @title Periodical ERC20 Staking
 /// @author Heydar Badirli
-contract ERC20PeriodicalStaking is AdministrativeFunctions, StakingFunctions, WithdrawFunctions, ClaimFunctions {
-    constructor(address tokenAddress) ProgramManager(IERC20Metadata(tokenAddress)) {
+/// @notice Voucher-gated staking: set voucherSigner, limitController and treasury after deployment.
+contract ERC20PeriodicalStaking is
+    AdministrativeFunctions,
+    StakingFunctions,
+    WithdrawFunctions,
+    ClaimFunctions,
+    EnforcementFunctions
+{
+    constructor(address tokenAddress)
+        ProgramManager(IERC20Metadata(tokenAddress))
+        EIP712("ERC20PeriodicalStaking", "1")
+    {
         contractOwner = msg.sender;
     }
 }

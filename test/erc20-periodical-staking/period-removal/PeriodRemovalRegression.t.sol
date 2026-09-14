@@ -12,7 +12,7 @@ import "../functions/WithdrawalFunctions.sol";
 contract PeriodRemovalRegression is ClaimFunctions, WithdrawalFunctions {
     uint256 constant PERIOD_SHORT = 7;
     uint256 constant PERIOD_LONG = 90;
-    uint256 constant APY = 30;
+    uint256 constant APY = 3000; // bps (30%)
     uint256 constant TARGET = 10_000_000 ether;
     uint256 constant STAKE_AMOUNT = 200 ether;
 
@@ -49,10 +49,8 @@ contract PeriodRemovalRegression is ClaimFunctions, WithdrawalFunctions {
     }
 
     function _stakeFor(address user, uint256 phase, uint256 period, uint256 amount) internal {
-        uint256 apy = stakingContract.phasePeriodDataList(Types.PhasePeriodDataType.APY, phase, period);
         _increaseAllowance(user, amount);
-        vm.prank(user);
-        stakingContract.safeStake(phase, period, amount, apy);
+        _stakeV(stakingContract, user, phase, period, amount);
     }
 
     function _stakeFor(address user, uint256 period, uint256 amount) internal {
@@ -78,10 +76,11 @@ contract PeriodRemovalRegression is ClaimFunctions, WithdrawalFunctions {
                 0,
                 "userPhasePeriod STAKING"
             );
+            // v0.4.0: only the STAKING cell is tracked per phase/period.
             assertEq(
-                stakingContract.getUserPhasePeriodData(Types.DataType.REWARD_EXPECTED, users[i], 0, PERIOD_SHORT),
+                stakingContract.getUserPhasePeriodData(Types.DataType.STAKING, users[i], 0, PERIOD_LONG),
                 0,
-                "userPhasePeriod REWARD_EXPECTED"
+                "userPhasePeriod STAKING long"
             );
         }
         // Contract holds exactly the remaining reward pool.
@@ -356,9 +355,11 @@ contract PeriodRemovalRegression is ClaimFunctions, WithdrawalFunctions {
         stakingContract.addStakingPeriod(PERIOD_SHORT, apys, targets);
 
         _increaseAllowance(userTwo, STAKE_AMOUNT);
+        (Types.StakeVoucher memory v, bytes memory sig) =
+            _prepareVoucherStake(stakingContract, userTwo, 0, PERIOD_SHORT, 0, 0);
         vm.prank(userTwo);
         vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_SHORT, targets[0]));
-        stakingContract.safeStake(0, PERIOD_SHORT, STAKE_AMOUNT, APY);
+        stakingContract.stakeWithVoucher(v, sig, STAKE_AMOUNT, APY);
 
         skip(PERIOD_SHORT * 1 days + 1);
         vm.prank(userOne);
@@ -410,5 +411,146 @@ contract PeriodRemovalRegression is ClaimFunctions, WithdrawalFunctions {
 
         assertLt(gasUsed, REMOVE_PERIOD_GAS_BOUND, "popStakingPhase gas scales with staker count");
         assertEq(_getPhasePeriodStakingStaked(0, PERIOD_SHORT), STAKE_AMOUNT * stakerCount);
+    }
+
+    // ======================================
+    // =  v0.4.0: seize after removal       =
+    // ======================================
+
+    /// @notice Seizing deposits on a removed period closes them like a claim/withdraw would.
+    function test_SeizeDeposits_AfterRemoveStakingPeriod() public {
+        _setupProgram();
+        _stakeFor(userOne, PERIOD_SHORT, STAKE_AMOUNT);
+        _stakeFor(userOne, PERIOD_LONG, STAKE_AMOUNT);
+        uint256 rewards =
+            stakingContract.getDeposit(userOne, 0).rewardGenerated + stakingContract.getDeposit(userOne, 1).rewardGenerated;
+
+        stakingContract.removeStakingPeriod(PERIOD_SHORT);
+        stakingContract.popStakingPhase();
+
+        address[] memory wallets = new address[](2);
+        wallets[0] = userOne;
+        wallets[1] = userOne;
+        uint256[] memory numbers = new uint256[](2);
+        numbers[1] = 1;
+        vm.prank(contractAdmin);
+        stakingContract.freezeDeposits(wallets, numbers);
+        uint256 poolBefore = stakingContract.rewardPool();
+        stakingContract.seizeDeposits(wallets, numbers);
+
+        assertGt(rewards, 0);
+        assertEq(myToken.balanceOf(treasury), STAKE_AMOUNT * 2, "principal only");
+        assertEq(stakingContract.rewardPool(), poolBefore, "pool untouched");
+        assertEq(stakingContract.getDeposit(userOne, 0).rewardGenerated, 0);
+        assertEq(stakingContract.getDeposit(userOne, 1).rewardGenerated, 0);
+        _assertClosed(userOne, 0);
+        _assertClosed(userOne, 1);
+
+        address[] memory users = new address[](1);
+        users[0] = userOne;
+        _assertAllCountersZeroed(users);
+    }
+
+    // ======================================
+    // =  v0.4.0: period existence via APY  =
+    // ======================================
+    // stakeWithVoucher checks period existence with APY != 0 instead of scanning stakingPeriodList. That is only
+    // correct if, for every existing phase, APY != 0 exactly when the period is configured.
+
+    function test_Stake_IntoRemovedPeriod_Reverts() public {
+        _setupProgram();
+        _stakeFor(userOne, PERIOD_SHORT, STAKE_AMOUNT);
+        stakingContract.removeStakingPeriod(PERIOD_SHORT);
+
+        _increaseAllowance(userTwo, STAKE_AMOUNT);
+        (Types.StakeVoucher memory v, bytes memory sig) =
+            _prepareVoucherStake(stakingContract, userTwo, 0, PERIOD_SHORT, 0, 0);
+        vm.prank(userTwo);
+        vm.expectRevert(abi.encodeWithSelector(Errors.StakingPeriodDoesNotExist.selector, PERIOD_SHORT));
+        stakingContract.stakeWithVoucher(v, sig, STAKE_AMOUNT, 0);
+
+        // A period that was never added reverts the same way; the remaining period still works.
+        (v, sig) = _prepareVoucherStake(stakingContract, userTwo, 0, 30, 0, 0);
+        vm.prank(userTwo);
+        vm.expectRevert(abi.encodeWithSelector(Errors.StakingPeriodDoesNotExist.selector, 30));
+        stakingContract.stakeWithVoucher(v, sig, STAKE_AMOUNT, 0);
+
+        _stakeFor(userTwo, PERIOD_LONG, STAKE_AMOUNT);
+        assertEq(_getPhasePeriodStakingStaked(0, PERIOD_LONG), STAKE_AMOUNT);
+    }
+
+    function test_Stake_AfterPopStakingPhase_Reverts() public {
+        _setupProgram();
+        stakingContract.popStakingPhase();
+
+        _increaseAllowance(userTwo, STAKE_AMOUNT);
+        (Types.StakeVoucher memory v, bytes memory sig) =
+            _prepareVoucherStake(stakingContract, userTwo, 0, PERIOD_LONG, 0, 0);
+        vm.prank(userTwo);
+        vm.expectRevert(abi.encodeWithSelector(Errors.StakingPhaseDoesNotExist.selector, 0));
+        stakingContract.stakeWithVoucher(v, sig, STAKE_AMOUNT, 0);
+    }
+
+    function test_ApyZeroIsRejectedEverywhere() public {
+        _setupProgram();
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidAPY.selector, 0, 1));
+        stakingContract.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, PERIOD_SHORT, 0);
+
+        uint256[] memory apys = new uint256[](1);
+        uint256[] memory targets = new uint256[](1);
+        targets[0] = TARGET;
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidAPY.selector, 0, 1));
+        stakingContract.addStakingPeriod(30, apys, targets);
+
+        uint256[] memory apys2 = new uint256[](2);
+        uint256[] memory targets2 = new uint256[](2);
+        apys2[0] = APY;
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidAPY.selector, 0, 1));
+        stakingContract.pushStakingPhase(apys2, targets2);
+    }
+
+    function testFuzz_PeriodExistsIffApyNonZero(uint256 seed) public {
+        uint256[5] memory candidates = [uint256(0), 7, 30, 90, 180];
+        for (uint256 step = 0; step < 16; step++) {
+            uint256 r = uint256(keccak256(abi.encode(seed, step)));
+            uint256 op = r % 4;
+            uint256 period = candidates[(r >> 8) % candidates.length];
+            uint256 phaseCount = stakingContract.stakingPhaseCount();
+            uint256 periodCount = stakingContract.getStakingPeriods().length;
+
+            if (op == 0 && !stakingContract.checkIfStakingPeriodExists(period)) {
+                stakingContract.addStakingPeriod(period, _nonZeroValues(phaseCount, r), _nonZeroValues(phaseCount, r));
+            } else if (op == 1 && stakingContract.checkIfStakingPeriodExists(period)) {
+                stakingContract.removeStakingPeriod(period);
+            } else if (op == 2 && phaseCount < 4) {
+                stakingContract.pushStakingPhase(_nonZeroValues(periodCount, r), _nonZeroValues(periodCount, r));
+            } else if (op == 3 && phaseCount > 0) {
+                stakingContract.popStakingPhase();
+            }
+
+            _assertApyIffPeriodExists(candidates);
+        }
+    }
+
+    function _nonZeroValues(uint256 len, uint256 r) internal pure returns (uint256[] memory values) {
+        values = new uint256[](len);
+        for (uint256 i = 0; i < len; i++) {
+            values[i] = (uint256(keccak256(abi.encode(r, i))) % 10_000) + 1;
+        }
+    }
+
+    function _assertApyIffPeriodExists(uint256[5] memory candidates) internal {
+        uint256 phaseCount = stakingContract.stakingPhaseCount();
+        // Also check one phase past the end: a popped phase must leave no APY behind.
+        for (uint256 phase = 0; phase <= phaseCount; phase++) {
+            for (uint256 i = 0; i < candidates.length; i++) {
+                bool apySet = _getPhasePeriodAPY(phase, candidates[i]) != 0;
+                if (phase < phaseCount) {
+                    assertEq(apySet, stakingContract.checkIfStakingPeriodExists(candidates[i]), "APY iff period");
+                } else {
+                    assertFalse(apySet, "popped phase APY");
+                }
+            }
+        }
     }
 }

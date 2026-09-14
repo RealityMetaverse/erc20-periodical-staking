@@ -8,7 +8,10 @@ import {MockPeriodicalStakingContract} from "../shared/mocks/MockPeriodicalStaki
 import {MockERC1155} from "../shared/mocks/MockERC1155.sol";
 import {RequirementChecker} from "../../src/contracts/requirement-checker/RequirementChecker.sol";
 import {RequirementCheckerV2} from "../../src/contracts/requirement-checker/v2/RequirementCheckerV2.sol";
-import {ERC20PeriodicalStaking} from "../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
+// v0.4.0 removed the RequirementChecker hook from the staking contract; the consumer here is the vendored v0.2.4
+// deployment the backend's checker is actually wired into, which still exposes setRequirementChecker.
+import {ERC20PeriodicalStaking} from
+    "../erc20-periodical-staking/security/invariants/legacy/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 
 contract RequirementCheckerV2IntegrationTest is Test {
     TestToken token;

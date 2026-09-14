@@ -103,6 +103,35 @@ contract TwoStepOwnershipTest is V030Base {
         assertEq(stakingContract.contractOwner(), userTwo);
     }
 
+    /// @notice v0.4.0 owner-only settings (voucher signer, extras, treasury, seize) follow the accepted owner.
+    function test_Accept_MovesVoucherAndEnforcementAdmin() public {
+        stakingContract.transferOwnership(userOne);
+        vm.prank(userOne);
+        stakingContract.acceptOwnership();
+
+        bytes memory notOwner =
+            abi.encodeWithSelector(AccessControl.UnauthorizedAccess.selector, AccessControl.AccessTier.OWNER);
+        vm.expectRevert(notOwner);
+        stakingContract.setVoucherSigner(address(0xBEEF));
+        vm.expectRevert(notOwner);
+        stakingContract.setTreasury(userTwo);
+        vm.expectRevert(notOwner);
+        stakingContract.setMaxExtraApyBps(1);
+        vm.expectRevert(notOwner);
+        stakingContract.setMaxExtraLimit(1);
+
+        vm.startPrank(userOne);
+        stakingContract.setVoucherSigner(address(0xBEEF));
+        stakingContract.setTreasury(userTwo);
+        stakingContract.setMaxExtraApyBps(250);
+        stakingContract.setMaxExtraLimit(1 ether);
+        vm.stopPrank();
+        assertEq(stakingContract.voucherSigner(), address(0xBEEF));
+        assertEq(stakingContract.treasury(), userTwo);
+        assertEq(stakingContract.maxExtraApyBps(), 250);
+        assertEq(stakingContract.maxExtraLimit(), 1 ether);
+    }
+
     function test_NonOwner_CannotPropose() public {
         vm.prank(contractAdmin);
         vm.expectRevert(

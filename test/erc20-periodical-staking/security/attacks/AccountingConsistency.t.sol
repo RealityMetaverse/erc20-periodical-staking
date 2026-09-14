@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./AttackBase.t.sol";
+import "./VoucherAttackBase.sol";
 
 /// @title AccountingConsistency
-/// @notice Every sequence of {stake, early withdraw, mature claim, indefinite partial claim, indefinite withdraw}
-///         must leave the contract with: balance == totalStaked + rewardPool, per-user sums == totals,
-///         per-cell sums == totals, REWARD_EXPECTED == open periodical rewards. (`rewardPool >= REWARD_EXPECTED`
-///         is not an invariant: stakes are never blocked by the pool, so it is only asserted in the scenarios
-///         where the pool was funded beforehand.)
-contract AccountingConsistencyTest is AttackBase {
+/// @notice Every sequence of {stake, early withdraw, mature claim, indefinite partial claim, indefinite withdraw,
+///         freeze, unfreeze, seize} must leave the contract with: balance == totalStaked + rewardPool, per-user
+///         sums == totals, per-cell sums == totals, REWARD_EXPECTED == open periodical rewards.
+///         (`rewardPool >= REWARD_EXPECTED` is not an invariant: stakes are never blocked by the pool, so it is only
+///         asserted in the scenarios where the pool was funded beforehand.)
+contract AccountingConsistencyTest is VoucherAttackBase {
     /// @dev Hypothesis: a single periodical deposit that matures and is claimed leaves no residue.
     function test_periodical_stakeThenMatureClaim() public {
         uint256 amt = 1_000 * ONE;
@@ -17,6 +17,7 @@ contract AccountingConsistencyTest is AttackBase {
         _assertAccounting();
         uint256 reward = _deposit(alice, n).rewardGenerated;
         assertEq(reward, staking.calculateReward(amt, APY_PHASE0[1], P30));
+        assertEq(reward, amt * APY_PHASE0[1] * P30 / 3_650_000, "bps reward formula");
 
         _warpDays(30);
         uint256 before = token.balanceOf(alice);
@@ -95,6 +96,54 @@ contract AccountingConsistencyTest is AttackBase {
         assertEq(_total(Types.DataType.REWARD_EXPECTED), 0);
     }
 
+    /// @dev Hypothesis: seizing a mix of periodical and indefinite deposits in one batch desyncs a counter or
+    ///      touches a bystander's deposit. Seize must close like a withdrawal that pays no reward (principal only).
+    function test_seize_mixedBatch_accountingIntact_bystanderUnaffected() public {
+        uint256 a = _stake(alice, 0, P30, 1_000 * ONE);
+        uint256 b = _stake(bob, 0, P90, 2_000 * ONE);
+        uint256 c = _stake(carol, 0, P0, 3_000 * ONE);
+        _warpDays(10);
+        uint256 rewardA = _deposit(alice, a).rewardGenerated;
+        uint256 accruedC = _deposit(carol, c).rewardGenerated;
+        uint256 rewardB = _deposit(bob, b).rewardGenerated;
+        assertGt(accruedC, 0);
+
+        _freeze(alice, a);
+        _freeze(carol, c);
+        _assertAccounting();
+
+        address[] memory w = new address[](2);
+        w[0] = alice;
+        w[1] = carol;
+        uint256[] memory n = new uint256[](2);
+        n[0] = a;
+        n[1] = c;
+        uint256 poolBefore = staking.rewardPool();
+        uint256 withdrawnBefore = _total(Types.DataType.WITHDRAWAL);
+        staking.seizeDeposits(w, n);
+
+        assertGt(rewardA, 0);
+        assertEq(token.balanceOf(treasury), 4_000 * ONE, "treasury gets principal only");
+        assertEq(staking.rewardPool(), poolBefore, "pool untouched");
+        assertEq(_total(Types.DataType.WITHDRAWAL) - withdrawnBefore, 4_000 * ONE);
+        assertEq(_user(Types.DataType.CLAIM, alice), 0);
+        assertEq(_user(Types.DataType.CLAIM, carol), 0);
+        assertEq(_total(Types.DataType.REWARD_EXPECTED), rewardB, "only bob's reserve remains");
+        assertEq(_staked(0, P30), 0);
+        assertEq(_staked(0, P0), 0);
+        assertEq(_upp(Types.DataType.STAKING, alice, 0, P30), 0, "limit cell freed");
+        assertEq(_deposit(alice, a).rewardGenerated, 0, "unpaid reservation zeroed");
+        assertEq(_deposit(carol, c).rewardGenerated, 0, "seized indefinite shows no accrual");
+        _assertAccounting();
+
+        _warpDays(80);
+        uint256 before = token.balanceOf(bob);
+        _claim(bob, b);
+        assertEq(token.balanceOf(bob) - before, 2_000 * ONE + rewardB);
+        assertEq(_total(Types.DataType.STAKING), 0);
+        _assertAccounting();
+    }
+
     /// @dev Hypothesis: switching the phase back and forth never breaks closing of old-phase deposits.
     function test_phaseSwitching_backAndForth_oldDepositsStillClose() public {
         uint256 a = _stake(alice, 0, P30, 1_000 * ONE);
@@ -152,17 +201,23 @@ contract AccountingConsistencyTest is AttackBase {
         assertEq(_staked(0, P30), 0);
     }
 
-    /// @dev popping a phase with live deposits must leave accounting intact and deposits closable.
+    /// @dev popping a phase with live deposits must leave accounting intact and deposits closable (or seizable).
     function test_popPhase_liveDeposits_accountingIntact() public {
         staking.changeStakingPhase(1);
         uint256 a = _stake(alice, 1, P30, 1_000 * ONE);
         uint256 b = _stake(bob, 1, P0, 2_000 * ONE);
+        uint256 c = _stake(carol, 1, P90, 500 * ONE);
         _assertAccounting();
 
         staking.popStakingPhase();
         assertEq(staking.stakingPhaseCount(), 1);
         assertEq(staking.currentStakingPhase(), 0);
         assertEq(_staked(1, P30), 1_000 * ONE, "STAKED must survive phase pop");
+        _assertAccounting();
+
+        _freeze(carol, c);
+        _seize(carol, c); // seizing a deposit on a removed phase closes its cell too
+        assertEq(_staked(1, P90), 0);
         _assertAccounting();
 
         _warpDays(30);
@@ -187,13 +242,14 @@ contract AccountingConsistencyTest is AttackBase {
 
         assertEq(_staked(0, P30), 10_000 * ONE);
         // Only 2_000 left under the new target
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 12_000 * ONE));
-        staking.safeStake(0, P30, 2_001 * ONE, 50);
+        _expectStakeRevert(
+            bob, 0, P30, 2_001 * ONE, 50, abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 12_000 * ONE)
+        );
         _stake(bob, 0, P30, 2_000 * ONE);
         _assertAccounting();
         // old deposit keeps its APY
         assertEq(_deposit(alice, 0).APY, APY_PHASE0[1]);
+        assertEq(_deposit(bob, 0).APY, 50);
     }
 
     /// @dev the owner cannot collect rewards that are earmarked for open periodical deposits.
@@ -209,7 +265,7 @@ contract AccountingConsistencyTest is AttackBase {
         _assertAccounting();
 
         // One more wei must fail
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(Errors.RewardPoolBelowReserved.selector, 1, 0));
         staking.collectReward(1);
         _assertAccounting();
 
@@ -305,14 +361,16 @@ contract AccountingConsistencyTest is AttackBase {
     // ---------------------------------------------------------------------
     // Seeded random action sequence — invariant re-checked after every step
     // ---------------------------------------------------------------------
-    /// @dev Hypothesis: no sequence of user + admin actions breaks the accounting identities.
+    /// @dev Hypothesis: no sequence of user + admin + enforcement actions breaks the accounting identities.
     function testFuzz_randomActionSequence(uint256 seed) public {
         uint256 steps = 40;
         for (uint256 i = 0; i < steps; i++) {
             uint256 r = uint256(keccak256(abi.encode(seed, i)));
             address u = users[r % users.length];
-            uint256 action = (r >> 8) % 8;
+            uint256 action = (r >> 8) % 10;
             uint256 phase = staking.currentStakingPhase();
+            uint256 n = staking.checkDepositCountOfAddress(u);
+            uint256 d = n == 0 ? 0 : (r >> 40) % n;
 
             if (action == 0 || action == 1) {
                 uint256 period = PERIODS[(r >> 16) % PERIODS.length];
@@ -325,29 +383,25 @@ contract AccountingConsistencyTest is AttackBase {
                 if (staking.rewardPool() < _total(Types.DataType.REWARD_EXPECTED) + newReward) continue;
                 _stake(u, phase, period, amount);
             } else if (action == 2) {
-                uint256 n = staking.checkDepositCountOfAddress(u);
-                if (n == 0) continue;
-                uint256 d = (r >> 40) % n;
+                if (n == 0 || staking.isDepositFrozen(u, d)) continue;
                 ProgramManager.DepositStatus st = _status(u, d);
                 if (
                     st == ProgramManager.DepositStatus.TIME_LEFT
                         || (
                             st == ProgramManager.DepositStatus.INDEFINITE
-                                && staking.rewardPool() >= _deposit(u, d).rewardGenerated
+                                && staking.getCollectableReward() >= _deposit(u, d).rewardGenerated
                         )
                 ) {
                     _withdraw(u, d);
                 }
             } else if (action == 3) {
-                uint256 n = staking.checkDepositCountOfAddress(u);
-                if (n == 0) continue;
-                uint256 d = (r >> 40) % n;
+                if (n == 0 || staking.isDepositFrozen(u, d)) continue;
                 ProgramManager.DepositStatus st = _status(u, d);
                 if (st == ProgramManager.DepositStatus.READY_TO_CLAIM) {
                     _claim(u, d);
                 } else if (st == ProgramManager.DepositStatus.INDEFINITE) {
                     uint256 rew = _deposit(u, d).rewardGenerated;
-                    if (rew > 0 && staking.rewardPool() >= rew) _claim(u, d);
+                    if (rew > 0 && staking.getCollectableReward() > 0) _claim(u, d);
                 }
             } else if (action == 4) {
                 _claimAll(u);
@@ -355,13 +409,34 @@ contract AccountingConsistencyTest is AttackBase {
                 _warpDays(((r >> 48) % 45) + 1);
             } else if (action == 6) {
                 staking.changeStakingPhase((r >> 56) % staking.stakingPhaseCount());
-            } else {
+            } else if (action == 7) {
                 // owner collects whatever is not earmarked or tops up
                 if ((r >> 64) % 2 == 0) {
-                    uint256 free = staking.rewardPool() - _total(Types.DataType.REWARD_EXPECTED);
+                    uint256 free = staking.getCollectableReward();
                     if (free > 1) staking.collectReward(free / 2);
                 } else {
                     staking.provideReward(1_000 * ONE);
+                }
+            } else if (action == 8) {
+                if (n == 0 || staking.isDepositFrozen(u, d)) continue;
+                ProgramManager.DepositStatus st = _status(u, d);
+                if (
+                    st == ProgramManager.DepositStatus.TIME_LEFT || st == ProgramManager.DepositStatus.READY_TO_CLAIM
+                        || st == ProgramManager.DepositStatus.INDEFINITE
+                ) {
+                    vm.prank(admin);
+                    staking.freezeDeposit(u, d);
+                }
+            } else {
+                if (n == 0 || !staking.isDepositFrozen(u, d)) continue;
+                if ((r >> 72) % 3 == 0) {
+                    vm.prank(admin);
+                    staking.unfreezeDeposit(u, d);
+                } else {
+                    uint256 tBefore = token.balanceOf(treasury);
+                    _seize(u, d);
+                    assertGe(token.balanceOf(treasury) - tBefore, _deposit(u, d).amount, "seize pays principal");
+                    assertEq(uint256(_status(u, d)), uint256(ProgramManager.DepositStatus.SEIZED));
                 }
             }
             _assertAccounting();

@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "./V030Base.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @title Reward-pool accounting at stake, claim and collectReward
 /// @dev There is no stake-time pool check. The guarantees are: the owner can never collect reward
@@ -630,6 +631,138 @@ contract RewardSolvencyTest is V030Base {
         stakingContract.claimAll();
         _assertPoolCoversReserve();
         assertEq(stakingContract.totalDataList(Types.DataType.REWARD_EXPECTED), 0);
+    }
+
+    // ======================================
+    // =          Seize (v0.4.0)            =
+    // ======================================
+
+    function _freezeAndSeize(address wallet, uint256 depositNumber) internal {
+        stakingContract.freezeDeposit(wallet, depositNumber);
+        stakingContract.seizeDeposit(wallet, depositNumber);
+    }
+
+    /// @notice A frozen periodical deposit whose reserved reward exceeds the pool is still seizable: the treasury
+    ///         gets principal only, the reservation is released, and every counter moves exactly like a close.
+    function test_Seize_PeriodicalPoolShort_PrincipalOnly_ReleasesReserve() public {
+        _setupProgram(false);
+        uint256 reward = _periodicalReward(STAKE_AMOUNT, PERIOD_LONG);
+        _stakeFor(userOne, PERIOD_LONG, STAKE_AMOUNT);
+        _fundRewardPool(reward - 1);
+
+        stakingContract.freezeDeposit(userOne, 0);
+        vm.expectEmit(true, true, true, true, address(stakingContract));
+        emit SeizeDeposit(userOne, 0, treasury, STAKE_AMOUNT);
+        stakingContract.seizeDeposit(userOne, 0);
+
+        assertEq(myToken.balanceOf(treasury), STAKE_AMOUNT);
+        assertEq(stakingContract.rewardPool(), reward - 1, "pool untouched");
+        assertEq(stakingContract.getCollectableReward(), reward - 1, "released reservation is collectable");
+        assertEq(stakingContract.totalDataList(Types.DataType.REWARD_EXPECTED), 0);
+        assertEq(stakingContract.userDataList(Types.DataType.REWARD_EXPECTED, userOne), 0);
+        assertEq(stakingContract.getDeposit(userOne, 0).rewardGenerated, 0);
+        assertEq(stakingContract.totalDataList(Types.DataType.STAKING), 0);
+        assertEq(stakingContract.userDataList(Types.DataType.WITHDRAWAL, userOne), STAKE_AMOUNT);
+        assertEq(stakingContract.userDataList(Types.DataType.CLAIM, userOne), 0);
+        assertEq(stakingContract.getPhasePeriodData(Types.PhasePeriodDataType.STAKED, 0, PERIOD_LONG), 0);
+        assertEq(stakingContract.getUserPhasePeriodData(Types.DataType.STAKING, userOne, 0, PERIOD_LONG), 0);
+        _assertPoolCoversReserve();
+    }
+
+    /// @notice Even with a covering pool a periodical seize before maturity sends principal only: the reserved
+    ///         reward is released back to the collectable part of the pool and nothing is booked as CLAIM.
+    function test_Seize_PeriodicalCovered_PrincipalOnly_ReleasesReserveBeforeMaturity() public {
+        _setupProgram(true);
+        uint256 reward = _periodicalReward(STAKE_AMOUNT, PERIOD_LONG);
+        _stakeFor(userOne, PERIOD_LONG, STAKE_AMOUNT);
+        skip(10 days);
+        assertGt(reward, 0);
+        assertEq(stakingContract.getCollectableReward(), amountToProvide - reward);
+
+        _freezeAndSeize(userOne, 0);
+        assertEq(myToken.balanceOf(treasury), STAKE_AMOUNT, "principal only");
+        assertEq(stakingContract.rewardPool(), amountToProvide, "pool untouched");
+        assertEq(stakingContract.getCollectableReward(), amountToProvide, "reservation released to collectable");
+        assertEq(stakingContract.userDataList(Types.DataType.CLAIM, userOne), 0);
+        assertEq(stakingContract.getDeposit(userOne, 0).rewardGenerated, 0, "unpaid reward zeroed");
+        assertEq(stakingContract.totalDataList(Types.DataType.REWARD_EXPECTED), 0);
+        assertEq(stakingContract.stakerActiveDepositStartIndex(userOne), 1);
+        _assertPoolCoversReserve();
+    }
+
+    /// @notice An indefinite seize never pays its accrued reward, whether or not `collectable` could cover it:
+    ///         the accrual stays in the pool and the periodical reserve is never touched.
+    function test_Seize_Indefinite_NeverPaysReward_EvenWhenCovered() public {
+        _setupProgram(false);
+        uint256 reserved = _periodicalReward(STAKE_AMOUNT, PERIOD_LONG);
+        _fundRewardPool(reserved + 5);
+        _stakeFor(userOne, PERIOD_LONG, STAKE_AMOUNT);
+        _stakeFor(userTwo, 0, STAKE_AMOUNT);
+        _stakeFor(userThree, 0, STAKE_AMOUNT);
+        skip(30 days);
+        uint256 accrued = stakingContract.getDeposit(userTwo, 0).rewardGenerated;
+        assertGt(accrued, 5);
+
+        // Not covered: principal only, the 5 free wei are not paid partially.
+        _freezeAndSeize(userTwo, 0);
+        assertEq(myToken.balanceOf(treasury), STAKE_AMOUNT);
+        assertEq(stakingContract.rewardPool(), reserved + 5);
+        assertEq(stakingContract.userDataList(Types.DataType.CLAIM, userTwo), 0);
+        _assertPoolCoversReserve();
+
+        // Covered: still principal only, the accrual stays in the pool.
+        uint256 accrued3 = stakingContract.getDeposit(userThree, 0).rewardGenerated;
+        assertEq(accrued3, accrued);
+        _fundRewardPool(accrued3);
+        assertGe(stakingContract.getCollectableReward(), accrued3, "collectable could pay it");
+        _freezeAndSeize(userThree, 0);
+        assertEq(myToken.balanceOf(treasury), 2 * STAKE_AMOUNT, "principal only");
+        assertEq(stakingContract.rewardPool(), reserved + 5 + accrued3, "pool untouched");
+        assertEq(stakingContract.userDataList(Types.DataType.CLAIM, userThree), 0);
+        assertEq(stakingContract.getDeposit(userThree, 0).rewardGenerated, 0, "seized view shows no accrual");
+        _assertPoolCoversReserve();
+
+        // The periodical deposit is still fully payable.
+        skip(60 days + 1);
+        uint256 before = myToken.balanceOf(userOne);
+        vm.prank(userOne);
+        stakingContract.claimDeposit(0);
+        assertEq(myToken.balanceOf(userOne), before + STAKE_AMOUNT + reserved);
+    }
+
+    /// @notice seizeDeposits closes a mixed batch with one transfer; totals end exactly where a full close would.
+    function test_SeizeDeposits_MixedBatch_SingleTransfer() public {
+        _setupProgram(true);
+        _stakeFor(userOne, PERIOD_SHORT, STAKE_AMOUNT);
+        _stakeFor(userTwo, PERIOD_LONG, STAKE_AMOUNT);
+        _stakeFor(userThree, 0, STAKE_AMOUNT);
+        skip(PERIOD_SHORT * 1 days + 1); // deposit 0 READY, 1 TIME_LEFT, 2 INDEFINITE (7 days)
+
+        address[] memory ws = new address[](3);
+        uint256[] memory ns = new uint256[](3);
+        ws[0] = userOne;
+        ws[1] = userTwo;
+        ws[2] = userThree;
+        stakingContract.freezeDeposits(ws, ns);
+
+        uint256 expected = 3 * STAKE_AMOUNT; // principal only
+        uint256 poolBefore = stakingContract.rewardPool();
+        vm.recordLogs();
+        stakingContract.seizeDeposits(ws, ns);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        uint256 transfers;
+        bytes32 transferTopic = keccak256("Transfer(address,address,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(myToken) && logs[i].topics[0] == transferTopic) transfers++;
+        }
+        assertEq(transfers, 1, "one token transfer for the whole batch");
+        assertEq(myToken.balanceOf(treasury), expected);
+        assertEq(stakingContract.totalDataList(Types.DataType.STAKING), 0);
+        assertEq(stakingContract.totalDataList(Types.DataType.REWARD_EXPECTED), 0);
+        assertEq(myToken.balanceOf(address(stakingContract)), stakingContract.rewardPool());
+        assertEq(stakingContract.rewardPool(), poolBefore, "pool untouched");
+        assertEq(stakingContract.totalDataList(Types.DataType.CLAIM), 0, "no reward booked as CLAIM");
     }
 
     /// @dev Scenario assertion, NOT a contract invariant: every test that calls this funded

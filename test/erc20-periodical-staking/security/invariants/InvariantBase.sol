@@ -119,14 +119,16 @@ abstract contract InvariantBase is Test {
     function _check_tokenFlowGhosts() internal {
         uint256 bal = token.balanceOf(address(staking));
         uint256 expectedBal = handler.ghost_userIn() + handler.ghost_provided() + handler.ghost_donated()
-            - handler.ghost_userOut() - handler.ghost_collected() - handler.ghost_rescued();
+            - handler.ghost_userOut() - handler.ghost_collected() - handler.ghost_rescued() - handler.ghost_seizedOut();
         assertEq(
-            bal, expectedBal, "balanceOf(staking) != userIn + provided + donated - userOut - collected - rescued (ghost)"
+            bal,
+            expectedBal,
+            "balanceOf(staking) != userIn + provided + donated - userOut - collected - rescued - seized (ghost)"
         );
         assertEq(
             staking.totalDataList(Types.DataType.STAKING),
-            handler.ghost_userIn() - handler.ghost_principalPaid(),
-            "totalDataList[STAKING] != userIn - principalPaid (ghost)"
+            handler.ghost_userIn() - handler.ghost_principalPaid() - handler.ghost_seizedPrincipal(),
+            "totalDataList[STAKING] != userIn - principalPaid - seizedPrincipal (ghost)"
         );
     }
 
@@ -151,10 +153,16 @@ abstract contract InvariantBase is Test {
         }
     }
 
-    /// @dev rewardPool only moves through provideReward (+), collectReward (-) and reward payouts (-).
+    /// @dev rewardPool only moves through provideReward (+), collectReward (-) and reward payouts (-). Seize never
+    ///      touches it (principal only).
     function _check_rewardPoolAccounting() internal {
         uint256 expected = handler.ghost_provided() - handler.ghost_collected() - handler.ghost_rewardsPaid();
         assertEq(staking.rewardPool(), expected, "rewardPool != provided - collected - rewardsPaid (ghost)");
+    }
+
+    /// @dev Frozen deposits cannot be claimed or withdrawn by design; liveness checks skip them.
+    function _isFrozen(address user, uint256 idx) internal view returns (bool) {
+        return !handler.legacy() && staking.isDepositFrozen(user, idx);
     }
 
     /// @dev For every DataType, sum of per-user data over all actors == the global total.
@@ -187,34 +195,25 @@ abstract contract InvariantBase is Test {
         assertEq(sum, staking.totalDataList(Types.DataType.STAKING), "sum(phasePeriod STAKED) != totalDataList[STAKING]");
     }
 
-    /// @dev Per user: sum over (phase, period) of userPhasePeriodDataList[t] == userDataList[t]
-    ///      for STAKING, REWARD_EXPECTED, WITHDRAWAL, CLAIM.
+    /// @dev Per user: sum over (phase, period) of the STAKING cell (getUserPhasePeriodData) == userDataList[STAKING].
+    ///      Since v0.4.0 only STAKING is tracked per phase/period.
     function _check_userPhasePeriodSums() internal {
         address[] memory users = handler.getUsers();
         uint256[] memory periods = handler.getEverSeenPeriods();
         uint256 phases = handler.ghost_maxPhaseCount();
-        Types.DataType[4] memory dts =
-            [Types.DataType.STAKING, Types.DataType.REWARD_EXPECTED, Types.DataType.WITHDRAWAL, Types.DataType.CLAIM];
 
         for (uint256 u = 0; u < users.length; u++) {
-            for (uint256 t = 0; t < dts.length; t++) {
-                uint256 sum;
-                for (uint256 p = 0; p < phases; p++) {
-                    for (uint256 k = 0; k < periods.length; k++) {
-                        sum += staking.userPhasePeriodDataList(dts[t], p, periods[k], users[u]);
-                    }
+            uint256 sum;
+            for (uint256 p = 0; p < phases; p++) {
+                for (uint256 k = 0; k < periods.length; k++) {
+                    sum += staking.getUserPhasePeriodData(Types.DataType.STAKING, users[u], p, periods[k]);
                 }
-                assertEq(
-                    sum,
-                    staking.userDataList(dts[t], users[u]),
-                    string.concat(
-                        "sum(userPhasePeriodDataList) != userDataList for user ",
-                        vm.toString(users[u]),
-                        " DataType ",
-                        vm.toString(uint256(dts[t]))
-                    )
-                );
             }
+            assertEq(
+                sum,
+                staking.userDataList(Types.DataType.STAKING, users[u]),
+                string.concat("sum(STAKING cells) != userDataList[STAKING] for user ", vm.toString(users[u]))
+            );
         }
     }
 
@@ -255,7 +254,7 @@ abstract contract InvariantBase is Test {
         for (uint256 u = 0; u < users.length; u++) {
             uint256 count = staking.checkDepositCountOfAddress(users[u]);
             for (uint256 i = 0; i < count; i++) {
-                if (!_isOpen(staking.checkDepositStatus(users[u], i))) continue;
+                if (!_isOpen(staking.checkDepositStatus(users[u], i)) || _isFrozen(users[u], i)) continue;
 
                 uint256 snap = vm.snapshot();
                 _makeClosableEnvironment();
@@ -319,6 +318,7 @@ abstract contract InvariantBase is Test {
             for (uint256 i = 0; i < count; i++) {
                 ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
                 if (d.withdrawalDate != 0 || d.stakingEndDate == 0) continue; // closed or indefinite
+                if (_isFrozen(users[u], i)) continue; // frozen: claim blocked by design
 
                 uint256 snap = vm.snapshot();
                 vm.prank(owner);

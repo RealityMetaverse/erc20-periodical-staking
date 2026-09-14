@@ -3,6 +3,8 @@ pragma solidity 0.8.20;
 
 import "./AuxiliaryFunctions.sol";
 import "../../src/common/Types.sol";
+import "../../src/common/Errors.sol";
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 contract MainManagementScenarios is AuxiliaryFunctions {
     // ======================================
@@ -200,46 +202,90 @@ contract MainManagementScenarios is AuxiliaryFunctions {
     }
 
     // ======================================
-    // =       Whitelist Management Test    =
+    // =  Voucher, Limit & Treasury Config  =
     // ======================================
-    function test_WhitelistManagement_AccessControl() external {
-        // Non-owner should not be able to change whitelist settings
-        vm.startPrank(userOne);
-        vm.expectRevert();
-        stakingContract.setWhitelistEnabled(true);
-        vm.expectRevert();
-        stakingContract.setWhitelistAddress(userOne, true);
-        vm.expectRevert();
-        address[] memory addrs = new address[](1);
-        addrs[0] = userOne;
-        stakingContract.setWhitelistAddresses(addrs, true);
-        vm.stopPrank();
+    // v0.4.0: the whitelist tests were removed together with the whitelist; these cover its replacement settings.
+    function test_VoucherConfig_OnlyOwner() external {
+        address[2] memory callers = [userOne, contractAdmin];
+        for (uint256 i = 0; i < callers.length; i++) {
+            vm.startPrank(callers[i]);
+            vm.expectRevert();
+            stakingContract.setVoucherSigner(userOne);
+            vm.expectRevert();
+            stakingContract.setMaxExtraApyBps(1);
+            vm.expectRevert();
+            stakingContract.setMaxExtraLimit(1);
+            vm.expectRevert();
+            stakingContract.setTreasury(userOne);
+            vm.expectRevert();
+            stakingContract.setLimitController(address(0));
+            vm.stopPrank();
+        }
+
+        assertEq(stakingContract.voucherSigner(), _voucherSignerAddr());
+        assertEq(stakingContract.treasury(), treasury);
+        assertTrue(stakingContract.limitController() != address(0));
     }
 
-    function test_WhitelistManagement_SingleAndBatch() external {
-        // Initially whitelist is disabled
-        assertEq(stakingContract.whitelistEnabled(), false);
+    function test_VoucherConfig_OwnerSetters() external {
+        stakingContract.setVoucherSigner(userTwo);
+        assertEq(stakingContract.voucherSigner(), userTwo);
+        // address(0) is allowed: it disables staking.
+        stakingContract.setVoucherSigner(address(0));
+        assertEq(stakingContract.voucherSigner(), address(0));
 
-        // Enable whitelist
-        stakingContract.setWhitelistEnabled(true);
-        assertEq(stakingContract.whitelistEnabled(), true);
+        stakingContract.setMaxExtraApyBps(250);
+        assertEq(stakingContract.maxExtraApyBps(), 250);
+        stakingContract.setMaxExtraApyBps(type(uint32).max);
+        assertEq(stakingContract.maxExtraApyBps(), type(uint32).max);
+        vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 32, 1 << 32));
+        stakingContract.setMaxExtraApyBps(1 << 32);
 
-        // Single address update
-        assertEq(stakingContract.isWhitelisted(userOne), false);
-        stakingContract.setWhitelistAddress(userOne, true);
-        assertEq(stakingContract.isWhitelisted(userOne), true);
+        stakingContract.setMaxExtraLimit(5e18);
+        assertEq(stakingContract.maxExtraLimit(), 5e18);
+        vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 128, 1 << 128));
+        stakingContract.setMaxExtraLimit(1 << 128);
 
-        // Batch update for userTwo and userThree
-        address[] memory addrs = new address[](2);
-        addrs[0] = userTwo;
-        addrs[1] = userThree;
-        stakingContract.setWhitelistAddresses(addrs, true);
-        assertEq(stakingContract.isWhitelisted(userTwo), true);
-        assertEq(stakingContract.isWhitelisted(userThree), true);
+        stakingContract.setTreasury(userThree);
+        assertEq(stakingContract.treasury(), userThree);
+        vm.expectRevert(Errors.ZeroAddressProvided.selector);
+        stakingContract.setTreasury(address(0));
+        assertEq(stakingContract.treasury(), userThree);
 
-        // Batch removal
-        stakingContract.setWhitelistAddresses(addrs, false);
-        assertEq(stakingContract.isWhitelisted(userTwo), false);
-        assertEq(stakingContract.isWhitelisted(userThree), false);
+        stakingContract.setLimitController(address(0));
+        assertEq(stakingContract.limitController(), address(0));
+    }
+
+    function test_ProgramManagement_MinimumDeposit() external {
+        assertEq(stakingContract.minimumDeposit(), 100);
+        stakingContract.setMiniumumDeposit(_defaultMinimumDeposit);
+        assertEq(stakingContract.minimumDeposit(), _defaultMinimumDeposit);
+
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidMinimumDeposit.selector, 0, 1));
+        stakingContract.setMiniumumDeposit(0);
+        vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 128, 1 << 128));
+        stakingContract.setMiniumumDeposit(1 << 128);
+        assertEq(stakingContract.minimumDeposit(), _defaultMinimumDeposit);
+    }
+
+    /// @notice Only STAKING, WITHDRAWAL and CLAIM have an availability switch.
+    function test_ProgramManagement_ActionAvailability() external {
+        Types.DataType[3] memory actions = [Types.DataType.STAKING, Types.DataType.WITHDRAWAL, Types.DataType.CLAIM];
+        for (uint256 i = 0; i < actions.length; i++) {
+            assertTrue(stakingContract.checkActionAvailability(actions[i]));
+            stakingContract.changeActionAvailability(actions[i], false);
+            assertFalse(stakingContract.checkActionAvailability(actions[i]));
+            for (uint256 j = 0; j < actions.length; j++) {
+                if (j > i) assertTrue(stakingContract.checkActionAvailability(actions[j]));
+            }
+        }
+        stakingContract.changeActionAvailability(Types.DataType.CLAIM, true);
+        assertTrue(stakingContract.checkActionAvailability(Types.DataType.CLAIM));
+
+        assertFalse(stakingContract.checkActionAvailability(Types.DataType.REWARD_PROVIDED));
+        vm.expectRevert(Errors.InvalidDataType.selector);
+        stakingContract.changeActionAvailability(Types.DataType.REWARD_PROVIDED, true);
+        vm.expectRevert(Errors.InvalidDataType.selector);
+        stakingContract.changeActionAvailability(Types.DataType.REWARD_EXPECTED, true);
     }
 }

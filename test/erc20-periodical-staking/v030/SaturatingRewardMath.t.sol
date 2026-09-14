@@ -5,11 +5,20 @@ import "./V030Base.sol";
 
 /// @dev Exposes the internal indefinite-reward calculation so the saturating branch can be unit tested.
 ///      The public API pins each deposit's APY at stake time, so accrued < rewardGenerated is not reachable
-///      through safeStake/claim; the harness tests the guard directly.
+///      through stakeWithVoucher/claim; the harness tests the guard directly on a packed deposit.
 contract RewardMathHarness is ERC20PeriodicalStaking {
     constructor(address token) ERC20PeriodicalStaking(token) {}
 
-    function indefiniteReward(TokenDeposit memory d) external view returns (uint256) {
+    function indefiniteReward(uint256 amount, uint256 apyBps, uint256 startDate, uint256 rewardGenerated)
+        external
+        view
+        returns (uint256)
+    {
+        PackedDeposit memory d;
+        d.amount = uint128(amount);
+        d.apyBps = uint32(apyBps);
+        d.stakingStartDate = uint40(startDate);
+        d.rewardGenerated = uint128(rewardGenerated);
         return _calculateIndefiniteDepositReward(d);
     }
 }
@@ -17,14 +26,6 @@ contract RewardMathHarness is ERC20PeriodicalStaking {
 /// @title Indefinite reward math is saturating
 contract SaturatingRewardMathTest is V030Base {
     RewardMathHarness harness;
-
-    function _deposit(uint256 amount, uint256 apy, uint256 startDate, uint256 rewardGenerated)
-        internal
-        pure
-        returns (ProgramManager.TokenDeposit memory)
-    {
-        return ProgramManager.TokenDeposit(0, 0, startDate, 0, 0, amount, apy, rewardGenerated);
-    }
 
     function _harness() internal {
         harness = new RewardMathHarness(address(myToken));
@@ -37,9 +38,9 @@ contract SaturatingRewardMathTest is V030Base {
         uint256 accrued = harness.calculateReward(STAKE_AMOUNT, APY, 10);
 
         // rewardGenerated larger than accrued (e.g. paid at a higher rate earlier): must be 0, not underflow.
-        assertEq(harness.indefiniteReward(_deposit(STAKE_AMOUNT, APY, start, accrued + 1)), 0);
-        assertEq(harness.indefiniteReward(_deposit(STAKE_AMOUNT, APY, start, accrued * 3)), 0);
-        assertEq(harness.indefiniteReward(_deposit(STAKE_AMOUNT, APY, start, type(uint256).max)), 0);
+        assertEq(harness.indefiniteReward(STAKE_AMOUNT, APY, start, accrued + 1), 0);
+        assertEq(harness.indefiniteReward(STAKE_AMOUNT, APY, start, accrued * 3), 0);
+        assertEq(harness.indefiniteReward(STAKE_AMOUNT, APY, start, type(uint128).max), 0);
     }
 
     function test_ExactDifferenceWhenAccruedExceedsPaid() public {
@@ -48,20 +49,21 @@ contract SaturatingRewardMathTest is V030Base {
         uint256 start = _now() - 10 days;
         uint256 accrued = harness.calculateReward(STAKE_AMOUNT, APY, 10);
 
-        assertEq(harness.indefiniteReward(_deposit(STAKE_AMOUNT, APY, start, 0)), accrued);
-        assertEq(harness.indefiniteReward(_deposit(STAKE_AMOUNT, APY, start, accrued / 2)), accrued - accrued / 2);
-        assertEq(harness.indefiniteReward(_deposit(STAKE_AMOUNT, APY, start, accrued)), 0);
+        assertEq(harness.indefiniteReward(STAKE_AMOUNT, APY, start, 0), accrued);
+        assertEq(harness.indefiniteReward(STAKE_AMOUNT, APY, start, accrued / 2), accrued - accrued / 2);
+        assertEq(harness.indefiniteReward(STAKE_AMOUNT, APY, start, accrued), 0);
     }
 
-    function testFuzz_NeverReverts(uint128 amount, uint16 apy, uint32 daysPassed, uint256 rewardGenerated)
+    /// @notice Over the full packed ranges (uint128 amount and reward, uint32 APY) the guard never reverts.
+    function testFuzz_NeverReverts(uint128 amount, uint32 apyBps, uint24 daysPassed, uint128 rewardGenerated)
         public
     {
         _harness();
         vm.warp(uint256(daysPassed) * 1 days + 1);
         uint256 start = _now() - uint256(daysPassed) * 1 days;
-        uint256 accrued = harness.calculateReward(amount, apy, daysPassed);
+        uint256 accrued = harness.calculateReward(amount, apyBps, daysPassed);
 
-        uint256 got = harness.indefiniteReward(_deposit(amount, apy, start, rewardGenerated));
+        uint256 got = harness.indefiniteReward(amount, apyBps, start, rewardGenerated);
         if (rewardGenerated >= accrued) assertEq(got, 0);
         else assertEq(got, accrued - rewardGenerated);
     }

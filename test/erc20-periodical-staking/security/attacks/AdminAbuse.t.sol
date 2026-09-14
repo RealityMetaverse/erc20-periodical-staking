@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./AttackBase.t.sol";
+import "./VoucherAttackBase.sol";
 
 /// @title AdminAbuse
 /// @notice Owner/admin actions performed mid-flight must never lock user principal, never retroactively
-///         change what a deposit pays, and must always be recoverable by the owner.
-contract AdminAbuseTest is AttackBase {
+///         change what a deposit pays, and must always be recoverable by the owner. Freeze / seize is the one
+///         deliberate way to take a deposit: it must stay tiered (admins freeze, only the owner seizes), only
+///         ever pay the treasury, never touch other deposits' reserves, and never revert because the pool is short.
+contract AdminAbuseTest is VoucherAttackBase {
+    event FreezeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed by);
+    event UnfreezeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed by);
+    event SeizeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed treasury, uint256 principal);
+
     // ---------------------------------------------------------------------
     // APY changes
     // ---------------------------------------------------------------------
@@ -29,7 +35,7 @@ contract AdminAbuseTest is AttackBase {
     function test_apyRaised_periodicalDeposit_notRetroactive() public {
         uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
         uint256 reward = _deposit(alice, d).rewardGenerated;
-        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, 1000);
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, 9_000);
         _warpDays(30);
         uint256 before = token.balanceOf(alice);
         _claim(alice, d);
@@ -69,13 +75,30 @@ contract AdminAbuseTest is AttackBase {
         assertEq(_deposit(alice, d).APY, APY_PHASE0[0]);
     }
 
-    /// @dev Hypothesis: safeStake's expectedAPY guard protects users from an APY change in the same block.
-    function test_apyChanged_frontRunsStaker_exactError() public {
+    /// @dev Hypothesis: the owner front-runs a staker by lowering the APY. expectedApyBps is a floor: a lower
+    ///      effective APY reverts with exact figures, a higher one is accepted and recorded, and the voucher's
+    ///      extra APY counts toward the floor.
+    function test_apyChanged_frontRunsStaker_floorGuard() public {
         uint256 old = _apy(0, P30);
         staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, old - 1);
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, old, abi.encodeWithSelector(Errors.ApyBelowExpected.selector, 0, P30, old - 1, old)
+        );
+
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, old + 1);
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 0);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.PhasePeriodAPYChanged.selector, 0, P30, old - 1));
-        staking.safeStake(0, P30, 1_000 * ONE, old);
+        uint256 d = staking.stakeWithVoucher(v, sig, 1_000 * ONE, old);
+        assertEq(_deposit(alice, d).APY, old + 1, "higher APY accepted and recorded");
+
+        (v, sig) = _prepareVoucherStake(staking, alice, 0, P30, 5, 0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.ApyBelowExpected.selector, 0, P30, old + 6, old + 7));
+        staking.stakeWithVoucher(v, sig, 1_000 * ONE, old + 7);
+        vm.prank(alice);
+        d = staking.stakeWithVoucher(v, sig, 1_000 * ONE, old + 6);
+        assertEq(_deposit(alice, d).APY, old + 6);
+        _assertAccounting();
     }
 
     // ---------------------------------------------------------------------
@@ -87,16 +110,14 @@ contract AdminAbuseTest is AttackBase {
         uint256 d = _stake(alice, 0, P30, 10_000 * ONE);
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, P30, 1_000 * ONE);
 
-        (bool exceeds, uint256 remaining) = staking.checkIfUserExceedsLimit(alice, 0, P30, 1);
-        assertFalse(exceeds);
-        assertEq(remaining, 0);
-        (, uint256[][] memory rem,) = staking.getPhasePeriodUserData(alice);
-        assertEq(rem[0][1], 0);
+        // views that subtract staked from target saturate instead of underflowing
+        staking.getRewardRequiredForTargets();
+        staking.getRewardPoolShortfall();
+        staking.getProgramDataWithUserData(alice);
 
-        uint256 h1 = _apy(0, P30);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 1_000 * ONE));
-        staking.safeStake(0, P30, 100, h1);
+        _expectStakeRevert(
+            bob, 0, P30, 100, _apy(0, P30), abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 1_000 * ONE)
+        );
 
         _warpDays(30);
         _claim(alice, d);
@@ -107,10 +128,9 @@ contract AdminAbuseTest is AttackBase {
     function test_targetZero_disablesNewStakes_notClosing() public {
         uint256 d = _stake(alice, 0, P0, 1_000 * ONE);
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, P0, 0);
-        uint256 h2 = _apy(0, P0);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P0, 0));
-        staking.safeStake(0, P0, 100, h2);
+        _expectStakeRevert(
+            bob, 0, P0, 100, _apy(0, P0), abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P0, 0)
+        );
         _warpDays(3);
         _withdraw(alice, d);
         _assertAccounting();
@@ -158,9 +178,9 @@ contract AdminAbuseTest is AttackBase {
         assertEq(staking.currentStakingPhase(), 0);
         vm.expectRevert(Errors.NoStakingPhasesAddedYet.selector);
         staking.popStakingPhase();
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingPhaseDoesNotExist.selector, 0));
-        staking.safeStake(0, P30, 1_000 * ONE, 0);
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, 0, abi.encodeWithSelector(Errors.StakingPhaseDoesNotExist.selector, 0)
+        );
         vm.expectRevert(Errors.NoStakingPhasesAddedYet.selector);
         staking.changeStakingPhase(0);
     }
@@ -189,9 +209,9 @@ contract AdminAbuseTest is AttackBase {
         assertEq(_deposit(alice, d).rewardGenerated, reward);
         assertEq(_staked(1, P30), 10_000 * ONE, "STAKED must survive pop");
 
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 1, P30, 11_000 * ONE));
-        staking.safeStake(1, P30, 1_001 * ONE, 2);
+        _expectStakeRevert(
+            bob, 1, P30, 1_001 * ONE, 2, abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 1, P30, 11_000 * ONE)
+        );
         _stake(bob, 1, P30, 1_000 * ONE);
 
         _warpDays(30);
@@ -291,7 +311,7 @@ contract AdminAbuseTest is AttackBase {
     }
 
     // ---------------------------------------------------------------------
-    // Action availability & whitelist
+    // Action availability
     // ---------------------------------------------------------------------
 
     /// @dev Hypothesis: closing CLAIM also blocks withdraw (or vice versa). They must be independent and reversible.
@@ -302,10 +322,9 @@ contract AdminAbuseTest is AttackBase {
         staking.changeActionAvailability(Types.DataType.CLAIM, false);
         _withdraw(alice, d1); // withdraw still open
         staking.changeActionAvailability(Types.DataType.STAKING, false);
-        uint256 h5 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.NotOpen.selector, Types.DataType.STAKING));
-        staking.safeStake(0, P30, 1_000 * ONE, h5);
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(Errors.NotOpen.selector, Types.DataType.STAKING)
+        );
 
         _warpDays(30);
         vm.prank(alice);
@@ -323,9 +342,13 @@ contract AdminAbuseTest is AttackBase {
     }
 
     /// @dev Hypothesis: toggling availability on a non-action DataType has side effects on real actions.
-    function test_actionAvailability_nonActionTypes_noSideEffects() public {
+    ///      Since v0.4.0 it is rejected outright and reads as closed.
+    function test_actionAvailability_nonActionTypes_rejected_noSideEffects() public {
+        vm.expectRevert(Errors.InvalidDataType.selector);
         staking.changeActionAvailability(Types.DataType.REWARD_EXPECTED, false);
-        staking.changeActionAvailability(Types.DataType.REWARD_PROVIDED, false);
+        vm.expectRevert(Errors.InvalidDataType.selector);
+        staking.changeActionAvailability(Types.DataType.REWARD_PROVIDED, true);
+        assertFalse(staking.checkActionAvailability(Types.DataType.REWARD_EXPECTED));
         assertTrue(staking.checkActionAvailability(Types.DataType.STAKING));
         assertTrue(staking.checkActionAvailability(Types.DataType.CLAIM));
         assertTrue(staking.checkActionAvailability(Types.DataType.WITHDRAWAL));
@@ -333,36 +356,264 @@ contract AdminAbuseTest is AttackBase {
         staking.provideReward(1);
     }
 
-    /// @dev Hypothesis: enabling the whitelist after a deposit blocks closing that deposit.
-    function test_whitelistToggle_midDeposit_onlyBlocksNewStakes() public {
-        uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
-        uint256 e = _stake(alice, 0, P0, 1_000 * ONE);
-        staking.setWhitelistEnabled(true);
-        uint256 h6 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.NotWhitelisted.selector, alice));
-        staking.safeStake(0, P30, 1_000 * ONE, h6);
-        _withdraw(alice, e);
-        _warpDays(30);
-        _claim(alice, d);
+    // ---------------------------------------------------------------------
+    // Freeze and seize
+    // ---------------------------------------------------------------------
 
-        staking.setWhitelistAddress(alice, true);
-        uint256 f = _stake(alice, 0, P0, 1_000 * ONE);
-        staking.setWhitelistAddress(alice, false);
-        _withdraw(alice, f);
+    /// @dev Hypothesis: an admin can take a deposit, or seize pays someone other than the treasury.
+    ///      Admins may freeze and unfreeze; only the owner seizes, and the tokens go to the treasury only.
+    function test_freezeSeize_tiering_paysTreasuryOnly() public {
+        uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
+        uint256 reward = _deposit(alice, d).rewardGenerated;
+
+        vm.expectEmit(true, true, true, true, address(staking));
+        emit FreezeDeposit(alice, d, admin);
+        vm.prank(admin);
+        staking.freezeDeposit(alice, d);
+        assertTrue(staking.isDepositFrozen(alice, d));
+
+        vm.prank(admin);
+        vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
+        staking.seizeDeposit(alice, d);
+        vm.prank(admin);
+        vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
+        staking.seizeDeposits(_one(alice), _oneU(d));
+
+        vm.expectEmit(true, true, true, true, address(staking));
+        emit UnfreezeDeposit(alice, d, admin);
+        vm.prank(admin);
+        staking.unfreezeDeposit(alice, d);
+        vm.prank(admin);
+        staking.freezeDeposit(alice, d);
+
+        address newTreasury = makeAddr("newTreasury");
+        staking.setTreasury(newTreasury);
+        uint256 ownerBefore = token.balanceOf(owner);
+        uint256 adminBefore = token.balanceOf(admin);
+        uint256 poolBefore = staking.rewardPool();
+        vm.expectEmit(true, true, true, true, address(staking));
+        emit SeizeDeposit(alice, d, newTreasury, 1_000 * ONE);
+        _seize(alice, d);
+
+        assertGt(reward, 0);
+        assertEq(token.balanceOf(newTreasury), 1_000 * ONE, "treasury receives principal only");
+        assertEq(staking.rewardPool(), poolBefore, "reserved reward stays in the pool");
+        assertEq(_user(Types.DataType.REWARD_EXPECTED, alice), 0, "reservation released");
+        assertEq(token.balanceOf(treasury), 0, "old treasury receives nothing");
+        assertEq(token.balanceOf(owner), ownerBefore, "owner receives nothing");
+        assertEq(token.balanceOf(admin), adminBefore, "admin receives nothing");
+        assertFalse(staking.isDepositFrozen(alice, d), "seized clears the frozen flag");
+        assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.SEIZED));
         _assertAccounting();
     }
 
-    /// @dev Hypothesis: whitelist helpers accept address(0) (poisoning the mapping).
-    function test_whitelist_zeroAddress_rejected() public {
-        vm.expectRevert(Errors.ZeroAddressProvided.selector);
-        staking.setWhitelistAddress(address(0), true);
-        address[] memory a = new address[](2);
-        a[0] = alice;
-        a[1] = address(0);
-        vm.expectRevert(Errors.ZeroAddressProvided.selector);
-        staking.setWhitelistAddresses(a, true);
-        assertFalse(staking.isWhitelisted(alice), "batch must be atomic");
+    /// @dev Every enforcement edge reverts with its exact error; nothing can be frozen, seized or unfrozen twice,
+    ///      and a closed or seized deposit can never be reopened through freeze/unfreeze.
+    function test_freezeSeize_guards_exactErrors() public {
+        uint256 a = _stake(alice, 0, P0, 1_000 * ONE);
+        uint256 b = _stake(alice, 0, P30, 1_000 * ONE);
+
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 9));
+        staking.freezeDeposit(alice, 9);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 0));
+        staking.freezeDeposit(bob, 0);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 9));
+        staking.unfreezeDeposit(alice, 9);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 9));
+        staking.seizeDeposit(alice, 9);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 9));
+        staking.isDepositFrozen(alice, 9);
+
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, a));
+        staking.seizeDeposit(alice, a);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, a));
+        staking.unfreezeDeposit(alice, a);
+
+        _freeze(alice, a);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, alice, a));
+        staking.freezeDeposit(alice, a);
+
+        _seize(alice, a);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, a));
+        staking.seizeDeposit(alice, a);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotOpen.selector, alice, a));
+        staking.freezeDeposit(alice, a);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, a));
+        staking.unfreezeDeposit(alice, a);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.NotWithdrawable.selector, a));
+        staking.withdrawDeposit(a);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.NotClaimable.selector, a));
+        staking.claimDeposit(a);
+
+        // a normally closed deposit cannot be frozen (so it cannot be seized either)
+        _warpDays(30);
+        _claim(alice, b);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotOpen.selector, alice, b));
+        staking.freezeDeposit(alice, b);
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: freezing locks principal permanently or the frozen deposit can still be exited by the
+    ///      user. Frozen: single claim/withdraw revert DepositFrozen, batch claims skip it (and still pay the
+    ///      rest), claimable views exclude it; after unfreeze everything is paid in full.
+    function test_frozen_userCannotExit_batchSkips_unfreezeRestores() public {
+        uint256 d0 = _stake(alice, 0, P30, 1_000 * ONE);
+        uint256 d1 = _stake(alice, 0, P30, 2_000 * ONE);
+        uint256 d2 = _stake(alice, 0, P0, 3_000 * ONE);
+        uint256 r0 = _deposit(alice, d0).rewardGenerated;
+        uint256 r1 = _deposit(alice, d1).rewardGenerated;
+        _freeze(alice, d0);
+        _freeze(alice, d2);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, alice, d2));
+        staking.withdrawDeposit(d2);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, alice, d2));
+        staking.withdrawDepositPartial(d2, 0);
+
+        _warpDays(30);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, alice, d0));
+        staking.claimDeposit(d0);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, alice, d2));
+        staking.claimDeposit(d2);
+
+        (uint256 cs, uint256 cp, uint256 ci) = staking.checkClaimableDataFor(alice);
+        assertEq(cs, 2_000 * ONE, "frozen principal not claimable");
+        assertEq(cp, r1);
+        assertEq(ci, 0, "frozen indefinite reward not claimable");
+
+        uint256 before = token.balanceOf(alice);
+        _claimAll(alice);
+        assertEq(token.balanceOf(alice) - before, 2_000 * ONE + r1, "claimAll pays only the unfrozen deposit");
+        vm.prank(alice);
+        staking.claimRange(0, 3); // silent skip, no revert
+        assertEq(token.balanceOf(alice) - before, 2_000 * ONE + r1);
+        assertEq(uint256(_status(alice, d0)), uint256(ProgramManager.DepositStatus.READY_TO_CLAIM));
+        _assertAccounting();
+
+        vm.prank(admin);
+        staking.unfreezeDeposit(alice, d0);
+        vm.prank(admin);
+        staking.unfreezeDeposit(alice, d2);
+        uint256 accrued = _deposit(alice, d2).rewardGenerated;
+        before = token.balanceOf(alice);
+        _claim(alice, d0);
+        _withdraw(alice, d2);
+        assertEq(token.balanceOf(alice) - before, 1_000 * ONE + r0 + 3_000 * ONE + accrued, "nothing lost while frozen");
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: a short pool makes seize revert (letting a frozen user out-wait enforcement). A
+    ///      periodical seize with an unfunded reserve pays principal only, releases the reservation and zeroes
+    ///      the deposit's recorded reward.
+    function test_seize_periodical_poolShort_principalOnly_neverReverts() public {
+        staking.collectReward(staking.getCollectableReward()); // pool = 0
+        uint256 d = _stake(alice, 0, P90, 10_000 * ONE);
+        assertGt(_deposit(alice, d).rewardGenerated, 0);
+        _warpDays(95); // matured too: READY_TO_CLAIM seizes the same way
+        _freeze(alice, d);
+
+        vm.expectEmit(true, true, true, true, address(staking));
+        emit SeizeDeposit(alice, d, treasury, 10_000 * ONE);
+        _seize(alice, d);
+        assertEq(token.balanceOf(treasury), 10_000 * ONE);
+        assertEq(_total(Types.DataType.REWARD_EXPECTED), 0, "reservation released");
+        assertEq(_deposit(alice, d).rewardGenerated, 0, "unpaid reward is not recorded as paid");
+        assertEq(_user(Types.DataType.CLAIM, alice), 0);
+        assertEq(staking.rewardPool(), 0);
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: seizing an indefinite deposit takes reward reserved for someone else's periodical deposit.
+    ///      Seize never pays a reward: the treasury gets principal only and the pool is untouched.
+    function test_seize_indefinite_neverTakesOthersReserve() public {
+        staking.collectReward(staking.getCollectableReward());
+        uint256 bobReward = staking.calculateReward(1_000 * ONE, _apy(0, P90), P90);
+        staking.provideReward(bobReward + 1);
+        uint256 b = _stake(bob, 0, P90, 1_000 * ONE);
+        uint256 a = _stake(alice, 0, P0, 100_000 * ONE);
+        _warpDays(10);
+        uint256 accrued = _deposit(alice, a).rewardGenerated;
+        assertGt(accrued, 1, "precondition: accrued exceeds the 1-wei collectable slack");
+
+        _freeze(alice, a);
+        _seize(alice, a);
+        assertEq(token.balanceOf(treasury), 100_000 * ONE, "principal only, no partial reward");
+        assertEq(staking.rewardPool(), bobReward + 1, "pool untouched");
+        _assertAccounting();
+
+        _warpDays(80);
+        uint256 before = token.balanceOf(bob);
+        _claim(bob, b);
+        assertEq(token.balanceOf(bob) - before, 1_000 * ONE + bobReward, "bob's reserve intact");
+        _assertAccounting();
+    }
+
+    /// @dev Batch enforcement is atomic: one bad entry reverts everything (no partial freeze, no partial seize,
+    ///      no transfer); length mismatches are typed; empty batches are harmless no-ops.
+    function test_enforcementBatches_atomicAndLengthChecked() public {
+        uint256 a = _stake(alice, 0, P0, 1_000 * ONE);
+        uint256 b = _stake(bob, 0, P0, 1_000 * ONE);
+
+        address[] memory w = new address[](2);
+        w[0] = alice;
+        w[1] = bob;
+        uint256[] memory n = new uint256[](2);
+        n[0] = a;
+        n[1] = 5; // bob has no deposit #5
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 5));
+        staking.freezeDeposits(w, n);
+        assertFalse(staking.isDepositFrozen(alice, a), "freeze batch must be atomic");
+
+        n[1] = b;
+        vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 2, 1));
+        staking.freezeDeposits(w, _oneU(a));
+        vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 2, 1));
+        staking.unfreezeDeposits(w, _oneU(a));
+        vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 2, 1));
+        staking.seizeDeposits(w, _oneU(a));
+
+        _freeze(alice, a); // bob stays unfrozen
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, bob, b));
+        staking.seizeDeposits(w, n);
+        assertTrue(staking.isDepositFrozen(alice, a), "seize batch must be atomic");
+        assertEq(uint256(_status(alice, a)), uint256(ProgramManager.DepositStatus.INDEFINITE));
+        assertEq(token.balanceOf(treasury), 0);
+
+        // same deposit twice in one batch: the second entry sees it already seized
+        address[] memory ww = new address[](2);
+        ww[0] = alice;
+        ww[1] = alice;
+        uint256[] memory nn = new uint256[](2);
+        nn[0] = a;
+        nn[1] = a;
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, a));
+        staking.seizeDeposits(ww, nn);
+        assertTrue(staking.isDepositFrozen(alice, a));
+
+        staking.seizeDeposits(new address[](0), new uint256[](0));
+        staking.freezeDeposits(new address[](0), new uint256[](0));
+        assertEq(token.balanceOf(treasury), 0);
+        _assertAccounting();
+    }
+
+    /// @dev Pausing claims and withdrawals does not stop enforcement, and enforcement does not reopen them.
+    function test_enforcement_ignoresActionAvailability() public {
+        uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
+        staking.changeActionAvailability(Types.DataType.CLAIM, false);
+        staking.changeActionAvailability(Types.DataType.WITHDRAWAL, false);
+        staking.changeActionAvailability(Types.DataType.STAKING, false);
+        vm.prank(admin);
+        staking.freezeDeposit(alice, d);
+        _seize(alice, d);
+        assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.SEIZED));
+        assertFalse(staking.checkActionAvailability(Types.DataType.CLAIM));
+        _assertAccounting();
     }
 
     // ---------------------------------------------------------------------
@@ -371,14 +622,12 @@ contract AdminAbuseTest is AttackBase {
 
     /// @dev Hypothesis: pointing limitController at an EOA bricks the contract.
     ///      It may only block new stakes and controller-dependent views; owner must be able to recover.
+    ///      Unsetting the controller does NOT fall back to "no limit": staking stays closed with a typed error.
     function test_limitController_setToEOA_recoverable() public {
         uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
         staking.setLimitController(rando);
 
-        uint256 h7 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert();
-        staking.safeStake(0, P30, 1_000 * ONE, h7);
+        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), "");
         vm.expectRevert();
         staking.getProgramDataWithUserData(alice);
         staking.getProgramData(); // does not consult the controller
@@ -387,32 +636,38 @@ contract AdminAbuseTest is AttackBase {
         _claim(alice, d);
 
         staking.setLimitController(address(0));
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(Errors.LimitControllerNotSet.selector)
+        );
+        (,,,,, uint256[][] memory limits, uint256[][] memory remaining) = staking.getProgramDataWithUserData(alice);
+        assertEq(limits[0][1], 0, "no controller => zero-filled limits");
+        assertEq(remaining[0][1], 0, "no controller => zero-filled remaining (no whole-pool fallback)");
+
+        staking.setLimitController(address(new OpenLimitController(address(staking))));
         _stake(alice, 0, P30, 1_000 * ONE);
         staking.getProgramDataWithUserData(alice);
         _assertAccounting();
     }
 
-    /// @dev Hypothesis: pointing requirementChecker at an EOA bricks *all* program views including getProgramData.
-    ///      Claims/withdrawals must still work and the owner must be able to recover.
-    function test_requirementChecker_setToEOA_recoverable() public {
+    /// @dev Hypothesis: pointing voucherSigner at a contract that does not implement ERC-1271 (here: the token)
+    ///      bricks something besides new stakes. Claims, withdrawals and every view must keep working.
+    function test_voucherSigner_setToNon1271Contract_recoverable() public {
         uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
-        staking.setRequirementChecker(rando);
+        uint256 e = _stake(bob, 0, P0, 1_000 * ONE);
+        staking.setVoucherSigner(address(token));
 
-        uint256 h8 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert();
-        staking.safeStake(0, P30, 1_000 * ONE, h8);
-        vm.expectRevert();
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector)
+        );
         staking.getProgramData();
-        // user-facing reads that don't need the checker
+        staking.getProgramDataWithUserData(alice);
         staking.checkClaimableDataFor(alice);
-        staking.getDeposit(alice, d);
 
         _warpDays(30);
         _claim(alice, d);
+        _withdraw(bob, e);
 
-        staking.setRequirementChecker(address(0));
-        staking.getProgramData();
+        staking.setVoucherSigner(_voucherSignerAddr());
         _stake(alice, 0, P30, 1_000 * ONE);
         _assertAccounting();
     }
@@ -475,7 +730,8 @@ contract AdminAbuseTest is AttackBase {
         staking.acceptOwnership();
     }
 
-    /// @dev Hypothesis: an admin can escalate to owner-only functions or mint more admins.
+    /// @dev Hypothesis: an admin can escalate to owner-only functions (seize and the voucher knobs included)
+    ///      or mint more admins.
     function test_admin_cannotEscalate() public {
         vm.startPrank(admin);
         vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
@@ -486,11 +742,20 @@ contract AdminAbuseTest is AttackBase {
         staking.collectReward(1);
         vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
         staking.rescueTokens(address(token), 1);
+        vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
+        staking.setTreasury(admin);
+        vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
+        staking.setVoucherSigner(admin);
+        vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));
+        staking.setMaxExtraApyBps(10_000);
         vm.stopPrank();
         staking.removeContractAdmin(admin);
         vm.prank(admin);
         vm.expectRevert(_unauthorized(AccessControl.AccessTier.ADMIN));
         staking.provideReward(1);
+        vm.prank(admin);
+        vm.expectRevert(_unauthorized(AccessControl.AccessTier.ADMIN));
+        staking.freezeDeposit(alice, 0);
     }
 
     /// @dev Hypothesis: raising minimumDeposit after a small deposit blocks closing it.
@@ -499,16 +764,21 @@ contract AdminAbuseTest is AttackBase {
         staking.setMiniumumDeposit(1_000_000 * ONE);
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidMinimumDeposit.selector, 0, 1));
         staking.setMiniumumDeposit(0);
-        uint256 h9 = _apy(0, P30);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.InsufficientDeposit.selector, 1_000 * ONE, 1_000_000 * ONE));
-        staking.safeStake(0, P30, 1_000 * ONE, h9);
+        _expectStakeRevert(
+            bob,
+            0,
+            P30,
+            1_000 * ONE,
+            _apy(0, P30),
+            abi.encodeWithSelector(Errors.InsufficientDeposit.selector, 1_000 * ONE, 1_000_000 * ONE)
+        );
         _warpDays(30);
         _claim(alice, d);
         _assertAccounting();
     }
 
     /// @dev Hypothesis: the owner can drain principal through any admin path (collect / rescue / pop / remove).
+    ///      The only path that moves principal is freeze + seize, and it pays the treasury, never the owner.
     function test_owner_cannotExtractPrincipal_anyPath() public {
         _stake(alice, 0, P30, 10_000 * ONE);
         _stake(bob, 0, P0, 10_000 * ONE);
@@ -528,5 +798,13 @@ contract AdminAbuseTest is AttackBase {
 
         assertGe(token.balanceOf(address(staking)), principal, "principal must stay in the contract");
         assertEq(_total(Types.DataType.STAKING), principal);
+
+        uint256 ownerBefore = token.balanceOf(owner);
+        _freeze(bob, 0);
+        _seize(bob, 0);
+        assertEq(token.balanceOf(owner), ownerBefore, "seize never pays the owner");
+        assertEq(token.balanceOf(treasury), 10_000 * ONE);
+        vm.expectRevert();
+        staking.rescueTokens(address(token), 1); // seizing creates no rescuable excess
     }
 }

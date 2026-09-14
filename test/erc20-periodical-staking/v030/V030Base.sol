@@ -13,7 +13,7 @@ import "../../../src/contracts/erc20-periodical-staking/AccessControl.sol";
 abstract contract V030Base is ClaimFunctions, WithdrawalFunctions, Events {
     uint256 constant PERIOD_SHORT = 7;
     uint256 constant PERIOD_LONG = 90;
-    uint256 constant APY = 30;
+    uint256 constant APY = 3000; // bps
     uint256 constant TARGET = 10_000_000 ether;
     uint256 constant STAKE_AMOUNT = 200 ether;
 
@@ -48,10 +48,8 @@ abstract contract V030Base is ClaimFunctions, WithdrawalFunctions, Events {
     }
 
     function _stakeFor(address user, uint256 period, uint256 amount) internal {
-        uint256 apy = stakingContract.phasePeriodDataList(Types.PhasePeriodDataType.APY, 0, period);
         _increaseAllowance(user, amount);
-        vm.prank(user);
-        stakingContract.safeStake(0, period, amount, apy);
+        _stakeV(stakingContract, user, 0, period, amount);
     }
 
     function _periodicalReward(uint256 amount, uint256 period) internal view returns (uint256) {

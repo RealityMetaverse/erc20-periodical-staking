@@ -206,29 +206,69 @@ contract LimitControllerWalletLimitTest is LimitControllerFunctions {
     }
 
     // ======================================
-    // =   Integration with safeStake        =
+    // =   Integration with stakeWithVoucher =
     // ======================================
 
-    function test_Integration_ZeroLimitBlocksStake_ClearUnblocks() public {
+    function _integrationSetup() internal {
         _deployWithDefault();
         _addPhasesAndPeriods();
         _increaseAllowance(address(this), amountToProvide);
         stakingContract.provideReward(amountToProvide);
         limitController.setDefaultLimit(0, 0, DEFAULT_LIMIT);
         _setLimitControllerOnStakingContract(address(limitController));
+    }
 
+    function test_Integration_ZeroLimitBlocksStake_ClearUnblocks() public {
+        _integrationSetup();
         limitController.setWalletLimit(userOne, 0, 0, 0);
         uint256 apy = _getPhasePeriodAPY(0, 0);
 
         _increaseAllowance(userOne, amountToStake);
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(stakingContract, userOne, 0, 0, 0, 0);
         vm.prank(userOne);
         vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, amountToStake, 0));
-        stakingContract.safeStake(0, 0, amountToStake, apy);
+        stakingContract.stakeWithVoucher(v, sig, amountToStake, apy);
 
         limitController.clearWalletLimit(userOne, 0, 0);
-        vm.prank(userOne);
-        stakingContract.safeStake(0, 0, amountToStake, apy);
+        _stakeV(stakingContract, userOne, 0, 0, amountToStake);
         assertEq(stakingContract.userDataList(Types.DataType.STAKING, userOne), amountToStake);
         assertEq(_getRemaining(userOne, 0, 0), DEFAULT_LIMIT - amountToStake);
+    }
+
+    /// @notice A wallet explicitly blocked with limit 0 can still stake up to the voucher's extraLimit. The extra
+    ///         is per voucher, not cumulative: a second voucher with the same extra finds its headroom used up.
+    function test_Integration_ZeroLimit_VoucherExtraLimitIsTheOnlyHeadroom() public {
+        _integrationSetup();
+        limitController.setWalletLimit(userOne, 0, 0, 0);
+        uint256 apy = _getPhasePeriodAPY(0, 0);
+        _increaseAllowance(userOne, 3 * amountToStake);
+
+        (Types.StakeVoucher memory v, bytes memory sig) =
+            _prepareVoucherStake(stakingContract, userOne, 0, 0, 0, amountToStake);
+        vm.prank(userOne);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Errors.StakingLimitExceeded.selector, userOne, 0, 0, amountToStake + 1, amountToStake
+            )
+        );
+        stakingContract.stakeWithVoucher(v, sig, amountToStake + 1, apy);
+
+        // The reverted call did not burn the nonce: the same voucher stakes exactly the extra.
+        vm.prank(userOne);
+        stakingContract.stakeWithVoucher(v, sig, amountToStake, apy);
+        assertEq(stakingContract.userDataList(Types.DataType.STAKING, userOne), amountToStake);
+        assertEq(_getRemaining(userOne, 0, 0), 0, "controller view excludes voucher extras");
+
+        (v, sig) = _prepareVoucherStake(stakingContract, userOne, 0, 0, 0, amountToStake);
+        vm.prank(userOne);
+        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, amountToStake, 0));
+        stakingContract.stakeWithVoucher(v, sig, amountToStake, apy);
+
+        // Clearing the explicit 0 restores the default on top of the extra.
+        limitController.clearWalletLimit(userOne, 0, 0);
+        vm.prank(userOne);
+        stakingContract.stakeWithVoucher(v, sig, amountToStake, apy);
+        assertEq(stakingContract.userDataList(Types.DataType.STAKING, userOne), 2 * amountToStake);
+        assertEq(_getRemaining(userOne, 0, 0), DEFAULT_LIMIT - 2 * amountToStake);
     }
 }

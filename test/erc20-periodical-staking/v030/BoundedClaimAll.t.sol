@@ -171,6 +171,44 @@ contract BoundedClaimAllTest is V030Base {
         assertEq(stakingContract.stakerActiveDepositStartIndex(userOne), 3);
     }
 
+    /// @notice v0.4.0: claimAll / claimRange skip a frozen deposit instead of reverting the batch, the cursor stops
+    ///         at it (it is still open), and seizing it lets the cursor move past the whole closed prefix.
+    function test_ClaimAll_SkipsFrozen_CursorStopsUntilSeized() public {
+        _setupProgram(true);
+        _stakeMany(userOne, 3);
+        skip(PERIOD_SHORT * 1 days + 1);
+        uint256 reward = _periodicalReward(STAKE_AMOUNT, PERIOD_SHORT);
+
+        stakingContract.freezeDeposit(userOne, 0); // owner counts as admin
+
+        (uint256 cs, uint256 cp, uint256 ci) = stakingContract.checkClaimableDataFor(userOne);
+        assertEq(cs, 2 * STAKE_AMOUNT, "claimable principal skips the frozen deposit");
+        assertEq(cp, 2 * reward);
+        assertEq(ci, 0);
+
+        uint256 before = myToken.balanceOf(userOne);
+        vm.prank(userOne);
+        stakingContract.claimAll();
+        assertEq(myToken.balanceOf(userOne) - before, cs + cp, "single payout matches the claimable view");
+        assertFalse(_isClosed(userOne, 0));
+        assertTrue(_isClosed(userOne, 1));
+        assertTrue(_isClosed(userOne, 2));
+        assertEq(stakingContract.stakerActiveDepositStartIndex(userOne), 0, "cursor stops at the frozen deposit");
+
+        // A window holding only the frozen deposit is a silent no-op; the single claim reverts.
+        vm.prank(userOne);
+        stakingContract.claimRange(0, 1);
+        assertFalse(_isClosed(userOne, 0));
+        vm.prank(userOne);
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, userOne, 0));
+        stakingContract.claimDeposit(0);
+
+        stakingContract.seizeDeposit(userOne, 0);
+        assertTrue(_isClosed(userOne, 0));
+        assertEq(stakingContract.stakerActiveDepositStartIndex(userOne), 3, "cursor moves past the seized prefix");
+        assertEq(stakingContract.userDataList(Types.DataType.STAKING, userOne), 0);
+    }
+
     /// @notice Gas for a bounded claim must not grow with the total number of deposits behind the cursor.
     function test_ClaimRange_GasIndependentOfHistory() public {
         _setupProgram(true);

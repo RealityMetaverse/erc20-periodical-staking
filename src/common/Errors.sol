@@ -36,11 +36,15 @@ abstract contract Errors {
     error NotWithdrawable(uint256 depositNumber);
     error NotClaimable(uint256 depositNumber);
     error InsufficientDeposit(uint256 _tokenSent, uint256 _requiredAmount);
+    error DepositFrozen(address wallet, uint256 depositNumber);
+    error DepositNotFrozen(address wallet, uint256 depositNumber);
+    error DepositNotOpen(address wallet, uint256 depositNumber);
 
     // ======================================
     // =        Target & Limit Errors       =
     // ======================================
     error AmountExceedsTarget(uint256 stakingPhase, uint256 stakingPeriod, uint256 stakingTarget);
+    /// @param allowed Remaining headroom for this stake (controller limit + voucher extraLimit - used), 0 if none.
     error StakingLimitExceeded(address wallet, uint256 phase, uint256 period, uint256 requested, uint256 allowed);
 
     // ======================================
@@ -57,15 +61,26 @@ abstract contract Errors {
     error InvalidAPY(uint256 providedValue, uint256 minValue);
     error InvalidMinimumDeposit(uint256 providedValue, uint256 minValue);
     error InvalidDataType();
-    error PhasePeriodAPYChanged(uint256 stakingPhase, uint256 stakingPeriod, uint256 currentAPY);
+    error ApyBelowExpected(uint256 stakingPhase, uint256 stakingPeriod, uint256 effectiveApyBps, uint256 expectedApyBps);
+
+    // ======================================
+    // =        Voucher Errors              =
+    // ======================================
+    error VoucherSignerNotSet();
+    error LimitControllerNotSet();
+    error TreasuryNotSet();
+    error InvalidVoucherSignature();
+    error VoucherWalletMismatch(address voucherWallet, address caller);
+    error VoucherExpired(uint256 validUntil, uint256 currentTime);
+    error VoucherNonceUsed(address wallet, uint256 nonce);
+    error VoucherExtraApyTooHigh(uint256 extraApyBps, uint256 maxExtraApyBps);
+    error VoucherExtraLimitTooHigh(uint256 extraLimit, uint256 maxExtraLimit);
 
     // ======================================
     // =        Access Control Errors       =
     // ======================================
     error NotOpen(Types.DataType action);
     error NotPendingOwner(address caller, address pendingOwner);
-    error NotWhitelisted(address user);
-    error RequirementNotMet(uint256 requiredWorth, uint256 actualWorth);
 
     // ======================================
     // =        ERC1155 Errors              =

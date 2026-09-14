@@ -1,25 +1,64 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./AttackBase.t.sol";
+import "./VoucherAttackBase.sol";
+import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {ReentrantERC20} from "../../../shared/malicious/MaliciousTokens.sol";
-import {
-    MaliciousLimitController,
-    MaliciousRequirementChecker,
-    ReentrancyAttacker
-} from "../../../shared/malicious/MaliciousControllers.sol";
+import {MaliciousLimitController, ReentrancyAttacker} from "../../../shared/malicious/MaliciousControllers.sol";
+
+/// @notice ERC-1271 voucher signer that can be switched into hostile modes.
+contract MaliciousVoucherSigner is IERC1271 {
+    enum Mode {
+        VALID, // approves every hash
+        INVALID, // wrong magic value
+        REVERT,
+        REENTER, // tries to call back into the staking contract; approves only if the guard blocked it
+        GAS_BURN
+    }
+
+    bytes4 internal constant REENTRANT = bytes4(keccak256("ReentrancyGuardReentrantCall()"));
+
+    Mode public mode;
+    address public target;
+    bytes public reenterData;
+
+    function setMode(Mode m) external {
+        mode = m;
+    }
+
+    function setReenter(address target_, bytes calldata data) external {
+        target = target_;
+        reenterData = data;
+    }
+
+    function isValidSignature(bytes32, bytes memory) external view returns (bytes4) {
+        if (mode == Mode.VALID) return IERC1271.isValidSignature.selector;
+        if (mode == Mode.INVALID) return 0xffffffff;
+        if (mode == Mode.REVERT) revert("signer says no");
+        if (mode == Mode.REENTER) {
+            (bool ok, bytes memory ret) = target.staticcall(reenterData);
+            if (!ok && ret.length >= 4 && bytes4(ret) == REENTRANT) return IERC1271.isValidSignature.selector;
+            return 0x00000000;
+        }
+        uint256 x;
+        while (true) {
+            x++;
+        }
+        return 0x00000000;
+    }
+}
 
 /// @title Reentrancy
-/// @notice The only external call surfaces of the staking contract are the token, the limit controller
-///         and the requirement checker. Every re-entry attempt through them must be rejected and must
-///         leave accounting untouched.
-contract ReentrancyTest is AttackBase {
+/// @notice The external call surfaces of the staking contract are the token, the limit controller and (since
+///         v0.4.0) an ERC-1271 voucher signer. Every re-entry attempt through them must be rejected and must
+///         leave accounting untouched; a voucher must never be spendable twice through re-entry.
+contract ReentrancyTest is VoucherAttackBase {
     ReentrantERC20 internal rtoken;
     ERC20PeriodicalStaking internal rs;
     ReentrancyAttacker internal atk;
 
     MaliciousLimitController internal mlc;
-    MaliciousRequirementChecker internal mrc;
+    MaliciousVoucherSigner internal msig;
 
     uint256 internal constant AMT = 10_000 * ONE;
 
@@ -33,15 +72,20 @@ contract ReentrancyTest is AttackBase {
         atk.approveAll();
 
         mlc = new MaliciousLimitController();
-        mrc = new MaliciousRequirementChecker();
+        msig = new MaliciousVoucherSigner();
     }
 
     function _rsApy(uint256 phase, uint256 period) internal view returns (uint256) {
         return rs.getPhasePeriodData(Types.PhasePeriodDataType.APY, phase, period);
     }
 
+    /// @dev Calldata for a fresh, validly signed stake of the attacker contract on `rs`.
+    function _atkStakeData(uint256 period, uint256 amount) internal returns (bytes memory) {
+        return _stakeData(rs, address(atk), 0, period, amount, _rsApy(0, period));
+    }
+
     function _atkStake(uint256 period, uint256 amount) internal returns (bool ok, bytes memory ret) {
-        (ok, ret) = atk.exec(abi.encodeCall(rs.safeStake, (0, period, amount, _rsApy(0, period))));
+        (ok, ret) = atk.exec(_atkStakeData(period, amount));
     }
 
     function _rsConservation() internal {
@@ -53,12 +97,12 @@ contract ReentrancyTest is AttackBase {
     }
 
     // ---------------------------------------------------------------------
-    // Token hooks: transferFrom (inside safeStake / provideReward)
+    // Token hooks: transferFrom (inside stakeWithVoucher / provideReward)
     // ---------------------------------------------------------------------
 
-    /// @dev Hypothesis: re-entering safeStake from inside the token's transferFrom creates a second deposit.
-    function test_reenter_safeStake_fromTransferFrom_isBlocked() public {
-        atk.setReenter(abi.encodeCall(rs.safeStake, (0, P0, AMT, _rsApy(0, P0))));
+    /// @dev Hypothesis: re-entering stakeWithVoucher (fresh voucher) from inside transferFrom creates a second deposit.
+    function test_reenter_stake_fromTransferFrom_isBlocked() public {
+        atk.setReenter(_atkStakeData(P0, AMT));
         rtoken.setHook(address(atk), abi.encodeCall(atk.poke, ()), false, true, true, 5);
 
         (bool ok,) = _atkStake(P0, AMT);
@@ -71,18 +115,42 @@ contract ReentrancyTest is AttackBase {
         _rsConservation();
     }
 
-    /// @dev Hypothesis: when the token propagates the inner revert, the outer stake fully reverts and nothing moves.
-    function test_reenter_safeStake_fromTransferFrom_propagated_revertsAtomically() public {
-        atk.setReenter(abi.encodeCall(rs.safeStake, (0, P0, AMT, _rsApy(0, P0))));
+    /// @dev Hypothesis: re-entering with the SAME voucher while its nonce is not yet visible as used spends it
+    ///      twice. The guard blocks the inner call, and afterwards the voucher is spent for good.
+    function test_reenter_sameVoucher_fromTransferFrom_blocked_thenReplayRejected() public {
+        bytes memory data = _atkStakeData(P0, AMT);
+        atk.setReenter(data);
+        rtoken.setHook(address(atk), abi.encodeCall(atk.poke, ()), false, true, true, 5);
+
+        (bool ok,) = atk.exec(data);
+        assertTrue(ok);
+        assertFalse(atk.lastSuccess());
+        assertEq(_selectorOf(atk.lastReturn()), REENTRANT_CALL_SELECTOR);
+        assertEq(rs.checkDepositCountOfAddress(address(atk)), 1);
+
+        rtoken.clearHook();
+        (bool ok2, bytes memory ret) = atk.exec(data);
+        assertFalse(ok2, "replay after the outer stake must fail");
+        assertEq(_selectorOf(ret), Errors.VoucherNonceUsed.selector);
+        assertEq(rs.checkDepositCountOfAddress(address(atk)), 1);
+        _rsConservation();
+    }
+
+    /// @dev Hypothesis: when the token propagates the inner revert, the outer stake fully reverts and nothing moves
+    ///      (the voucher nonce included: it stays usable).
+    function test_reenter_stake_fromTransferFrom_propagated_revertsAtomically() public {
+        atk.setReenter(_atkStakeData(P0, AMT));
         rtoken.setHook(address(atk), abi.encodeCall(atk.pokeStrict, ()), false, true, false, 5);
 
         uint256 balBefore = rtoken.balanceOf(address(atk));
+        uint256 nonce = _nextVoucherNonce[address(atk)];
         (bool ok, bytes memory ret) = _atkStake(P0, AMT);
         assertFalse(ok, "outer stake must revert");
         assertEq(_selectorOf(ret), REENTRANT_CALL_SELECTOR);
         assertEq(rs.checkDepositCountOfAddress(address(atk)), 0);
         assertEq(rtoken.balanceOf(address(atk)), balBefore, "no tokens may leave the attacker");
         assertEq(rs.totalDataList(Types.DataType.STAKING), 0);
+        assertFalse(rs.isVoucherNonceUsed(address(atk), nonce), "reverted stake must not burn the nonce");
         _rsConservation();
     }
 
@@ -103,7 +171,7 @@ contract ReentrancyTest is AttackBase {
     }
 
     // ---------------------------------------------------------------------
-    // Token hooks: transfer (inside withdraw / claim / claimAll / collectReward)
+    // Token hooks: transfer (inside withdraw / claim / claimAll / collectReward / seize)
     // ---------------------------------------------------------------------
 
     /// @dev Hypothesis: re-entering withdrawDeposit from the payout transfer pays twice.
@@ -148,7 +216,8 @@ contract ReentrancyTest is AttackBase {
         _rsConservation();
     }
 
-    /// @dev Hypothesis: re-entering claimAll from inside claimAll's first payout double-claims later deposits.
+    /// @dev Hypothesis: re-entering claimAll from inside claimAll's payout double-claims deposits. claimAll now
+    ///      aggregates into ONE transfer, so the hook fires once and every deposit is already closed by then.
     function test_reenter_claimAll_fromTransfer_isBlocked_eachPaidOnce() public {
         rtoken.clearHook();
         _atkStake(P30, AMT);
@@ -163,18 +232,19 @@ contract ReentrancyTest is AttackBase {
         uint256 before = rtoken.balanceOf(address(atk));
         (bool ok,) = atk.exec(abi.encodeWithSignature("claimAll()"));
         assertTrue(ok);
-        assertEq(atk.pokes(), 3, "one hook per payout");
+        assertEq(atk.pokes(), 1, "one aggregated payout");
         assertFalse(atk.lastSuccess());
+        assertEq(_selectorOf(atk.lastReturn()), REENTRANT_CALL_SELECTOR);
         assertEq(rtoken.balanceOf(address(atk)) - before, 3 * (AMT + rewardEach), "each deposit paid exactly once");
         assertEq(rs.totalDataList(Types.DataType.STAKING), 0);
         _rsConservation();
     }
 
-    /// @dev Hypothesis: re-entering safeStake from the payout transfer of a withdraw (cross-function).
+    /// @dev Hypothesis: re-entering stakeWithVoucher from the payout transfer of a withdraw (cross-function).
     function test_reenter_stake_fromTransfer_duringWithdraw_isBlocked() public {
         rtoken.clearHook();
         _atkStake(P0, AMT);
-        atk.setReenter(abi.encodeCall(rs.safeStake, (0, P0, AMT, _rsApy(0, P0))));
+        atk.setReenter(_atkStakeData(P0, AMT));
         rtoken.setHook(address(atk), abi.encodeCall(atk.poke, ()), true, false, true, 5);
 
         (bool ok,) = atk.exec(abi.encodeCall(rs.withdrawDeposit, (0)));
@@ -183,6 +253,39 @@ contract ReentrancyTest is AttackBase {
         assertEq(_selectorOf(atk.lastReturn()), REENTRANT_CALL_SELECTOR);
         assertEq(rs.checkDepositCountOfAddress(address(atk)), 1, "no new deposit sneaked in");
         _rsConservation();
+    }
+
+    /// @dev Hypothesis: a depositor being seized re-enters withdrawDeposit from the treasury payout to rescue its
+    ///      principal as well. The guard blocks it; the treasury is paid once and the attacker nothing.
+    function test_reenter_withdraw_fromSeizePayout_isBlocked() public {
+        rtoken.clearHook();
+        _atkStake(P0, AMT);
+        rs.freezeDeposit(address(atk), 0);
+        atk.setReenter(abi.encodeCall(rs.withdrawDeposit, (0)));
+        rtoken.setHook(address(atk), abi.encodeCall(atk.poke, ()), true, false, true, 5);
+
+        uint256 atkBefore = rtoken.balanceOf(address(atk));
+        rs.seizeDeposit(address(atk), 0);
+        assertEq(atk.pokes(), 1);
+        assertFalse(atk.lastSuccess());
+        assertEq(_selectorOf(atk.lastReturn()), REENTRANT_CALL_SELECTOR);
+        assertEq(rtoken.balanceOf(treasury), AMT, "treasury paid once");
+        assertEq(rtoken.balanceOf(address(atk)), atkBefore, "attacker receives nothing");
+        assertEq(uint256(rs.checkDepositStatus(address(atk), 0)), uint256(ProgramManager.DepositStatus.SEIZED));
+        _rsConservation();
+    }
+
+    /// @dev Hypothesis (read-only reentrancy): during the seize payout the deposit still looks open.
+    function test_readOnlyReentrancy_statusSeizedDuringSeizePayout() public {
+        rtoken.clearHook();
+        _atkStake(P0, AMT);
+        rs.freezeDeposit(address(atk), 0);
+        atk.setReenter(abi.encodeCall(rs.checkDepositStatus, (address(atk), 0)));
+        rtoken.setHook(address(atk), abi.encodeCall(atk.poke, ()), true, false, true, 5);
+
+        rs.seizeDeposit(address(atk), 0);
+        assertTrue(atk.lastSuccess());
+        assertEq(abi.decode(atk.lastReturn(), (uint8)), uint8(ProgramManager.DepositStatus.SEIZED));
     }
 
     /// @dev Hypothesis (read-only reentrancy): state observed from inside the payout transfer is already final (CEI).
@@ -233,9 +336,9 @@ contract ReentrancyTest is AttackBase {
         staking.setLimitController(address(mlc));
     }
 
-    /// @dev Hypothesis: a limit controller that re-enters safeStake during the limit check creates a deposit.
+    /// @dev Hypothesis: a limit controller that re-enters stakeWithVoucher during the limit check creates a deposit.
     function test_maliciousLC_reenter_cannotMutate() public {
-        mlc.setReenter(address(staking), abi.encodeCall(staking.safeStake, (0, P0, 1_000 * ONE, _apy(0, P0))));
+        mlc.setReenter(address(staking), _stakeData(staking, alice, 0, P0, 1_000 * ONE, _apy(0, P0)));
         _useMLC(MaliciousLimitController.Mode.REENTER);
         _stake(alice, 0, P0, 1_000 * ONE);
         assertEq(staking.checkDepositCountOfAddress(alice), 1, "controller must not have created a deposit");
@@ -244,15 +347,15 @@ contract ReentrancyTest is AttackBase {
     }
 
     /// @dev Hypothesis: a reverting limit controller bricks the contract. It may only block *new* stakes.
+    ///      Removing it does not reopen staking without limits; a working controller does.
     function test_maliciousLC_revert_onlyBlocksStake_claimsUnaffected() public {
         uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
         uint256 e = _stake(bob, 0, P0, 1_000 * ONE);
         _useMLC(MaliciousLimitController.Mode.REVERT);
 
-        uint256 h1 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(MaliciousLimitController.ControllerRevert.selector);
-        staking.safeStake(0, P30, 1_000 * ONE, h1);
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(MaliciousLimitController.ControllerRevert.selector)
+        );
         _assertAccounting();
 
         _warpDays(30);
@@ -261,6 +364,10 @@ contract ReentrancyTest is AttackBase {
         _assertAccounting();
 
         staking.setLimitController(address(0));
+        _expectStakeRevert(
+            alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(Errors.LimitControllerNotSet.selector)
+        );
+        staking.setLimitController(address(new OpenLimitController(address(staking))));
         _stake(alice, 0, P30, 1_000 * ONE);
         _assertAccounting();
     }
@@ -269,12 +376,11 @@ contract ReentrancyTest is AttackBase {
     function test_maliciousLC_emptyRevert_atomic() public {
         _useMLC(MaliciousLimitController.Mode.EMPTY_REVERT);
         uint256 bal = token.balanceOf(alice);
-        uint256 h2 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert();
-        staking.safeStake(0, P30, 1_000 * ONE, h2);
+        uint256 nonce = _nextVoucherNonce[alice];
+        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), "");
         assertEq(token.balanceOf(alice), bal);
         assertEq(staking.checkDepositCountOfAddress(alice), 0);
+        assertFalse(staking.isVoucherNonceUsed(alice, nonce));
         _assertAccounting();
     }
 
@@ -282,7 +388,7 @@ contract ReentrancyTest is AttackBase {
     function test_maliciousLC_gasBurn_revertsCleanly() public {
         _useMLC(MaliciousLimitController.Mode.GAS_BURN);
         uint256 bal = token.balanceOf(alice);
-        bytes memory data = abi.encodeCall(staking.safeStake, (0, P30, 1_000 * ONE, _apy(0, P30)));
+        bytes memory data = _stakeData(staking, alice, 0, P30, 1_000 * ONE, _apy(0, P30));
         vm.prank(alice);
         (bool ok,) = address(staking).call{gas: 3_000_000}(data);
         assertFalse(ok);
@@ -296,101 +402,131 @@ contract ReentrancyTest is AttackBase {
         _useMLC(MaliciousLimitController.Mode.WRONG_LENGTH);
         _stake(alice, 0, P30, 1_000 * ONE);
         _assertAccounting();
-        vm.expectRevert();
+        // 2 phases x 3 periods = 6 cells, the controller returns 5
+        vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 6, 5));
         staking.getPhasePeriodUserData(alice);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 6, 5));
         staking.getProgramDataWithUserData(alice);
         // Reads that do not touch the controller keep working
         staking.getProgramData();
         staking.checkClaimableDataFor(alice);
     }
 
-    /// @dev Hypothesis: a controller returning 0 for everyone blocks stakes with an exact error, nothing else.
-    function test_maliciousLC_allowNone_exactError() public {
+    /// @dev Hypothesis: a controller returning 0 for everyone blocks stakes with an exact error, and the voucher's
+    ///      extraLimit becomes exact (non-accumulating) headroom on top of it.
+    function test_maliciousLC_allowNone_exactError_extraLimitExact() public {
         _useMLC(MaliciousLimitController.Mode.ALLOW_NONE);
-        uint256 h3 = _apy(0, P30);
+        uint256 apy = _apy(0, P30);
+        _expectStakeRevert(
+            alice,
+            0,
+            P30,
+            1_000 * ONE,
+            apy,
+            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 1_000 * ONE, 0)
+        );
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 500 * ONE);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 1_000 * ONE, 0));
-        staking.safeStake(0, P30, 1_000 * ONE, h3);
+        vm.expectRevert(
+            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 500 * ONE + 1, 500 * ONE)
+        );
+        staking.stakeWithVoucher(v, sig, 500 * ONE + 1, apy);
+        vm.prank(alice);
+        staking.stakeWithVoucher(v, sig, 500 * ONE, apy);
+    }
+
+    /// @dev Hypothesis: a controller returning max allowed, combined with a max extraLimit, overflows the cap.
+    function test_maliciousLC_allowAll_maxExtraLimit_noOverflow() public {
+        _useMLC(MaliciousLimitController.Mode.ALLOW_ALL);
+        _stakeVWith(staking, alice, 0, P30, 1_000 * ONE, 0, type(uint128).max);
+        assertEq(staking.checkDepositCountOfAddress(alice), 1);
+        _assertAccounting();
     }
 
     // ---------------------------------------------------------------------
-    // Malicious requirement checker
+    // Malicious ERC-1271 voucher signer
     // ---------------------------------------------------------------------
 
-    function _useMRC(MaliciousRequirementChecker.Mode m) internal {
-        mrc.setMode(m);
-        staking.setRequirementChecker(address(mrc));
+    function _useSigner(MaliciousVoucherSigner.Mode m) internal {
+        msig.setMode(m);
+        staking.setVoucherSigner(address(msig));
     }
 
-    /// @dev Hypothesis: a requirement checker re-entering withdrawDeposit during the check mutates state.
-    function test_maliciousRC_reenter_cannotMutate() public {
+    /// @dev A smart-contract signer is supported: its approval authorizes the stake without any ECDSA signature.
+    function test_contractSigner_valid_authorizesStake() public {
+        _useSigner(MaliciousVoucherSigner.Mode.VALID);
+        Types.StakeVoucher memory v = _makeVoucher(alice, 0, P30, 0, 0);
+        uint256 apy = _apy(0, P30);
+        vm.prank(alice);
+        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
+        assertEq(staking.checkDepositCountOfAddress(alice), 1);
+        // but the wallet binding and the nonce still apply
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherNonceUsed.selector, alice, v.nonce));
+        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherWalletMismatch.selector, alice, bob));
+        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
+    }
+
+    /// @dev Hypothesis: a contract signer that refuses (wrong magic or revert) lets the stake through, or its
+    ///      revert bubbles up as something other than a typed error. An ECDSA signature by the old EOA key is not
+    ///      accepted once the signer is a contract.
+    function test_contractSigner_refusesOrReverts_invalidSignature() public {
+        uint256 apy = _apy(0, P30);
+        MaliciousVoucherSigner.Mode[2] memory modes = [MaliciousVoucherSigner.Mode.INVALID, MaliciousVoucherSigner.Mode.REVERT];
+        for (uint256 i = 0; i < modes.length; i++) {
+            _useSigner(modes[i]);
+            (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 0);
+            vm.prank(alice);
+            vm.expectRevert(Errors.InvalidVoucherSignature.selector);
+            staking.stakeWithVoucher(v, sig, 1_000 * ONE, apy);
+            assertFalse(staking.isVoucherNonceUsed(alice, v.nonce));
+        }
+        assertEq(staking.checkDepositCountOfAddress(alice), 0);
+    }
+
+    /// @dev Hypothesis: a contract signer re-enters the staking contract while being asked to validate. The check
+    ///      is a STATICCALL under the guard: the signer only approves if its re-entry hit the reentrancy guard,
+    ///      so a successful outer stake proves the inner withdraw was blocked, and nothing else moved.
+    function test_contractSigner_reenter_blockedByGuard() public {
         uint256 d = _stake(alice, 0, P0, 1_000 * ONE);
-        mrc.setReenter(address(staking), abi.encodeCall(staking.withdrawDeposit, (d)));
-        _useMRC(MaliciousRequirementChecker.Mode.REENTER);
-        _stake(alice, 0, P0, 1_000 * ONE);
+        msig.setReenter(address(staking), abi.encodeCall(staking.withdrawDeposit, (d)));
+        _useSigner(MaliciousVoucherSigner.Mode.REENTER);
+
+        Types.StakeVoucher memory v = _makeVoucher(alice, 0, P0, 0, 0);
+        uint256 apy = _apy(0, P0);
+        vm.prank(alice);
+        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
+
+        assertEq(staking.checkDepositCountOfAddress(alice), 2);
         assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.INDEFINITE), "not withdrawn");
         assertEq(_total(Types.DataType.STAKING), 2_000 * ONE);
         _assertAccounting();
     }
 
-    /// @dev Hypothesis: a reverting checker only blocks new stakes; claims/withdrawals must not consult it.
-    function test_maliciousRC_revert_onlyBlocksStake() public {
-        uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
-        _useMRC(MaliciousRequirementChecker.Mode.REVERT);
-        uint256 h4 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(MaliciousRequirementChecker.CheckerRevert.selector);
-        staking.safeStake(0, P30, 1_000 * ONE, h4);
-        _warpDays(30);
-        _claim(alice, d);
-        _assertAccounting();
-    }
-
-    /// @dev Hypothesis: FAIL mode yields the exact RequirementNotMet error with the checker's figures.
-    function test_maliciousRC_fail_exactError() public {
-        _useMRC(MaliciousRequirementChecker.Mode.FAIL);
-        uint256 h5 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.RequirementNotMet.selector, 1, 0));
-        staking.safeStake(0, P30, 1_000 * ONE, h5);
-        assertFalse(staking.checkIfUserMeetsRequirements(alice, 0, P30));
-    }
-
-    /// @dev Hypothesis: gas-burning checker.
-    function test_maliciousRC_gasBurn_revertsCleanly() public {
-        _useMRC(MaliciousRequirementChecker.Mode.GAS_BURN);
-        bytes memory data = abi.encodeCall(staking.safeStake, (0, P30, 1_000 * ONE, _apy(0, P30)));
+    /// @dev Hypothesis: a gas-burning contract signer leaves state half-written.
+    function test_contractSigner_gasBurn_revertsCleanly() public {
+        _useSigner(MaliciousVoucherSigner.Mode.GAS_BURN);
+        Types.StakeVoucher memory v = _makeVoucher(alice, 0, P30, 0, 0);
+        bytes memory data = abi.encodeCall(staking.stakeWithVoucher, (v, "", 1_000 * ONE, _apy(0, P30)));
+        uint256 bal = token.balanceOf(alice);
         vm.prank(alice);
         (bool ok,) = address(staking).call{gas: 3_000_000}(data);
         assertFalse(ok);
+        assertEq(token.balanceOf(alice), bal);
         assertEq(staking.checkDepositCountOfAddress(alice), 0);
+        assertFalse(staking.isVoucherNonceUsed(alice, v.nonce));
         _assertAccounting();
     }
 
-    /// @dev Hypothesis: wrong-length batch from the checker must not affect staking or claiming.
-    function test_maliciousRC_wrongLength_writePathsUnaffected() public {
-        _useMRC(MaliciousRequirementChecker.Mode.WRONG_LENGTH);
-        uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
-        vm.expectRevert();
-        staking.getProgramData();
-        vm.expectRevert();
-        staking.getPhasePeriodUserData(alice);
-        _warpDays(30);
-        _claim(alice, d);
-        _assertAccounting();
-    }
-
-    /// @dev Hypothesis: after the owner removes a hostile checker/controller everything is back to normal.
+    /// @dev Hypothesis: after the owner replaces a hostile signer/controller everything is back to normal.
     function test_hostileExternals_recoverableByOwner() public {
-        _useMRC(MaliciousRequirementChecker.Mode.REVERT);
+        _useSigner(MaliciousVoucherSigner.Mode.REVERT);
         _useMLC(MaliciousLimitController.Mode.REVERT);
-        uint256 h6 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert();
-        staking.safeStake(0, P30, 1_000 * ONE, h6);
-        staking.setRequirementChecker(address(0));
-        staking.setLimitController(address(0));
+        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), "");
+        staking.setVoucherSigner(_voucherSignerAddr());
+        staking.setLimitController(address(new OpenLimitController(address(staking))));
         _stake(alice, 0, P30, 1_000 * ONE);
         staking.getProgramDataWithUserData(alice);
         _assertAccounting();

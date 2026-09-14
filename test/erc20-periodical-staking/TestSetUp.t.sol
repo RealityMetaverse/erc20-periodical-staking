@@ -9,8 +9,9 @@ import {Clock} from "../shared/Clock.sol";
 
 import {ERC20PeriodicalStaking} from "../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 import "../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
+import {VoucherHelper} from "../shared/VoucherHelper.sol";
 
-contract TestSetUp is Test {
+contract TestSetUp is VoucherHelper {
     /// @dev Live-timestamp source. With `via_ir` a raw `block.timestamp` read after `skip` / `vm.warp` inside
     ///      the same test function can be CSE-d to the pre-warp value (see test/shared/ClockHazard.t.sol), so
     ///      every test that compares against the current time must go through `_now()`.
@@ -28,11 +29,12 @@ contract TestSetUp is Test {
     uint256 _defaultMinimumDeposit = 100 * myTokenDecimals;
 
     uint256 _refPeriod = 0;
-    uint256 _refAPY = 5;
+    /// @dev APY values are bps (10_000 = 100%)
+    uint256 _refAPY = 500;
     uint256 _refStakingTarget = 1000 * myTokenDecimals;
 
     uint256 _refPeriodModifier = 90;
-    uint256 _refAPYModifier = 5;
+    uint256 _refAPYModifier = 500;
     uint256 _refStakingTargetModifier = 1 * myTokenDecimals;
 
     ERC20PeriodicalStaking stakingContract;
@@ -53,6 +55,8 @@ contract TestSetUp is Test {
         myToken = new TestToken(myTokenDecimal);
         stakingContract = new ERC20PeriodicalStaking(address(myToken));
         stakingContract.addContractAdmin(contractAdmin);
+        // Voucher signer, permissive controller, treasury and generous extra caps.
+        _enableVoucherStaking(stakingContract);
 
         for (uint256 userNo = 0; userNo < addressList.length; userNo++) {
             myToken.transfer(addressList[userNo], tokenToDistribute);

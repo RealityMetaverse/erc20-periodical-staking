@@ -62,6 +62,17 @@ contract MaliciousLimitController is ILimitController {
         return _act();
     }
 
+    function getAllowedAndUsed(address, uint256, uint256) external view returns (uint256, uint256) {
+        if (mode == Mode.REENTER) {
+            // Invoked via STATICCALL: a state-changing re-entry must fail. If it somehow succeeded, allow nothing.
+            (bool ok,) = staking.staticcall(reenterData);
+            if (ok) return (0, 0);
+            return (type(uint256).max, 0);
+        }
+        if (mode == Mode.WRONG_LENGTH) return (type(uint256).max, 0);
+        return (_act(), 0);
+    }
+
     function getRemainingBatch(address[] calldata wallets, uint256[] calldata, uint256[] calldata)
         external
         view

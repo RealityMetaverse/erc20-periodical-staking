@@ -3,16 +3,20 @@
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./AccessControl.sol";
 import "../../interfaces/ILimitController.sol";
-import "../../interfaces/IRequirementChecker.sol";
 import "../../common/Events.sol";
 import "../../common/Types.sol";
 
-abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
+abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20Metadata;
     using ArrayLibrary for uint256[];
+
+    bytes32 public constant VOUCHER_TYPEHASH = keccak256(
+        "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimit,uint256 validUntil,uint256 nonce)"
+    );
 
     // ======================================
     // =             Functions              =
@@ -25,6 +29,17 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
         return phasePeriodDataList[dataType][phase][period];
     }
 
+    /// @notice EIP-712 digest the voucher signer must sign for `v`.
+    function getVoucherDigest(Types.StakeVoucher calldata v) public view returns (bytes32) {
+        return _hashTypedDataV4(
+            keccak256(
+                abi.encode(
+                    VOUCHER_TYPEHASH, v.wallet, v.phase, v.period, v.extraApyBps, v.extraLimit, v.validUntil, v.nonce
+                )
+            )
+        );
+    }
+
     function _checkDepositExistence(uint256 depositNumber) private view {
         _checkDepositExistenceFor(msg.sender, depositNumber);
     }
@@ -33,16 +48,6 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
     function _checkDepositExistenceFor(address userAddress, uint256 depositNumber) internal view {
         if (depositNumber >= stakerDepositList[userAddress].length) {
             revert DepositDoesNotExist(depositNumber);
-        }
-    }
-
-    function _checkIfTargetReached(uint256 stakingPhase, uint256 stakingPeriod, uint256 amountToStake) internal view {
-        uint256 stakingTarget =
-            phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][stakingPhase][stakingPeriod];
-        uint256 totalStaked = phasePeriodDataList[Types.PhasePeriodDataType.STAKED][stakingPhase][stakingPeriod];
-
-        if ((amountToStake + totalStaked) > stakingTarget) {
-            revert AmountExceedsTarget(stakingPhase, stakingPeriod, stakingTarget);
         }
     }
 
@@ -67,116 +72,29 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
         if (!checkIfStakingPeriodExists(stakingPeriod)) revert StakingPeriodDoesNotExist(stakingPeriod);
     }
 
+    /// @dev Status of an existing deposit. A seized deposit is closed regardless of its dates.
+    function _status(PackedDeposit storage d) internal view returns (DepositStatus) {
+        if ((d.flags & FLAG_SEIZED) != 0) return DepositStatus.SEIZED;
+        uint256 endDate = d.stakingEndDate;
+        uint256 withdrawalDate = d.withdrawalDate;
+        if (withdrawalDate == 0) {
+            if (endDate == 0) return DepositStatus.INDEFINITE;
+            return block.timestamp >= endDate ? DepositStatus.READY_TO_CLAIM : DepositStatus.TIME_LEFT;
+        }
+        return withdrawalDate < endDate ? DepositStatus.WITHDRAWN : DepositStatus.CLAIMED;
+    }
+
     function checkDepositStatus(address userAddress, uint256 depositNumber) public view returns (DepositStatus) {
         _checkDepositExistenceFor(userAddress, depositNumber);
-        TokenDeposit memory targetDeposit = stakerDepositList[userAddress][depositNumber];
-        if (targetDeposit.withdrawalDate == 0) {
-            return (targetDeposit.stakingEndDate == 0)
-                ? DepositStatus.INDEFINITE
-                : (
-                    (block.timestamp >= targetDeposit.stakingEndDate)
-                        ? DepositStatus.READY_TO_CLAIM
-                        : DepositStatus.TIME_LEFT
-                );
-        }
-        return (targetDeposit.withdrawalDate < targetDeposit.stakingEndDate)
-            ? DepositStatus.WITHDRAWN
-            : DepositStatus.CLAIMED;
+        return _status(stakerDepositList[userAddress][depositNumber]);
     }
 
+    /// @notice Whether STAKING / WITHDRAWAL / CLAIM is open; false for any other data type.
     function checkActionAvailability(Types.DataType action) public view returns (bool) {
-        return actionAvailabilityStatuses[action];
-    }
-
-    function _checkIfUserMeetsRequirements(
-        address userAddress,
-        uint256 stakingPhase,
-        uint256 stakingPeriod,
-        bool ifRevertExpected
-    ) internal view returns (bool) {
-        if (requirementChecker != address(0)) {
-            IRequirementChecker checker = IRequirementChecker(requirementChecker);
-            if (!checker.meetsRequirement(userAddress, stakingPhase, stakingPeriod)) {
-                if (ifRevertExpected) {
-                    uint256 totalWorth = checker.getTotalWorth(userAddress);
-                    uint256 requiredWorth = checker.getRequiredWorth(stakingPhase, stakingPeriod);
-                    revert RequirementNotMet(requiredWorth, totalWorth);
-                } else {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    function checkIfUserMeetsRequirements(address userAddress, uint256 stakingPhase, uint256 stakingPeriod)
-        public
-        view
-        returns (bool)
-    {
-        return _checkIfUserMeetsRequirements(userAddress, stakingPhase, stakingPeriod, false);
-    }
-
-    function _checkIfUserExceedsLimit(
-        address userAddress,
-        uint256 stakingPhase,
-        uint256 stakingPeriod,
-        uint256 tokenAmount,
-        bool ifRevertExpected
-    ) private view returns (bool, uint256) {
-        if (limitController != address(0)) {
-            ILimitController controller = ILimitController(limitController);
-            uint256 remaining = controller.getRemaining(userAddress, stakingPhase, stakingPeriod);
-            if (remaining < tokenAmount) {
-                if (ifRevertExpected) {
-                    revert StakingLimitExceeded(userAddress, stakingPhase, stakingPeriod, tokenAmount, remaining);
-                } else {
-                    return (true, remaining);
-                }
-            } else {
-                return (false, remaining);
-            }
-        }
-
-        uint256 stakingTarget =
-            getPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, stakingPhase, stakingPeriod);
-        uint256 totalStaked = getPhasePeriodData(Types.PhasePeriodDataType.STAKED, stakingPhase, stakingPeriod);
-        if (totalStaked >= stakingTarget) {
-            return (false, 0);
-        }
-        return (false, stakingTarget - totalStaked);
-    }
-
-    function checkIfUserExceedsLimit(
-        address userAddress,
-        uint256 stakingPhase,
-        uint256 stakingPeriod,
-        uint256 tokenAmount
-    ) public view returns (bool, uint256) {
-        return _checkIfUserExceedsLimit(userAddress, stakingPhase, stakingPeriod, tokenAmount, false);
-    }
-
-    function _checkIfLegitStakeRequest(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount)
-        internal
-        view
-    {
-        // If whitelist is enabled, only whitelisted addresses can stake
-        if (whitelistEnabled && !isWhitelisted[msg.sender]) {
-            revert NotWhitelisted(msg.sender);
-        }
-
-        // If requirement checker is set, check if the sender meets the requirement
-        _checkIfUserMeetsRequirements(msg.sender, stakingPhase, stakingPeriod, true);
-
-        if (tokenAmount < minimumDeposit) revert InsufficientDeposit(tokenAmount, minimumDeposit);
-
-        if (stakingPhase != currentStakingPhase) revert IncorrectStakingPhase(stakingPhase, currentStakingPhase);
-        _checkIfStakingPhasePeriodExists(stakingPhase, stakingPeriod);
-
-        _checkIfTargetReached(stakingPhase, stakingPeriod, tokenAmount);
-
-        // If staking limit is enabled, call LimitController to check remaining allowance before staking
-        _checkIfUserExceedsLimit(msg.sender, stakingPhase, stakingPeriod, tokenAmount, true);
+        if (action == Types.DataType.STAKING) return stakingOpen;
+        if (action == Types.DataType.WITHDRAWAL) return withdrawalOpen;
+        if (action == Types.DataType.CLAIM) return claimOpen;
+        return false;
     }
 
     // ======================================
@@ -189,11 +107,6 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard {
 
     modifier ifDepositExists(uint256 depositNumber) {
         _checkDepositExistence(depositNumber);
-        _;
-    }
-
-    modifier ifLegitStakeRequest(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount) {
-        _checkIfLegitStakeRequest(stakingPhase, stakingPeriod, tokenAmount);
         _;
     }
 

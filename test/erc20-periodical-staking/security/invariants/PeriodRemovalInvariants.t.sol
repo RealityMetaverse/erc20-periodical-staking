@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import {InvariantBase} from "./InvariantBase.sol";
 import {Handler} from "./Handler.sol";
+import {EnforcementInvariantChecks} from "./StakingInvariants.t.sol";
 
 /// @title PeriodRemovalInvariants
 /// @notice Lighter suite that focuses the invariant runner on period/phase add -> remove -> re-add churn while
-///         deposits are open. The star is the liveness invariant (the known production lockup).
-/// @dev Selector weights: stake x3, remove/add period x2 each, push/pop phase, warp x2, claim/withdraw.
-contract PeriodRemovalInvariants is InvariantBase {
+///         deposits are open. The star is the liveness invariant (the known production lockup). Freeze and seize
+///         run too, so deposits on removed periods / popped phases are also seized (limit cells and STAKED must
+///         still reconcile).
+/// @dev Selector weights: stake x3, remove/add period x2 each, push/pop phase, warp x2, claim/withdraw, freeze, seize.
+contract PeriodRemovalInvariants is EnforcementInvariantChecks {
     function setUp() external {
         _deploy(false);
 
-        bytes4[] memory s = new bytes4[](15);
+        bytes4[] memory s = new bytes4[](17);
         s[0] = Handler.stake.selector;
         s[1] = Handler.stake.selector;
         s[2] = Handler.stake.selector;
@@ -28,10 +30,12 @@ contract PeriodRemovalInvariants is InvariantBase {
         s[12] = Handler.claim.selector;
         s[13] = Handler.withdraw.selector;
         s[14] = Handler.claimAll.selector;
+        s[15] = Handler.freeze.selector;
+        s[16] = Handler.seize.selector;
         _target(s);
     }
 
-    /// @notice LIVENESS: every open deposit stays closable through arbitrary period/phase churn.
+    /// @notice LIVENESS: every open unfrozen deposit stays closable through arbitrary period/phase churn.
     function invariant_churn_everyOpenDepositIsClosable() external {
         _check_everyOpenDepositIsClosable();
     }
@@ -41,12 +45,17 @@ contract PeriodRemovalInvariants is InvariantBase {
         _check_tokenConservation();
     }
 
-    /// @notice Per-(phase,period) STAKED sums survive removal/re-add.
+    /// @notice Token flows (seize included) reconcile through churn.
+    function invariant_churn_tokenFlowGhosts() external {
+        _check_tokenFlowGhosts();
+    }
+
+    /// @notice Per-(phase,period) STAKED sums survive removal/re-add and seizes on removed cells.
     function invariant_churn_phasePeriodStakedSum() external {
         _check_phasePeriodStakedSum();
     }
 
-    /// @notice Per-user (phase,period) sums survive removal/re-add.
+    /// @notice Per-user (phase,period) STAKING sums survive removal/re-add.
     function invariant_churn_userPhasePeriodSums() external {
         _check_userPhasePeriodSums();
     }
@@ -72,8 +81,18 @@ contract PeriodRemovalInvariants is InvariantBase {
         _check_periodListAndPhaseIndex();
     }
 
-    /// @notice No claim/withdraw/admin call hit an unexplained revert (panics from zeroed counters).
+    /// @notice No claim/withdraw/admin/seize call hit an unexplained revert (panics from zeroed counters).
     function invariant_churn_noUnexpectedReverts() external {
         _check_noUnexpectedReverts();
+    }
+
+    /// @notice Frozen deposits on removed periods / popped phases are still seizable without a top-up.
+    function invariant_churn_everyFrozenDepositSeizableWithoutTopUp() external {
+        _check_everyFrozenDepositSeizableWithoutTopUp();
+    }
+
+    /// @notice Seize payouts are principal only (reward pool untouched) through churn.
+    function invariant_churn_payoutCommitments() external {
+        _check_payoutCommitments();
     }
 }

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./AttackBase.t.sol";
+import "./VoucherAttackBase.sol";
 
 /// @title DepositIndex
-/// @notice `stakerActiveDepositStartIndex` must never point past an open deposit, `claimAll` must never skip a
-///         claimable deposit, and bounded `claimRange` must make progress. Bad indexes must revert with custom errors.
-contract DepositIndexTest is AttackBase {
+/// @notice `stakerActiveDepositStartIndex` must never point past an open (or frozen) deposit, `claimAll` must never
+///         skip a claimable deposit, and bounded `claimRange` must make progress. Bad indexes must revert with
+///         custom errors. Seized deposits count as closed.
+contract DepositIndexTest is VoucherAttackBase {
     function _idx(address u) internal view returns (uint256) {
         return staking.stakerActiveDepositStartIndex(u);
     }
@@ -19,7 +20,8 @@ contract DepositIndexTest is AttackBase {
         for (uint256 i = 0; i < c; i++) {
             ProgramManager.DepositStatus st = _status(u, i);
             assertTrue(
-                st == ProgramManager.DepositStatus.WITHDRAWN || st == ProgramManager.DepositStatus.CLAIMED,
+                st == ProgramManager.DepositStatus.WITHDRAWN || st == ProgramManager.DepositStatus.CLAIMED
+                    || st == ProgramManager.DepositStatus.SEIZED,
                 "open deposit before cursor"
             );
         }
@@ -95,6 +97,55 @@ contract DepositIndexTest is AttackBase {
         assertEq(_idx(alice), 3, "#3 still open");
         _claim(alice, 3);
         assertEq(_idx(alice), 5);
+        _assertCursorSound(alice);
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: a seized deposit is treated as open by the cursor (claimAll keeps scanning it forever) or
+    ///      seizing a later deposit moves the cursor past an earlier open one.
+    function test_cursor_seizedCountsAsClosed_neverSkipsOpen() public {
+        uint256 d0 = _stake(alice, 0, P90, 1_000 * ONE);
+        uint256 d1 = _stake(alice, 0, P30, 1_000 * ONE);
+        uint256 d2 = _stake(alice, 0, P0, 1_000 * ONE);
+
+        _freeze(alice, d1);
+        _seize(alice, d1);
+        assertEq(_idx(alice), 0, "seizing a later deposit must not skip open #0");
+        _assertCursorSound(alice);
+
+        _freeze(alice, d0);
+        _seize(alice, d0);
+        assertEq(_idx(alice), 2, "seizing the head jumps over the already seized #1");
+        _assertCursorSound(alice);
+
+        _warpDays(5);
+        _withdraw(alice, d2);
+        assertEq(_idx(alice), 3);
+        _assertCursorSound(alice);
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: a frozen deposit at the head lets the cursor move past it, hiding it from claimAll after
+    ///      unfreeze. The cursor must stay on the frozen deposit while later deposits are claimed.
+    function test_cursor_frozenHead_staysPut_claimableAfterUnfreeze() public {
+        uint256 d0 = _stake(alice, 0, P30, 1_000 * ONE);
+        uint256 d1 = _stake(alice, 0, P30, 1_000 * ONE);
+        uint256 r = _deposit(alice, d0).rewardGenerated;
+        _freeze(alice, d0);
+        _warpDays(30);
+
+        uint256 before = token.balanceOf(alice);
+        _claimAll(alice);
+        assertEq(token.balanceOf(alice) - before, 1_000 * ONE + r, "only #1 paid");
+        assertEq(uint256(_status(alice, d1)), uint256(ProgramManager.DepositStatus.CLAIMED));
+        assertEq(_idx(alice), 0, "cursor must not pass the frozen #0");
+        _assertCursorSound(alice);
+
+        vm.prank(admin);
+        staking.unfreezeDeposit(alice, d0);
+        _claimAll(alice);
+        assertEq(token.balanceOf(alice) - before, 2 * (1_000 * ONE + r));
+        assertEq(_idx(alice), 2);
         _assertCursorSound(alice);
         _assertAccounting();
     }
@@ -190,13 +241,22 @@ contract DepositIndexTest is AttackBase {
         assertFalse(_isPanic(ret), "must not panic");
     }
 
-    /// @dev every deposit-indexed function reverts DepositDoesNotExist on a bad index, never a panic.
+    /// @dev every deposit-indexed function (enforcement included) reverts DepositDoesNotExist on a bad index,
+    ///      never a panic.
     function test_nonexistentDeposit_customErrorsEverywhere() public {
         bytes memory expected = abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 0);
         vm.expectRevert(expected);
         staking.checkDepositStatus(alice, 0);
         vm.expectRevert(expected);
         staking.getDeposit(alice, 0);
+        vm.expectRevert(expected);
+        staking.isDepositFrozen(alice, 0);
+        vm.expectRevert(expected);
+        staking.freezeDeposit(alice, 0);
+        vm.expectRevert(expected);
+        staking.unfreezeDeposit(alice, 0);
+        vm.expectRevert(expected);
+        staking.seizeDeposit(alice, 0);
         vm.prank(alice);
         vm.expectRevert(expected);
         staking.claimDeposit(0);
@@ -211,10 +271,16 @@ contract DepositIndexTest is AttackBase {
         vm.prank(alice);
         vm.expectRevert(expected);
         staking.claimDeposit(1);
+        vm.expectRevert(expected);
+        staking.freezeDeposit(alice, 1);
         // another user's deposit number is not mine
         vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 0));
         staking.withdrawDeposit(0);
+        (bool ok, bytes memory ret) =
+            address(staking).call(abi.encodeCall(staking.freezeDeposit, (alice, type(uint256).max)));
+        assertFalse(ok);
+        assertFalse(_isPanic(ret), "freeze must not panic on a huge index");
     }
 
     /// @dev Hypothesis: a claimed deposit can be claimed or withdrawn again.
@@ -264,18 +330,18 @@ contract DepositIndexTest is AttackBase {
         assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.CLAIMED));
     }
 
-    /// @dev Fuzz: random open/close sequences never leave an open deposit behind the cursor and claimAll
-    ///      always empties every READY_TO_CLAIM deposit.
+    /// @dev Fuzz: random open/close/freeze/seize sequences never leave an open deposit behind the cursor, and
+    ///      claimAll always empties every unfrozen READY_TO_CLAIM deposit.
     function testFuzz_cursorNeverSkipsClaimable(uint256 seed) public {
         for (uint256 i = 0; i < 30; i++) {
             uint256 r = uint256(keccak256(abi.encode(seed, i)));
-            uint256 a = r % 5;
+            uint256 a = r % 7;
+            uint256 n = staking.checkDepositCountOfAddress(alice);
+            uint256 d = n == 0 ? 0 : (r >> 16) % n;
             if (a == 0) {
                 _stake(alice, 0, PERIODS[(r >> 8) % 3], 1_000 * ONE);
             } else if (a == 1) {
-                uint256 n = staking.checkDepositCountOfAddress(alice);
-                if (n > 0) {
-                    uint256 d = (r >> 16) % n;
+                if (n > 0 && !staking.isDepositFrozen(alice, d)) {
                     ProgramManager.DepositStatus st = _status(alice, d);
                     if (st == ProgramManager.DepositStatus.TIME_LEFT || st == ProgramManager.DepositStatus.INDEFINITE) {
                         _withdraw(alice, d);
@@ -285,11 +351,22 @@ contract DepositIndexTest is AttackBase {
                 _claimAll(alice);
             } else if (a == 3) {
                 _warpDays(((r >> 24) % 40) + 1);
-            } else {
-                uint256 n = staking.checkDepositCountOfAddress(alice);
-                if (n > 0) {
-                    uint256 d = (r >> 16) % n;
+            } else if (a == 4) {
+                if (n > 0 && !staking.isDepositFrozen(alice, d)) {
                     if (_status(alice, d) == ProgramManager.DepositStatus.READY_TO_CLAIM) _claim(alice, d);
+                }
+            } else if (a == 5) {
+                if (n > 0 && !staking.isDepositFrozen(alice, d)) {
+                    ProgramManager.DepositStatus st = _status(alice, d);
+                    if (
+                        st == ProgramManager.DepositStatus.TIME_LEFT || st == ProgramManager.DepositStatus.READY_TO_CLAIM
+                            || st == ProgramManager.DepositStatus.INDEFINITE
+                    ) _freeze(alice, d);
+                }
+            } else {
+                if (n > 0 && staking.isDepositFrozen(alice, d)) {
+                    if ((r >> 32) % 2 == 0) _seize(alice, d);
+                    else staking.unfreezeDeposit(alice, d);
                 }
             }
             _assertCursorSound(alice);
@@ -297,6 +374,7 @@ contract DepositIndexTest is AttackBase {
         _claimAll(alice);
         uint256 cnt = staking.checkDepositCountOfAddress(alice);
         for (uint256 i = 0; i < cnt; i++) {
+            if (staking.isDepositFrozen(alice, i)) continue;
             assertTrue(
                 _status(alice, i) != ProgramManager.DepositStatus.READY_TO_CLAIM, "claimAll left a claimable deposit"
             );

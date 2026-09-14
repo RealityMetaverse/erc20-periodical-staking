@@ -179,13 +179,15 @@ contract AuxiliaryFunctions is ReadFunctions {
         uint256 tokenAmount,
         bool ifRevertExpected
     ) internal {
-        if (userAddress != address(this)) vm.startPrank(userAddress);
-
         uint256 phasePeriodAPY = _getPhasePeriodAPY(stakingPhase, stakingPeriod);
+        (Types.StakeVoucher memory voucher, bytes memory signature) =
+            _prepareVoucherStake(stakingContract, userAddress, stakingPhase, stakingPeriod, 0, 0);
+
+        if (userAddress != address(this)) vm.startPrank(userAddress);
 
         if (ifRevertExpected) {
             vm.expectRevert();
-            stakingContract.safeStake(stakingPhase, stakingPeriod, tokenAmount, phasePeriodAPY);
+            stakingContract.stakeWithVoucher(voucher, signature, tokenAmount, phasePeriodAPY);
         } else {
             uint256[] memory currentData = _getCurrentData(userAddress, stakingPhase, stakingPeriod);
             uint256 userDepositCountBefore = _getUserDepositCount(userAddress);
@@ -200,7 +202,7 @@ contract AuxiliaryFunctions is ReadFunctions {
             expectedData[4] = currentData[4] + tokenAmount;
             expectedData[8] = currentData[8] + rewardExpected;
             expectedData[9] = currentData[9] + rewardExpected;
-            stakingContract.safeStake(stakingPhase, stakingPeriod, tokenAmount, phasePeriodAPY);
+            stakingContract.stakeWithVoucher(voucher, signature, tokenAmount, phasePeriodAPY);
 
             currentData = _getCurrentData(userAddress, stakingPhase, stakingPeriod);
             assertEq(currentData[0], expectedData[0]);
@@ -219,6 +221,7 @@ contract AuxiliaryFunctions is ReadFunctions {
             assertEq(targetDeposit.stakingPhase, stakingPhase);
             assertEq(targetDeposit.stakingPeriod, stakingPeriod);
             assertEq(targetDeposit.amount, tokenAmount);
+            // Effective APY in bps; no voucher extra here, so it equals the base APY.
             assertEq(targetDeposit.APY, phasePeriodAPY);
             assertEq(targetDeposit.rewardGenerated, rewardExpected);
         }

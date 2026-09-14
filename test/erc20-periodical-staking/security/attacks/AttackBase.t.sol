@@ -10,6 +10,7 @@ import {ProgramManager} from "../../../../src/contracts/erc20-periodical-staking
 import {AccessControl} from "../../../../src/contracts/erc20-periodical-staking/AccessControl.sol";
 import {Errors} from "../../../../src/common/Errors.sol";
 import {Types} from "../../../../src/common/Types.sol";
+import {VoucherHelper} from "../../../shared/VoucherHelper.sol";
 
 /// @title AttackBase
 /// @notice Self-contained fixture for the adversarial test suites. Written against the v0.3.0
@@ -23,7 +24,7 @@ contract Clock {
     }
 }
 
-abstract contract AttackBase is Test {
+abstract contract AttackBase is VoucherHelper {
     Clock internal clock = new Clock();
 
     function _now() internal view returns (uint256) {
@@ -42,8 +43,9 @@ abstract contract AttackBase is Test {
     uint256 internal constant USER_FUNDS = 200_000 * ONE;
 
     uint256[] internal PERIODS = [P0, P30, P90];
-    uint256[] internal APY_PHASE0 = [5, 10, 20];
-    uint256[] internal APY_PHASE1 = [7, 14, 28];
+    // bps (10_000 = 100%)
+    uint256[] internal APY_PHASE0 = [500, 1000, 2000];
+    uint256[] internal APY_PHASE1 = [700, 1400, 2800];
 
     // Panic selector: Panic(uint256)
     bytes4 internal constant PANIC_SELECTOR = 0x4e487b71;
@@ -103,6 +105,7 @@ abstract contract AttackBase is Test {
     function _deployConfigured(address tokenAddr) internal returns (ERC20PeriodicalStaking s) {
         s = new ERC20PeriodicalStaking(tokenAddr);
         s.addContractAdmin(admin);
+        _enableVoucherStaking(s);
 
         uint256[] memory empty = new uint256[](0);
         for (uint256 i = 0; i < PERIODS.length; i++) {
@@ -155,15 +158,13 @@ abstract contract AttackBase is Test {
         return staking.userDataList(dt, u);
     }
 
+    /// @dev Only STAKING is tracked per phase/period since v0.4.0; any other type reverts InvalidDataType.
     function _upp(Types.DataType dt, address u, uint256 phase, uint256 period) internal view returns (uint256) {
-        return staking.userPhasePeriodDataList(dt, phase, period, u);
+        return staking.getUserPhasePeriodData(dt, u, phase, period);
     }
 
     function _stake(address u, uint256 phase, uint256 period, uint256 amount) internal returns (uint256 depositNo) {
-        uint256 apy = _apy(phase, period);
-        vm.prank(u);
-        staking.safeStake(phase, period, amount, apy);
-        depositNo = staking.checkDepositCountOfAddress(u) - 1;
+        depositNo = _stakeV(staking, u, phase, period, amount);
     }
 
     function _withdraw(address u, uint256 depositNo) internal {
@@ -300,20 +301,12 @@ abstract contract AttackBase is Test {
         // 3. sum over (phase, period) STAKED == totalStaked
         assertEq(_sumStakedAllCells(), _total(Types.DataType.STAKING), "sum(STAKED cells) != totalStaked");
 
-        // 4. per user: sum over cells == user totals for STAKING / WITHDRAWAL / CLAIM / REWARD_EXPECTED
+        // 4. per user: sum over STAKING cells == user STAKING total (the only per-phase/period cell since v0.4.0).
+        //    Seized deposits close exactly like a withdrawal, so no treasury term is needed here or in (1).
         uint256 rewardExpectedSum;
         for (uint256 i = 0; i < users.length; i++) {
             address u = users[i];
             assertEq(_sumUserCells(Types.DataType.STAKING, u), _user(Types.DataType.STAKING, u), "user STAKING cells");
-            assertEq(
-                _sumUserCells(Types.DataType.WITHDRAWAL, u), _user(Types.DataType.WITHDRAWAL, u), "user WITHDRAWAL cells"
-            );
-            assertEq(_sumUserCells(Types.DataType.CLAIM, u), _user(Types.DataType.CLAIM, u), "user CLAIM cells");
-            assertEq(
-                _sumUserCells(Types.DataType.REWARD_EXPECTED, u),
-                _user(Types.DataType.REWARD_EXPECTED, u),
-                "user REWARD_EXPECTED cells"
-            );
             // 5. REWARD_EXPECTED == sum of rewardGenerated over open periodical deposits
             uint256 open = _openPeriodicalRewards(u);
             assertEq(_user(Types.DataType.REWARD_EXPECTED, u), open, "user REWARD_EXPECTED != open periodical rewards");

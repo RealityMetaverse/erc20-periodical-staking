@@ -13,6 +13,7 @@ import {ERC20PeriodicalStaking as LegacyERC20PeriodicalStaking} from
     "./legacy/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 import {Errors} from "../../../../src/common/Errors.sol";
 import {Types} from "../../../../src/common/Types.sol";
+import {VoucherHelper} from "../../../shared/VoucherHelper.sol";
 
 /// @title Handler
 /// @notice Stateful-fuzzing handler for ERC20PeriodicalStaking.
@@ -29,7 +30,11 @@ import {Types} from "../../../../src/common/Types.sol";
 ///        Views that only exist in v0.3.0 (getCollectableReward) are routed through `_collectable()`, which
 ///        falls back to the whole rewardPool on the legacy deployment; an unguarded call would revert the
 ///        handler action itself and silently leave that action inert in the legacy run.
-contract Handler is Test {
+///      v0.4.0: src stakes through a signed voucher (random extra APY); the legacy deployment still uses
+///      safeStake through a low-level call. APY bounds are bps for src and percent for legacy (_maxApy).
+///      freeze / unfreeze / seize actions exist for src only (no-ops on legacy); frozen deposits are never
+///      picked for withdraw / claim, and seized tokens are tracked in the ghost_seized* flows.
+contract Handler is VoucherHelper {
     // ======================================
     // =            Deployment              =
     // ======================================
@@ -45,7 +50,8 @@ contract Handler is Test {
     uint256 internal constant USER_COUNT = 6;
     uint256 internal constant USER_FUNDS = 500_000e18;
     uint256 internal constant MAX_PERIOD_DAYS = 400;
-    uint256 internal constant MAX_APY = 100;
+    uint256 internal constant MAX_APY_BPS = 10_000; // src: bps
+    uint256 internal constant MAX_APY_LEGACY = 100; // v0.2.4: percent
     uint256 internal constant MAX_TARGET = 2_000_000e18;
     // Kept small so the invariant runner regularly sees rewardPool < REWARD_EXPECTED and matured periodical
     // claims that exceed the pool; the provideReward action (up to 1M per call) still reaches funded states.
@@ -65,6 +71,8 @@ contract Handler is Test {
     uint256 public ghost_collected; // collectReward total
     uint256 public ghost_donated; // tokens sent straight to the contract (not via any function)
     uint256 public ghost_rescued; // rescueTokens(STAKING_TOKEN) total
+    uint256 public ghost_seizedOut; // everything sent to the treasury by seizeDeposit
+    uint256 public ghost_seizedPrincipal; // principal seized; equals ghost_seizedOut (seize never pays a reward)
 
     /// @dev Mirror of actionAvailabilityStatuses for STAKING / WITHDRAWAL / CLAIM.
     bool[3] public ghost_actionOpen;
@@ -110,6 +118,12 @@ contract Handler is Test {
         vm.prank(owner);
         staking.addContractAdmin(admin);
 
+        if (!legacy_) {
+            vm.startPrank(owner);
+            _enableVoucherStaking(staking);
+            vm.stopPrank();
+        }
+
         for (uint256 i = 0; i < USER_COUNT; i++) {
             address u = makeAddr(string.concat("user", vm.toString(i)));
             users.push(u);
@@ -126,13 +140,14 @@ contract Handler is Test {
         ghost_actionOpen[1] = true;
         ghost_actionOpen[2] = true;
 
-        _seedProgram();
+        _seedProgram(legacy_);
     }
 
     /// @dev Seed a small program so the invariant runner does not waste depth reaching a usable state.
-    function _seedProgram() internal {
+    ///      Takes the flag as a parameter: the `legacy` immutable cannot be read during construction.
+    function _seedProgram(bool legacy_) internal {
         uint256[4] memory periods = [uint256(0), 30, 90, 180];
-        uint256[4] memory apys = [uint256(5), 10, 15, 20];
+        uint256[4] memory apys = legacy_ ? [uint256(5), 10, 15, 20] : [uint256(500), 1000, 1500, 2000];
         uint256[] memory noPhaseApy = new uint256[](0);
         uint256[] memory noPhaseTarget = new uint256[](0);
 
@@ -230,10 +245,28 @@ contract Handler is Test {
 
         // There is no stake-time pool check. The pool is deliberately NOT pre-funded here so both funded
         // and unfunded states are explored; `provideReward` is the only way the pool grows.
-        vm.prank(user);
-        try staking.safeStake(phase, period, amount, apy) {
+        bool ok;
+        bytes memory reason;
+        if (legacy) {
+            // v0.2.4 ABI; src no longer has safeStake.
+            vm.prank(user);
+            (ok, reason) = address(staking).call(
+                abi.encodeWithSignature("safeStake(uint256,uint256,uint256,uint256)", phase, period, amount, apy)
+            );
+        } else {
+            uint256 extraApy = bound(uint256(keccak256(abi.encode(amountSeed, capSeed))), 0, staking.maxExtraApyBps());
+            (Types.StakeVoucher memory v, bytes memory sig) =
+                _prepareVoucherStake(staking, user, phase, period, extraApy, 0);
+            vm.prank(user);
+            try staking.stakeWithVoucher(v, sig, amount, apy + extraApy) {
+                ok = true;
+            } catch (bytes memory r) {
+                reason = r;
+            }
+        }
+        if (ok) {
             ghost_userIn += amount;
-        } catch (bytes memory reason) {
+        } else {
             if (!ghost_actionOpen[0]) {
                 _expectSelector("stake_notOpen", "stake", reason, Errors.NotOpen.selector);
             } else {
@@ -488,7 +521,7 @@ contract Handler is Test {
         uint256 value;
         if (bound(typeSeed, 0, 1) == 0) {
             dt = Types.PhasePeriodDataType.APY;
-            value = bound(valueSeed, 1, MAX_APY);
+            value = bound(valueSeed, 1, _maxApy());
         } else {
             dt = Types.PhasePeriodDataType.STAKING_TARGET;
             value = bound(valueSeed, 0, MAX_TARGET);
@@ -625,13 +658,122 @@ contract Handler is Test {
     }
 
     // ======================================
+    // =        Enforcement (src only)      =
+    // ======================================
+    /// @notice Admin freezes an open, unfrozen deposit.
+    function freeze(uint256 userSeed, uint256 depositSeed) external {
+        calls["freeze"]++;
+        if (legacy) {
+            skipped["freeze_legacy"]++;
+            return;
+        }
+        address user = _pickUser(userSeed);
+        uint256[] memory candidates = _depositsWithStatus(user, true, true, true);
+        if (candidates.length == 0) {
+            skipped["freeze_none"]++;
+            return;
+        }
+        uint256 idx = candidates[bound(depositSeed, 0, candidates.length - 1)];
+
+        vm.prank(admin);
+        try staking.freezeDeposit(user, idx) {}
+        catch (bytes memory reason) {
+            _unexpected("freezeDeposit", reason);
+        }
+    }
+
+    /// @notice Admin unfreezes a frozen deposit.
+    function unfreeze(uint256 userSeed, uint256 depositSeed) external {
+        calls["unfreeze"]++;
+        if (legacy) {
+            skipped["unfreeze_legacy"]++;
+            return;
+        }
+        address user = _pickUser(userSeed);
+        uint256[] memory candidates = _frozenDeposits(user);
+        if (candidates.length == 0) {
+            skipped["unfreeze_none"]++;
+            return;
+        }
+        uint256 idx = candidates[bound(depositSeed, 0, candidates.length - 1)];
+
+        vm.prank(admin);
+        try staking.unfreezeDeposit(user, idx) {}
+        catch (bytes memory reason) {
+            _unexpected("unfreezeDeposit", reason);
+        }
+    }
+
+    /// @notice Owner seizes a frozen deposit. Only the principal goes to the treasury; the reward pool never moves
+    ///         (periodical: reservation released; indefinite: unpaid accrual stays in the pool).
+    function seize(uint256 userSeed, uint256 depositSeed) external {
+        calls["seize"]++;
+        if (legacy) {
+            skipped["seize_legacy"]++;
+            return;
+        }
+        address user = _pickUser(userSeed);
+        uint256[] memory candidates = _frozenDeposits(user);
+        if (candidates.length == 0) {
+            skipped["seize_none"]++;
+            return;
+        }
+        uint256 idx = candidates[bound(depositSeed, 0, candidates.length - 1)];
+        ProgramManager.TokenDeposit memory d = staking.getDeposit(user, idx);
+        uint256 balBefore = token.balanceOf(treasury);
+        uint256 poolBefore = staking.rewardPool();
+        bool coveredBefore = _poolCoversReserve();
+
+        vm.prank(owner);
+        try staking.seizeDeposit(user, idx) {
+            uint256 got = token.balanceOf(treasury) - balBefore;
+            if (got != d.amount) {
+                _payoutViolation("seize payout != principal", user, idx, got, d.amount);
+            }
+            if (staking.rewardPool() != poolBefore) {
+                _payoutViolation("seize moved rewardPool", user, idx, staking.rewardPool(), poolBefore);
+            }
+            ghost_seizedOut += got;
+            ghost_seizedPrincipal += got;
+            _checkReserveTransition("seize", user, idx, coveredBefore);
+            if (staking.checkDepositStatus(user, idx) != ProgramManager.DepositStatus.SEIZED) {
+                _payoutViolation("seized deposit is not SEIZED", user, idx, 0, 0);
+            }
+        } catch (bytes memory reason) {
+            _unexpected("seizeDeposit", reason);
+        }
+    }
+
+    // ======================================
     // =              Helpers               =
     // ======================================
     function _pickUser(uint256 seed) internal view returns (address) {
         return users[bound(seed, 0, users.length - 1)];
     }
 
-    /// @dev Indices of the user's deposits whose status is in the requested set.
+    function _maxApy() internal view returns (uint256) {
+        return legacy ? MAX_APY_LEGACY : MAX_APY_BPS;
+    }
+
+    /// @dev The mirrored v0.2.4 code has no freeze, so nothing is ever frozen there.
+    function _isFrozen(address user, uint256 idx) internal view returns (bool) {
+        return !legacy && staking.isDepositFrozen(user, idx);
+    }
+
+    function _frozenDeposits(address user) internal view returns (uint256[] memory out) {
+        uint256 count = staking.checkDepositCountOfAddress(user);
+        uint256[] memory tmp = new uint256[](count);
+        uint256 n;
+        for (uint256 i = 0; i < count; i++) {
+            if (_isFrozen(user, i)) tmp[n++] = i;
+        }
+        out = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            out[i] = tmp[i];
+        }
+    }
+
+    /// @dev Indices of the user's UNFROZEN deposits whose status is in the requested set.
     function _depositsWithStatus(address user, bool timeLeft, bool ready, bool indefinite)
         internal
         view
@@ -641,6 +783,7 @@ contract Handler is Test {
         uint256[] memory tmp = new uint256[](count);
         uint256 n;
         for (uint256 i = 0; i < count; i++) {
+            if (_isFrozen(user, i)) continue;
             ProgramManager.DepositStatus st = staking.checkDepositStatus(user, i);
             if (
                 (timeLeft && st == ProgramManager.DepositStatus.TIME_LEFT)
@@ -678,13 +821,14 @@ contract Handler is Test {
 
     function _randomApyTarget(uint256 n, uint256 apySeed, uint256 targetSeed)
         internal
-        pure
+        view
         returns (uint256[] memory apy, uint256[] memory target)
     {
         apy = new uint256[](n);
         target = new uint256[](n);
+        uint256 maxApy = _maxApy();
         for (uint256 i = 0; i < n; i++) {
-            apy[i] = _bound(uint256(keccak256(abi.encode(apySeed, i))), 1, MAX_APY);
+            apy[i] = _bound(uint256(keccak256(abi.encode(apySeed, i))), 1, maxApy);
             uint256 t = uint256(keccak256(abi.encode(targetSeed, i)));
             // 10% zero target (nothing stakeable), otherwise something roomy.
             target[i] = t % 10 == 0 ? 0 : _bound(t, 1_000e18, MAX_TARGET);

@@ -3,17 +3,21 @@ pragma solidity 0.8.20;
 
 /// @title Security regression tests for ERC20PeriodicalStaking
 /// @notice Deterministic reproductions of the v0.2.4 weaknesses (period-removal lockup, unprotected reward
-///         pool, unbounded admin loops, panicking views) and checks of the v0.3.0 behaviour that replaced them.
+///         pool, unbounded admin loops, panicking views), checks of the v0.3.0 behaviour that replaced them, and
+///         the v0.4.0 regressions (no stake without a voucher, no whole-pool fallback without a controller).
 ///
-///  The file is version-aware so it can be compiled against either the v0.2.4 or the v0.3.0 sources:
-///   - `_isV030()` probes for `getCollectableReward()` (v0.3.0 only) and branches.
-///   - `test_v024_*`  reproduce v0.2.4 (deployed 0xa816...) bugs; on v0.3.0 they assert the fix instead.
-///   - `test_v030_*`  exercise v0.3.0-only behaviour and are skipped on v0.2.4.
-///   - `test_known_*` document accepted limitations that exist on both versions.
-///   - `test_sound_*` document behaviour verified correct on both versions.
+///  History: the file was written to compile against both v0.2.4 and v0.3.0 and still branches on `_isV030()`,
+///  which probes for `getCollectableReward()`. Since v0.4.0 (voucher-only staking) it compiles against the
+///  current sources only, so the v0.2.4 branches document the original bug and are no longer executed.
+///   - `test_v024_*`  reproduce v0.2.4 (deployed 0xa816...) bugs and assert the fix.
+///   - `test_v030_*` / `test_v040_*` exercise behaviour introduced in that version.
+///   - `test_known_*` document accepted limitations.
+///   - `test_sound_*` document behaviour verified correct.
+///  APY is in basis points since v0.4.0: APY = 1000 is the same 10% the original figures were computed with.
 import {Test, console, stdError} from "forge-std/Test.sol";
 import {TestToken} from "../../../shared/TestToken.sol";
 import {Clock} from "../../../shared/Clock.sol";
+import {VoucherHelper} from "../../../shared/VoucherHelper.sol";
 import {ERC20PeriodicalStaking} from
     "../../../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 import {ProgramManager} from "../../../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
@@ -21,7 +25,7 @@ import {LimitController} from "../../../../src/contracts/LimitController.sol";
 import {Types} from "../../../../src/common/Types.sol";
 import {Errors} from "../../../../src/common/Errors.sol";
 
-contract SecurityRegression is Test {
+contract SecurityRegression is VoucherHelper {
     TestToken token;
     ERC20PeriodicalStaking staking;
 
@@ -32,7 +36,7 @@ contract SecurityRegression is Test {
     address attacker = makeAddr("attacker");
 
     uint256 constant ONE = 1e18;
-    uint256 constant APY = 10;
+    uint256 constant APY = 1000; // bps (10%)
     uint256 constant TARGET = 1_000_000 * ONE;
     uint256 constant PERIOD_90 = 90;
     uint256 constant PERIOD_0 = 0; // indefinite
@@ -48,6 +52,7 @@ contract SecurityRegression is Test {
         token = new TestToken(18);
         staking = new ERC20PeriodicalStaking(address(token));
         staking.addContractAdmin(admin);
+        _enableVoucherStaking(staking);
 
         uint256[] memory empty = new uint256[](0);
         staking.addStakingPeriod(PERIOD_0, empty, empty);
@@ -94,17 +99,22 @@ contract SecurityRegression is Test {
     }
 
     function _stake(address who, uint256 period, uint256 amount) internal returns (uint256 depositNo) {
+        depositNo = _stakeV(staking, who, 0, period, amount);
+    }
+
+    function _expectStakeRevert(address who, uint256 period, uint256 amount, bytes memory err) internal {
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, who, 0, period, 0, 0);
         vm.prank(who);
-        staking.safeStake(0, period, amount, APY);
-        depositNo = staking.checkDepositCountOfAddress(who) - 1;
+        vm.expectRevert(err);
+        staking.stakeWithVoucher(v, sig, amount, APY);
     }
 
     function _status(address who, uint256 dep) internal view returns (ProgramManager.DepositStatus) {
         return staking.checkDepositStatus(who, dep);
     }
 
-    /// @dev v0.3.0-only opt-in partial withdraw, encoded for a low-level call so this file still compiles
-    ///      against the v0.2.4 sources.
+    /// @dev v0.3.0+ opt-in partial withdraw, encoded for a low-level call (originally so the file compiled
+    ///      against the v0.2.4 sources).
     function _partialWithdrawCall(uint256 dep, uint256 minReward) internal pure returns (bytes memory) {
         return abi.encodeWithSignature("withdrawDepositPartial(uint256,uint256)", dep, minReward);
     }
@@ -194,10 +204,9 @@ contract SecurityRegression is Test {
         for (uint256 i = 0; i < n; i++) {
             address s = address(uint160(0x10000 + i));
             token.transfer(s, 100);
-            vm.startPrank(s);
+            vm.prank(s);
             token.approve(address(staking), 100);
-            staking.safeStake(0, PERIOD_90, 100, APY); // 100 wei = default minimumDeposit
-            vm.stopPrank();
+            _stake(s, PERIOD_90, 100); // 100 wei = default minimumDeposit
         }
     }
 
@@ -353,18 +362,18 @@ contract SecurityRegression is Test {
         lc.setWalletLimit(alice, 0, PERIOD_90, 0);
         assertTrue(lc.hasWalletLimit(alice, 0, PERIOD_90));
         assertEq(lc.getAllowed(alice, 0, PERIOD_90), 0);
-        vm.prank(alice);
-        vm.expectRevert(
+        _expectStakeRevert(
+            alice,
+            PERIOD_90,
+            1_000 * ONE,
             abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, PERIOD_90, 1_000 * ONE, 0)
         );
-        staking.safeStake(0, PERIOD_90, 1_000 * ONE, APY);
 
         // clearing restores the default
         lc.clearWalletLimit(alice, 0, PERIOD_90);
         assertFalse(lc.hasWalletLimit(alice, 0, PERIOD_90));
         assertEq(lc.getAllowed(alice, 0, PERIOD_90), 5_000 * ONE);
-        vm.prank(alice);
-        staking.safeStake(0, PERIOD_90, 1_000 * ONE, APY);
+        _stake(alice, PERIOD_90, 1_000 * ONE);
         assertEq(staking.checkDepositCountOfAddress(alice), 1);
     }
 
@@ -382,7 +391,42 @@ contract SecurityRegression is Test {
     }
 
     // =====================================================================================
-    // Known limitation (both versions): the owner can pause withdrawals and claims indefinitely (no timelock, no escape hatch)
+    // v0.4.0 regressions
+    // =====================================================================================
+    /// v0.3.0 treated `limitController == address(0)` as "headroom = remaining target", so one wallet could fill
+    /// the whole pool. v0.4.0 refuses to stake without a controller.
+    function test_v040_noLimitControllerMeansNoStaking() public {
+        _fund(1_000 * ONE);
+        staking.setLimitController(address(0));
+        _expectStakeRevert(attacker, PERIOD_90, 100_000 * ONE, abi.encodeWithSelector(Errors.LimitControllerNotSet.selector));
+        assertEq(staking.checkDepositCountOfAddress(attacker), 0);
+        assertEq(token.balanceOf(attacker), 100_000 * ONE);
+    }
+
+    /// The plain v0.3.0 stake entry point is gone (no fallback either) and an unsigned voucher is refused:
+    /// eligibility can only come from the backend's signature.
+    function test_v040_stakeWithoutVoucherImpossible() public {
+        vm.prank(attacker);
+        (bool ok, bytes memory ret) = address(staking).call(
+            abi.encodeWithSignature("safeStake(uint256,uint256,uint256,uint256)", 0, PERIOD_90, 1_000 * ONE, APY)
+        );
+        assertFalse(ok, "safeStake must not exist");
+        assertEq(ret.length, 0, "no fallback");
+
+        Types.StakeVoucher memory v = _makeVoucher(attacker, 0, PERIOD_90, 0, 0);
+        vm.prank(attacker);
+        vm.expectRevert(Errors.InvalidVoucherSignature.selector);
+        staking.stakeWithVoucher(v, "", 1_000 * ONE, APY);
+        // self-signed with the attacker's own key
+        bytes memory selfSig = _signVoucher(address(staking), v, uint256(keccak256("attacker")));
+        vm.prank(attacker);
+        vm.expectRevert(Errors.InvalidVoucherSignature.selector);
+        staking.stakeWithVoucher(v, selfSig, 1_000 * ONE, APY);
+        assertEq(staking.checkDepositCountOfAddress(attacker), 0);
+    }
+
+    // =====================================================================================
+    // Known limitation: the owner can pause withdrawals and claims indefinitely (no timelock, no escape hatch)
     // =====================================================================================
     function test_known_ownerCanPauseWithdrawAndClaimIndefinitely() public {
         _fund(1_000 * ONE);
@@ -425,8 +469,7 @@ contract SecurityRegression is Test {
     // =====================================================================================
     function test_sound_defaultMinimumDepositIs100Wei() public {
         _fund(1 * ONE);
-        vm.prank(alice);
-        staking.safeStake(0, PERIOD_90, 100, APY);
+        _stake(alice, PERIOD_90, 100);
         assertEq(staking.getDeposit(alice, 0).rewardGenerated, 2); // 100 wei * 10% * 90/365 = 2 wei
     }
 
@@ -465,12 +508,11 @@ contract SecurityRegression is Test {
         tgt[0] = 1_000 * ONE; // smaller than the 5_000 still staked
         staking.addStakingPeriod(PERIOD_90, apy, tgt);
 
-        (bool exceeds, uint256 remaining) = staking.checkIfUserExceedsLimit(bob, 0, PERIOD_90, 1);
-        assertFalse(exceeds);
-        assertEq(remaining, 0, "no underflow: remaining saturates at 0");
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_90, 1_000 * ONE));
-        staking.safeStake(0, PERIOD_90, 100 * ONE, APY);
+        // no underflow: the reward-for-targets view saturates the over-target cell at 0
+        assertEq(staking.getRewardRequiredForTargets(), 0);
+        _expectStakeRevert(
+            bob, PERIOD_90, 100 * ONE, abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_90, 1_000 * ONE)
+        );
 
         // old deposit still exits cleanly
         vm.prank(alice);
@@ -550,7 +592,7 @@ contract SecurityRegression is Test {
     /// Two-step ownership
     function test_v030_twoStepOwnership() public {
         if (!_isV030()) return;
-        // symbols below do not exist on v0.2.4, so use signatures to keep the file compiling on both
+        // symbols below did not exist on v0.2.4, so signatures are used
         bytes4 notPending = bytes4(keccak256("NotPendingOwner(address,address)"));
         bytes memory acceptCall = abi.encodeWithSignature("acceptOwnership()");
 
@@ -644,13 +686,15 @@ contract SecurityRegression is Test {
         staking.claimDeposit(dep);
         uint256 paidFirst = staking.getUserData(Types.DataType.CLAIM, alice);
 
-        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, PERIOD_0, 1); // 10% -> 1%
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, PERIOD_0, 1); // 10% -> 0.01%
 
         _warpBy(100 days);
         vm.prank(alice);
         staking.claimDeposit(dep);
         uint256 paidSecond = staking.getUserData(Types.DataType.CLAIM, alice) - paidFirst;
-        assertEq(paidSecond, paidFirst, "still accrues at the ORIGINAL APY; owner cannot cap liability");
+        // single-truncation math: floor(2x) - floor(x) is floor(x) or floor(x) + 1
+        assertApproxEqAbs(paidSecond, paidFirst, 1, "still accrues at the ORIGINAL APY; owner cannot cap liability");
+        assertEq(paidFirst + paidSecond, staking.calculateReward(1_000 * ONE, APY, 200), "exact total over 200 days");
         assertEq(staking.getDeposit(alice, dep).APY, APY);
     }
 
@@ -661,19 +705,17 @@ contract SecurityRegression is Test {
     }
 
     // =====================================================================================
-    // Verified-sound behaviour (both versions)
+    // Verified-sound behaviour
     // =====================================================================================
     function test_sound_targetLoweredBelowStakedDoesNotUnderflow() public {
         _fund(1_000 * ONE);
         _stake(alice, PERIOD_90, 5_000 * ONE);
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, PERIOD_90, 100 * ONE);
 
-        (bool exceeds, uint256 remaining) = staking.checkIfUserExceedsLimit(alice, 0, PERIOD_90, 1);
-        assertFalse(exceeds);
-        assertEq(remaining, 0);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_90, 100 * ONE));
-        staking.safeStake(0, PERIOD_90, 100 * ONE, APY);
+        assertEq(staking.getRewardRequiredForTargets(), 0, "over-target cell saturates, no underflow");
+        _expectStakeRevert(
+            bob, PERIOD_90, 100 * ONE, abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_90, 100 * ONE)
+        );
         vm.prank(alice);
         staking.withdrawDeposit(0);
         assertEq(token.balanceOf(alice), 10_000 * ONE);
@@ -711,7 +753,7 @@ contract SecurityRegression is Test {
 
         vm.prank(alice);
         staking.withdrawDeposit(0);
-        // v0.2.4 falls back to count-1 (closed deposit), v0.3.0 advances to count
+        // v0.2.4 fell back to count-1 (closed deposit), v0.3.0+ advances to count
         assertEq(staking.stakerActiveDepositStartIndex(alice), _isV030() ? 3 : 2);
     }
 

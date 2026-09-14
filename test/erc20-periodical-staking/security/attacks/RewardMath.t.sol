@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./AttackBase.t.sol";
+import "./VoucherAttackBase.sol";
 
 /// @title RewardMath
 /// @notice Rounding must always favour the contract, splitting/churning must never extract extra reward,
-///         day-boundary timing must not be gameable, and extreme parameters must fail loudly not silently.
-contract RewardMathTest is AttackBase {
+///         day-boundary timing must not be gameable, APYs are basis points (x.yz%) with the voucher's extra APY
+///         fixed into the deposit, and extreme parameters must fail loudly not silently.
+contract RewardMathTest is VoucherAttackBase {
+    uint256 internal constant BPS_YEAR = 3_650_000; // BPS_DENOMINATOR * DAYS_PER_YEAR
+
     /// @dev Fuzz: splitting one deposit into n smaller ones never yields more reward than the single deposit.
     function testFuzz_splitting_neverExtractsMore(uint256 amount, uint256 n) public {
         amount = bound(amount, 1_000, 50_000 * ONE);
@@ -23,6 +26,63 @@ contract RewardMathTest is AttackBase {
         }
         assertLe(sum, single, "splitting extracted extra reward");
         assertEq(_user(Types.DataType.REWARD_EXPECTED, alice), sum);
+    }
+
+    /// @dev x.yz% APYs are exact: 2.25% on 1000 tokens for a year is exactly 22.5 tokens, and 0.01% is honoured
+    ///      rather than truncated to 0 by an intermediate division.
+    function test_fractionalApy_bpsPrecision() public {
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P0, 225); // 2.25%
+        uint256 d = _stake(alice, 0, P0, 1_000 * ONE);
+        _warpDays(365);
+        assertEq(_deposit(alice, d).rewardGenerated, 22.5e18, "2.25% of 1000 over 365 days");
+
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P90, 1); // 0.01%
+        uint256 e = _stake(bob, 0, P90, 100_000 * ONE);
+        assertEq(_deposit(bob, e).rewardGenerated, 100_000 * ONE * 90 / BPS_YEAR);
+        assertGt(_deposit(bob, e).rewardGenerated, 0);
+        _assertAccounting();
+    }
+
+    /// @dev Fuzz: the voucher's extra APY is added to the base once, recorded as the deposit's effective APY, and
+    ///      used for its whole life (periodical reward at stake time, indefinite accrual later) even when the base
+    ///      APY changes afterwards.
+    function testFuzz_voucherExtraApy_effectiveRateForLife(uint256 extra, uint256 amount, uint256 daysHeld) public {
+        extra = bound(extra, 0, 10_000);
+        amount = bound(amount, 100, 50_000 * ONE);
+        daysHeld = bound(daysHeld, 0, 400);
+        uint256 base30 = _apy(0, P30);
+        uint256 base0 = _apy(0, P0);
+
+        uint256 p = _stakeVWith(staking, alice, 0, P30, amount, extra, 0);
+        uint256 i = _stakeVWith(staking, alice, 0, P0, amount, extra, 0);
+        assertEq(_deposit(alice, p).APY, base30 + extra);
+        assertEq(_deposit(alice, i).APY, base0 + extra);
+        assertEq(_deposit(alice, p).rewardGenerated, amount * (base30 + extra) * P30 / BPS_YEAR);
+
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P0, 1);
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, 1);
+        vm.warp(_now() + daysHeld * 1 days);
+        assertEq(_deposit(alice, i).rewardGenerated, amount * (base0 + extra) * daysHeld / BPS_YEAR);
+        assertEq(_deposit(alice, p).rewardGenerated, amount * (base30 + extra) * P30 / BPS_YEAR);
+        assertEq(_deposit(alice, i).APY, base0 + extra);
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: an APY that does not fit the packed uint32 field is silently truncated into a tiny rate
+    ///      (or an extra APY pushes the effective rate over the edge). It must revert with SafeCast's error.
+    function test_apyBeyondPackedWidth_revertsNotTruncated() public {
+        uint256 big = uint256(type(uint32).max) + 1;
+        bytes memory castErr = abi.encodeWithSignature("SafeCastOverflowedUintDowncast(uint8,uint256)", uint8(32), big);
+
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, big); // admin side has no bound
+        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, big, castErr);
+
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, type(uint32).max);
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 1, 0);
+        vm.prank(alice);
+        vm.expectRevert(castErr);
+        staking.stakeWithVoucher(v, sig, 1_000 * ONE, 0);
+        assertEq(staking.checkDepositCountOfAddress(alice), 0);
     }
 
     /// @dev Hypothesis: claiming right before / after a day rollover pays for a partial day.
@@ -97,12 +157,12 @@ contract RewardMathTest is AttackBase {
     ///      The stake is accepted (there is no stake-time pool check). The owner can no longer collect anything,
     ///      the matured claim reverts NotEnoughFundsInRewardPool until a top-up, then pays in full.
     function test_extremeAPY_periodical_acceptedButClaimWaitsForTopUp() public {
-        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, 1e18);
-        uint256 reward = staking.calculateReward(1_000 * ONE, 1e18, P30);
+        uint256 extreme = 4_000_000_000; // 40,000,000% — still fits the packed uint32
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, extreme);
+        uint256 reward = staking.calculateReward(1_000 * ONE, extreme, P30);
         uint256 pool = staking.rewardPool();
         assertGt(reward, pool);
-        vm.prank(alice);
-        staking.safeStake(0, P30, 1_000 * ONE, 1e18);
+        _stake(alice, 0, P30, 1_000 * ONE);
         assertEq(_total(Types.DataType.REWARD_EXPECTED), reward);
         assertEq(staking.getCollectableReward(), 0, "owner cannot collect promised reward");
         assertGe(staking.getRewardPoolShortfall(), reward - pool, "shortfall includes the deficit");
@@ -126,8 +186,8 @@ contract RewardMathTest is AttackBase {
     ///      but an indefinite depositor must always be able to recover principal through the opt-in partial
     ///      withdraw with a zero reward floor, regardless of reward pool state.
     function test_indefinite_principalRecoverable_whenPoolCannotPayReward() public {
-        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P0, 1e18);
-        uint256 d = _stake(alice, 0, P0, 1_000 * ONE);
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P0, 4_000_000_000);
+        uint256 d = _stake(alice, 0, P0, 10_000 * ONE);
         _warpDays(1);
         uint256 reward = _deposit(alice, d).rewardGenerated;
         uint256 pool = staking.rewardPool(); // no periodical deposit is open, so the whole pool is free
@@ -142,31 +202,33 @@ contract RewardMathTest is AttackBase {
         vm.prank(alice);
         (bool ok,) = address(staking).call(abi.encodeWithSignature("withdrawDepositPartial(uint256,uint256)", d, 0));
         assertTrue(ok, "indefinite principal locked behind unpayable reward");
-        assertGe(token.balanceOf(alice) - before, 1_000 * ONE);
+        assertGe(token.balanceOf(alice) - before, 10_000 * ONE);
         assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.WITHDRAWN));
     }
 
-    /// @dev Hypothesis: calculateReward near uint256 max silently wraps.
+    /// @dev Hypothesis: calculateReward near uint256 max silently wraps. With a single mulDiv the amount only
+    ///      overflows when apyBps * days exceeds one year of bps, and then it reverts exactly at the boundary.
     function test_amountNearUintMax_reverts_realisticNoRevert() public {
+        uint256 max = type(uint256).max;
+        // rate*days (150) below 3_650_000 scales down: even max amount fits, and the result is the exact floor
+        assertEq(staking.calculateReward(max, 5, 30), (max / BPS_YEAR) * 150 + ((max % BPS_YEAR) * 150) / BPS_YEAR);
+        // 100% for 730 days doubles the amount: max/2 fits, max/2 + 1 must revert, never wrap
+        assertEq(staking.calculateReward(max / 2, 10_000, 730), max - 1);
         vm.expectRevert();
-        staking.calculateReward(type(uint256).max, 5, 30);
+        staking.calculateReward(max / 2 + 1, 10_000, 730);
+        // rate * days itself is overflow-checked
         vm.expectRevert();
-        staking.calculateReward(type(uint256).max / 2, 5, 30);
-        // The largest amount that fits for (APY 5, 30 days): amount * X where X = (1e18*5/365)*30
-        uint256 x = (uint256(1e18) * 5 / 365) * 30;
-        uint256 maxAmount = type(uint256).max / x;
-        staking.calculateReward(maxAmount, 5, 30);
-        vm.expectRevert();
-        staking.calculateReward(maxAmount + 1, 5, 30);
+        staking.calculateReward(1, max, 2);
     }
 
-    /// @dev Fuzz: the reward never rounds up relative to the exact rational amount*apy*period/36500.
+    /// @dev Fuzz: the reward never rounds up relative to the exact rational amount*apyBps*period/3_650_000,
+    ///      and loses strictly less than one unit.
     function testFuzz_rewardNeverRoundsUp(uint256 amount, uint256 apy, uint256 period) public {
         amount = bound(amount, 0, 1e32);
         apy = bound(apy, 1, 1e9);
         period = bound(period, 0, 100_000);
         uint256 r = staking.calculateReward(amount, apy, period);
-        assertLe(r, (amount * apy * period) / 36_500);
+        assertEq(r, (amount * apy * period) / BPS_YEAR);
     }
 
     /// @dev Fuzz: an indefinite deposit's accrued reward over d days equals calculateReward(amount, apy, d) exactly,
@@ -193,10 +255,9 @@ contract RewardMathTest is AttackBase {
     function test_targetBoundary_exact() public {
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, P0, 5_000 * ONE);
         _stake(alice, 0, P0, 3_000 * ONE);
-        uint256 h1 = _apy(0, P0);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P0, 5_000 * ONE));
-        staking.safeStake(0, P0, 2_000 * ONE + 1, h1);
+        _expectStakeRevert(
+            bob, 0, P0, 2_000 * ONE + 1, _apy(0, P0), abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P0, 5_000 * ONE)
+        );
         _stake(bob, 0, P0, 2_000 * ONE);
         assertEq(_staked(0, P0), 5_000 * ONE);
     }

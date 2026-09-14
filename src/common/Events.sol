@@ -15,13 +15,17 @@ abstract contract Events {
     event AddContractAdmin(address indexed user);
     event RemoveContractAdmin(address indexed user);
 
+    /// @param apyBps Effective APY of the deposit (base + voucher extra), in bps
+    /// @param extraApyBps The voucher's extra APY, in bps
     event Stake(
         address indexed by,
         uint256 indexed stakingPhase,
         uint256 indexed stakingPeriod,
-        uint256 APY,
+        uint256 apyBps,
+        uint256 extraApyBps,
         uint256 tokenAmount,
-        uint256 depositNumber
+        uint256 depositNumber,
+        uint256 voucherNonce
     );
     event Withdraw(address indexed by, uint256 indexed depositNumber, uint256 stakedAmount, uint256 reward);
     event Claim(address indexed by, uint256 indexed depositNumber, uint256 stakedAmount, uint256 reward);
@@ -47,10 +51,14 @@ abstract contract Events {
     event AddStakingPeriod(uint256 indexed newStakingPeriod);
     event RemoveStakingPeriod(uint256 indexed stakingPeriod);
 
-    event UpdateWhitelistStatus(bool enabled);
-    event UpdateWhitelist(address indexed user, bool isWhitelisted);
-
     event UpdateLimitController(address indexed controller);
 
-    event UpdateRequirementChecker(address indexed checker);
+    event UpdateVoucherSigner(address indexed signer);
+    event UpdateMaxExtraApyBps(uint256 maxExtraApyBps);
+    event UpdateMaxExtraLimit(uint256 maxExtraLimit);
+    event UpdateTreasury(address indexed treasury);
+
+    event FreezeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed by);
+    event UnfreezeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed by);
+    event SeizeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed treasury, uint256 principal);
 }

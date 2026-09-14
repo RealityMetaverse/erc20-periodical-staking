@@ -1,13 +1,51 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./AttackBase.t.sol";
+import "./VoucherAttackBase.sol";
 import {LimitController} from "../../../../src/contracts/LimitController.sol";
+import {ILimitController} from "../../../../src/interfaces/ILimitController.sol";
+import {MockLegacyStaking} from "../../../shared/mocks/MockLegacyStaking.sol";
+
+/// @notice Controller that returns fixed (possibly hostile) figures, to attack the stake-side headroom math.
+contract FixedLimitController is ILimitController {
+    uint256 public allowed;
+    uint256 public used;
+
+    function set(uint256 allowed_, uint256 used_) external {
+        allowed = allowed_;
+        used = used_;
+    }
+
+    function getAllowedAndUsed(address, uint256, uint256) external view returns (uint256, uint256) {
+        return (allowed, used);
+    }
+
+    function getRemaining(address, uint256, uint256) external view returns (uint256) {
+        return used >= allowed ? 0 : allowed - used;
+    }
+
+    function getRemainingBatch(address[] calldata wallets, uint256[] calldata, uint256[] calldata)
+        external
+        pure
+        returns (uint256[] memory)
+    {
+        return new uint256[](wallets.length);
+    }
+
+    function getAllowedBatch(address[] calldata wallets, uint256[] calldata, uint256[] calldata)
+        external
+        pure
+        returns (uint256[] memory)
+    {
+        return new uint256[](wallets.length);
+    }
+}
 
 /// @title LimitControllerIntegration
 /// @notice Wallet-limit semantics (especially the "0 means default" ambiguity), limit changes after deposits,
-///         batch validation, and controllers pointed at the wrong staking contract.
-contract LimitControllerIntegrationTest is AttackBase {
+///         batch validation, controllers pointed at the wrong staking contract, the voucher's extraLimit, legacy
+///         stake counting, and hostile controller figures.
+contract LimitControllerIntegrationTest is VoucherAttackBase {
     LimitController internal lc;
 
     function setUp() public override {
@@ -22,46 +60,50 @@ contract LimitControllerIntegrationTest is AttackBase {
         }
     }
 
+    function _limitErr(address w, uint256 phase, uint256 period, uint256 requested, uint256 headroom)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, w, phase, period, requested, headroom);
+    }
+
     /// @dev Hypothesis: a wallet explicitly limited to 0 ("0 means no staking allowed" per NatSpec) can still stake
     ///      because getAllowed falls back to the default when the wallet limit is 0.
     function test_walletLimitZero_blocksWallet() public {
         lc.setWalletLimit(alice, 0, P30, 0);
         assertEq(lc.getAllowed(alice, 0, P30), 0, "explicit 0 wallet limit must mean 0");
-        uint256 h1 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 1_000 * ONE, 0));
-        staking.safeStake(0, P30, 1_000 * ONE, h1);
+        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), _limitErr(alice, 0, P30, 1_000 * ONE, 0));
     }
 
     /// @dev Hypothesis: with default 0 and no wallet limit, staking is blocked with exact figures.
     function test_defaultZero_noWalletLimit_blocked() public {
         lc.setDefaultLimit(0, P90, 0);
-        uint256 h2 = _apy(0, P90);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P90, 1_000 * ONE, 0));
-        staking.safeStake(0, P90, 1_000 * ONE, h2);
+        _expectStakeRevert(alice, 0, P90, 1_000 * ONE, _apy(0, P90), _limitErr(alice, 0, P90, 1_000 * ONE, 0));
         lc.setWalletLimit(alice, 0, P90, 500 * ONE);
-        uint256 h3 = _apy(0, P90);
-        vm.prank(alice);
-        vm.expectRevert(
-            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P90, 1_000 * ONE, 500 * ONE)
+        _expectStakeRevert(
+            alice, 0, P90, 1_000 * ONE, _apy(0, P90), _limitErr(alice, 0, P90, 1_000 * ONE, 500 * ONE)
         );
-        staking.safeStake(0, P90, 1_000 * ONE, h3);
         _stake(alice, 0, P90, 500 * ONE);
     }
 
-    /// @dev Hypothesis: lowering a limit below the staked amount underflows getRemaining or blocks closing.
+    /// @dev Hypothesis: lowering a limit below the staked amount underflows getRemaining / the stake headroom, or
+    ///      blocks closing. A voucher extraLimit smaller than the overshoot must still give no headroom.
     function test_limitLoweredBelowStaked_noUnderflow_closingWorks() public {
         uint256 d = _stake(alice, 0, P30, 8_000 * ONE);
         lc.setWalletLimit(alice, 0, P30, 5_000 * ONE);
         assertEq(lc.getRemaining(alice, 0, P30), 0);
-        (bool exceeds, uint256 rem) = staking.checkIfUserExceedsLimit(alice, 0, P30, 1);
-        assertTrue(exceeds);
-        assertEq(rem, 0);
-        uint256 h4 = _apy(0, P30);
+        (uint256 allowed, uint256 used) = lc.getAllowedAndUsed(alice, 0, P30);
+        assertEq(allowed, 5_000 * ONE);
+        assertEq(used, 8_000 * ONE);
+        uint256 apy = _apy(0, P30);
+        _expectStakeRevert(alice, 0, P30, 100, apy, _limitErr(alice, 0, P30, 100, 0));
+
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 2_000 * ONE);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 100, 0));
-        staking.safeStake(0, P30, 100, h4);
+        vm.expectRevert(_limitErr(alice, 0, P30, 100, 0));
+        staking.stakeWithVoucher(v, sig, 100, apy);
+
         _warpDays(30);
         _claim(alice, d);
         assertEq(lc.getRemaining(alice, 0, P30), 5_000 * ONE);
@@ -74,14 +116,109 @@ contract LimitControllerIntegrationTest is AttackBase {
         assertEq(lc.getRemaining(alice, 0, P30), 0);
         lc.setWalletLimit(alice, 0, P30, 12_000 * ONE);
         assertEq(lc.getRemaining(alice, 0, P30), 2_000 * ONE);
-        uint256 h5 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(
-            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 2_000 * ONE + 1, 2_000 * ONE)
+        _expectStakeRevert(
+            alice, 0, P30, 2_000 * ONE + 1, _apy(0, P30), _limitErr(alice, 0, P30, 2_000 * ONE + 1, 2_000 * ONE)
         );
-        staking.safeStake(0, P30, 2_000 * ONE + 1, h5);
         _stake(alice, 0, P30, 2_000 * ONE);
         assertEq(lc.getRemaining(alice, 0, P30), 0);
+    }
+
+    /// @dev Hypothesis: the voucher's extraLimit leaks into later stakes, or is measured against the base limit
+    ///      instead of total usage. It is per-stake headroom on top of (allowed - used), never stored.
+    function test_voucherExtraLimit_exactHeadroom_perStakeOnly() public {
+        uint256 apy = _apy(0, P30);
+        _stake(alice, 0, P30, 10_000 * ONE); // default limit exhausted
+
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 3_000 * ONE);
+        vm.prank(alice);
+        vm.expectRevert(_limitErr(alice, 0, P30, 3_000 * ONE + 1, 3_000 * ONE));
+        staking.stakeWithVoucher(v, sig, 3_000 * ONE + 1, apy);
+        vm.prank(alice);
+        staking.stakeWithVoucher(v, sig, 3_000 * ONE, apy);
+
+        // not persistent: a plain voucher has no headroom left
+        _expectStakeRevert(alice, 0, P30, 100, apy, _limitErr(alice, 0, P30, 100, 0));
+
+        // a later extra is measured against total usage (13k): 10k + 5k - 13k = 2k
+        (v, sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 5_000 * ONE);
+        vm.prank(alice);
+        vm.expectRevert(_limitErr(alice, 0, P30, 2_000 * ONE + 1, 2_000 * ONE));
+        staking.stakeWithVoucher(v, sig, 2_000 * ONE + 1, apy);
+
+        // the controller views never include voucher extras
+        assertEq(lc.getRemaining(alice, 0, P30), 0);
+        (, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        assertEq(rem[0][1], 0);
+        _assertAccounting();
+    }
+
+    /// @dev Fuzz: for any wallet limit, voucher extraLimit and legacy stake, a stake is accepted iff
+    ///      amount <= max(0, limit + extra - legacyStake), and the revert reports exactly that headroom.
+    function testFuzz_headroom_limitPlusExtraMinusLegacy(uint256 limit, uint256 extra, uint256 legacyAmt, uint256 amount)
+        public
+    {
+        limit = bound(limit, 0, 100_000 * ONE);
+        extra = bound(extra, 0, 50_000 * ONE);
+        legacyAmt = bound(legacyAmt, 0, 150_000 * ONE);
+        amount = bound(amount, 100, 50_000 * ONE);
+
+        MockLegacyStaking legacy = new MockLegacyStaking();
+        lc.setLegacyStakingContract(address(legacy));
+        legacy.setStaked(alice, 0, P0, legacyAmt);
+        lc.setWalletLimit(alice, 0, P0, limit);
+
+        uint256 cap = limit + extra;
+        uint256 headroom = legacyAmt >= cap ? 0 : cap - legacyAmt;
+        uint256 apy = _apy(0, P0);
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P0, 0, extra);
+
+        if (amount > headroom) {
+            vm.prank(alice);
+            vm.expectRevert(_limitErr(alice, 0, P0, amount, headroom));
+            staking.stakeWithVoucher(v, sig, amount, apy);
+            assertEq(_upp(Types.DataType.STAKING, alice, 0, P0), 0);
+        } else {
+            vm.prank(alice);
+            staking.stakeWithVoucher(v, sig, amount, apy);
+            assertEq(_upp(Types.DataType.STAKING, alice, 0, P0), amount);
+            (, uint256 used) = lc.getAllowedAndUsed(alice, 0, P0);
+            assertEq(used, legacyAmt + amount, "used = new contract + legacy");
+        }
+    }
+
+    /// @dev Hypothesis: legacy stake is remapped to other phases/periods, leaks between cells, or an unknown
+    ///      legacy phase/period reverts. It counts only in the SAME (phase, period) and unknown cells read 0.
+    function test_legacyStake_sameCellOnly_unknownCellsNeverRevert() public {
+        MockLegacyStaking legacy = new MockLegacyStaking();
+        lc.setLegacyStakingContract(address(legacy));
+        legacy.setStaked(alice, 0, P30, 8_000 * ONE);
+        legacy.setStaked(alice, 7, 365, 1_000_000 * ONE); // a phase/period the new contract never had
+
+        _expectStakeRevert(
+            alice, 0, P30, 2_000 * ONE + 1, _apy(0, P30), _limitErr(alice, 0, P30, 2_000 * ONE + 1, 2_000 * ONE)
+        );
+        _stake(alice, 0, P30, 2_000 * ONE);
+        _stake(alice, 0, P90, 10_000 * ONE); // other period untouched by legacy
+        staking.changeStakingPhase(1);
+        _stake(alice, 1, P30, 10_000 * ONE); // other phase untouched by legacy
+
+        (uint256 allowed, uint256 used) = lc.getAllowedAndUsed(alice, 7, 365);
+        assertEq(allowed, 0);
+        assertEq(used, 1_000_000 * ONE);
+        (allowed, used) = lc.getAllowedAndUsed(bob, 99, 12345);
+        assertEq(allowed + used, 0, "unknown cell reads 0 in both contracts");
+
+        (, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        assertEq(rem[0][1], 0, "phase 0 / P30 full (8k legacy + 2k new)");
+        assertEq(rem[0][0], 10_000 * ONE, "phase 0 / P0 untouched");
+        assertEq(rem[1][1], 0);
+
+        vm.expectRevert(abi.encodeWithSelector(LimitController.SameStakingAndLegacyContract.selector, address(staking)));
+        lc.setLegacyStakingContract(address(staking));
+
+        lc.setLegacyStakingContract(address(0));
+        assertEq(lc.getRemaining(alice, 0, P30), 8_000 * ONE, "without legacy only the new 2k counts");
+        _assertAccounting();
     }
 
     /// @dev Hypothesis: batch length mismatches are silently accepted somewhere.
@@ -104,6 +241,11 @@ contract LimitControllerIntegrationTest is AttackBase {
         // staking side batch getter
         vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 2, 1));
         staking.getUserPhasePeriodDataBatch(Types.DataType.STAKING, w, one, two);
+        // only STAKING is tracked per cell; other types are refused rather than silently reading 0
+        vm.expectRevert(Errors.InvalidDataType.selector);
+        staking.getUserPhasePeriodDataBatch(Types.DataType.CLAIM, w, two, two);
+        vm.expectRevert(Errors.InvalidDataType.selector);
+        staking.getUserPhasePeriodData(Types.DataType.WITHDRAWAL, alice, 0, P30);
     }
 
     /// @dev Hypothesis: a controller pointed at the wrong staking contract lets a wallet exceed its limit,
@@ -116,10 +258,7 @@ contract LimitControllerIntegrationTest is AttackBase {
         assertEq(lc.getRemaining(alice, 0, P30), 10_000 * ONE);
         lc.setStakingContract(address(staking));
         assertEq(lc.getRemaining(alice, 0, P30), 0, "after fix, existing stake must count");
-        uint256 h6 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 100, 0));
-        staking.safeStake(0, P30, 100, h6);
+        _expectStakeRevert(alice, 0, P30, 100, _apy(0, P30), _limitErr(alice, 0, P30, 100, 0));
         vm.expectRevert(Errors.ZeroAddressProvided.selector);
         lc.setStakingContract(address(0));
         vm.expectRevert(Errors.ZeroAddressProvided.selector);
@@ -129,10 +268,7 @@ contract LimitControllerIntegrationTest is AttackBase {
     /// @dev Hypothesis: a limit on one (phase, period) leaks into another cell.
     function test_limitIsPerCell() public {
         lc.setWalletLimit(alice, 0, P30, 1);
-        uint256 h7 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 1_000 * ONE, 1));
-        staking.safeStake(0, P30, 1_000 * ONE, h7);
+        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), _limitErr(alice, 0, P30, 1_000 * ONE, 1));
         _stake(alice, 0, P90, 1_000 * ONE);
         _stake(alice, 0, P0, 1_000 * ONE);
         staking.changeStakingPhase(1);
@@ -144,18 +280,19 @@ contract LimitControllerIntegrationTest is AttackBase {
     function test_limitAndTarget_bothEnforced() public {
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, P30, 5_000 * ONE);
         lc.setWalletLimit(alice, 0, P30, 100_000 * ONE);
-        uint256 h8 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 5_000 * ONE));
-        staking.safeStake(0, P30, 6_000 * ONE, h8);
+        _expectStakeRevert(
+            alice,
+            0,
+            P30,
+            6_000 * ONE,
+            _apy(0, P30),
+            abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 5_000 * ONE)
+        );
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, P30, TARGET);
         lc.setWalletLimit(alice, 0, P30, 5_000 * ONE);
-        uint256 h9 = _apy(0, P30);
-        vm.prank(alice);
-        vm.expectRevert(
-            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, 6_000 * ONE, 5_000 * ONE)
+        _expectStakeRevert(
+            alice, 0, P30, 6_000 * ONE, _apy(0, P30), _limitErr(alice, 0, P30, 6_000 * ONE, 5_000 * ONE)
         );
-        staking.safeStake(0, P30, 6_000 * ONE, h9);
         _stake(alice, 0, P30, 5_000 * ONE);
     }
 
@@ -170,32 +307,78 @@ contract LimitControllerIntegrationTest is AttackBase {
         _assertAccounting();
     }
 
+    /// @dev Hypothesis: freezing frees the limit (letting a frozen wallet stake around it), or seizing leaves the
+    ///      seized amount counted forever. Frozen stake still counts; a seize frees it like any close.
+    function test_limitCountsFrozenStake_seizeFreesHeadroom() public {
+        uint256 d = _stake(alice, 0, P0, 10_000 * ONE);
+        _freeze(alice, d);
+        assertEq(lc.getRemaining(alice, 0, P0), 0, "frozen stake still counts");
+        _expectStakeRevert(alice, 0, P0, 100, _apy(0, P0), _limitErr(alice, 0, P0, 100, 0));
+        _seize(alice, d);
+        assertEq(lc.getRemaining(alice, 0, P0), 10_000 * ONE, "seized stake no longer counts");
+        // whether a seized wallet may stake again is the backend's call (it issues the vouchers)
+        _stake(alice, 0, P0, 10_000 * ONE);
+        _assertAccounting();
+    }
+
     /// @dev Hypothesis: getPhasePeriodUserData disagrees with the controller's per-cell answers.
     function test_userDataView_matchesController() public {
         lc.setWalletLimit(alice, 0, P90, 3_000 * ONE);
         _stake(alice, 0, P90, 1_000 * ONE);
         _stake(alice, 0, P30, 4_000 * ONE);
-        (uint256[][] memory limits, uint256[][] memory rem, bool[][] memory elig) = staking.getPhasePeriodUserData(alice);
+        (uint256[][] memory limits, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
         for (uint256 ph = 0; ph < 2; ph++) {
             for (uint256 i = 0; i < PERIODS.length; i++) {
                 assertEq(limits[ph][i], lc.getAllowed(alice, ph, PERIODS[i]));
                 assertEq(rem[ph][i], lc.getRemaining(alice, ph, PERIODS[i]));
-                assertTrue(elig[ph][i]);
             }
         }
         assertEq(rem[0][2], 2_000 * ONE);
         assertEq(rem[0][1], 6_000 * ONE);
     }
 
-    /// @dev Hypothesis: with the controller unset, the view falls back to target-based headroom.
-    function test_controllerUnset_fallsBackToTarget() public {
+    /// @dev v0.3.0 fell back to target-based headroom with no controller, handing one wallet the whole pool.
+    ///      v0.4.0: no controller => no staking (typed error), the view is zero-filled, exits are unaffected.
+    function test_controllerUnset_noWholePoolFallback() public {
+        uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
         staking.setLimitController(address(0));
-        _stake(alice, 0, P30, 1_000 * ONE);
-        (uint256[][] memory limits, uint256[][] memory rem,) = staking.getPhasePeriodUserData(alice);
-        assertEq(limits[0][1], type(uint256).max);
-        assertEq(rem[0][1], TARGET - 1_000 * ONE);
-        (, uint256 r) = staking.checkIfUserExceedsLimit(alice, 0, P30, 1);
-        assertEq(r, TARGET - 1_000 * ONE);
+        _expectStakeRevert(
+            bob, 0, P30, TARGET / 2, _apy(0, P30), abi.encodeWithSelector(Errors.LimitControllerNotSet.selector)
+        );
+        (uint256[][] memory limits, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        assertEq(limits[0][1], 0);
+        assertEq(rem[0][1], 0);
+        _warpDays(30);
+        _claim(alice, d);
+        _assertAccounting();
+    }
+
+    /// @dev Hypothesis: hostile controller figures (max allowed, max used, allowed + extra overflowing) make the
+    ///      stake-side headroom math wrap or panic. It must saturate: cap at max, headroom at 0.
+    function test_hostileControllerFigures_overflowSafe() public {
+        FixedLimitController f = new FixedLimitController();
+        staking.setLimitController(address(f));
+        uint256 apy = _apy(0, P0);
+        uint256 bigExtra = type(uint128).max;
+
+        f.set(type(uint256).max, 0);
+        _stakeVWith(staking, alice, 0, P0, 1_000 * ONE, 0, bigExtra); // allowed + extra would overflow
+        f.set(type(uint256).max - 1, 0);
+        _stakeVWith(staking, alice, 0, P0, 1_000 * ONE, 0, bigExtra);
+
+        f.set(type(uint256).max, type(uint256).max);
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P0, 0, bigExtra);
+        vm.prank(alice);
+        vm.expectRevert(_limitErr(alice, 0, P0, 1_000 * ONE, 0));
+        staking.stakeWithVoucher(v, sig, 1_000 * ONE, apy);
+
+        f.set(0, type(uint256).max);
+        _expectStakeRevert(alice, 0, P0, 1_000 * ONE, apy, _limitErr(alice, 0, P0, 1_000 * ONE, 0));
+
+        f.set(5, 3);
+        _expectStakeRevert(alice, 0, P0, 100, apy, _limitErr(alice, 0, P0, 100, 2));
+        assertEq(staking.checkDepositCountOfAddress(alice), 2);
+        _assertAccounting();
     }
 
     /// @dev Fuzz: remaining never exceeds allowed and never underflows for any (limit, staked) pair.
@@ -210,9 +393,7 @@ contract LimitControllerIntegrationTest is AttackBase {
         uint256 allowed = lc.getAllowed(alice, 0, P0);
         uint256 remaining = lc.getRemaining(alice, 0, P0);
         assertEq(remaining, allowed);
-        uint256 apy = _apy(0, P0);
-        vm.prank(alice);
-        (bool ok,) = address(staking).call(abi.encodeCall(staking.safeStake, (0, P0, stakeAmt, apy)));
+        bool ok = _tryStake(alice, 0, P0, stakeAmt);
         assertEq(ok, stakeAmt <= remaining, "stake acceptance must match remaining");
         uint256 after_ = lc.getRemaining(alice, 0, P0);
         assertLe(after_, allowed);
@@ -226,6 +407,9 @@ contract LimitControllerIntegrationTest is AttackBase {
         vm.prank(bob);
         vm.expectRevert();
         lc2.setDefaultLimit(0, P30, 1);
+        vm.prank(bob);
+        vm.expectRevert();
+        lc2.setLegacyStakingContract(address(0));
         // controller address has no staking privileges
         vm.prank(address(lc2));
         vm.expectRevert(_unauthorized(AccessControl.AccessTier.OWNER));

@@ -50,19 +50,25 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
 
     function setMiniumumDeposit(uint256 newMinimumDeposit) external onlyContractOwner {
         if (newMinimumDeposit == 0) revert InvalidMinimumDeposit(newMinimumDeposit, 1);
-        minimumDeposit = newMinimumDeposit;
+        minimumDeposit = SafeCast.toUint128(newMinimumDeposit);
 
         emit UpdateMinimumDeposit(newMinimumDeposit);
     }
 
+    /// @notice Open or close STAKING, WITHDRAWAL or CLAIM. Any other data type reverts InvalidDataType.
     function changeActionAvailability(Types.DataType action, bool changeTo) external onlyContractOwner {
-        actionAvailabilityStatuses[action] = changeTo;
+        if (action == Types.DataType.STAKING) stakingOpen = changeTo;
+        else if (action == Types.DataType.WITHDRAWAL) withdrawalOpen = changeTo;
+        else if (action == Types.DataType.CLAIM) claimOpen = changeTo;
+        else revert InvalidDataType();
+
         emit UpdateActionAvailability(action, changeTo);
     }
 
     // ======================================
     // =       Phase Period Management      =
     // ======================================
+    /// @param apyForEachStakingPeriod Base APY per period, in bps (10_000 = 100%); 0 is rejected
     function pushStakingPhase(uint256[] memory apyForEachStakingPeriod, uint256[] memory targetForEachStakingPeriod)
         external
         onlyContractOwner
@@ -81,15 +87,18 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         }
 
         uint256 newStakingPhaseIndex = stakingPhaseCount;
-        for (uint256 i = 0; i < stakingPeriodCount; i++) {
+        for (uint256 i = 0; i < stakingPeriodCount;) {
             if (apyForEachStakingPeriod[i] == 0) revert InvalidAPY(0, 1);
             phasePeriodDataList[Types.PhasePeriodDataType.APY][newStakingPhaseIndex][stakingPeriodList[i]] =
                 apyForEachStakingPeriod[i];
             phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][newStakingPhaseIndex][stakingPeriodList[i]] =
                 targetForEachStakingPeriod[i];
+            unchecked {
+                ++i;
+            }
         }
 
-        stakingPhaseCount += 1;
+        stakingPhaseCount = SafeCast.toUint32(newStakingPhaseIndex + 1);
 
         emit AddStakingPhase(newStakingPhaseIndex);
     }
@@ -98,20 +107,26 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     /// @dev Accounting (STAKED, user/total data, rewardPool) is never touched: deposits opened on the
     ///      removed phase stay claimable and withdrawable. Gas is O(periods), independent of staker count.
     function popStakingPhase() external onlyContractOwner {
-        if (stakingPhaseCount == 0) revert NoStakingPhasesAddedYet();
-        uint256 lastStakingPhase = stakingPhaseCount - 1;
+        uint256 phaseCount = stakingPhaseCount;
+        if (phaseCount == 0) revert NoStakingPhasesAddedYet();
+        uint256 lastStakingPhase = phaseCount - 1;
 
         uint256 periodCount = stakingPeriodList.length;
-        for (uint256 periodIndex = 0; periodIndex < periodCount; periodIndex++) {
+        for (uint256 periodIndex = 0; periodIndex < periodCount;) {
             _clearPhasePeriodConfig(lastStakingPhase, stakingPeriodList[periodIndex]);
+            unchecked {
+                ++periodIndex;
+            }
         }
 
-        stakingPhaseCount -= 1;
-        if (currentStakingPhase != 0 && currentStakingPhase == stakingPhaseCount) currentStakingPhase -= 1;
+        stakingPhaseCount = uint32(lastStakingPhase);
+        uint256 currentPhase = currentStakingPhase;
+        if (currentPhase != 0 && currentPhase == lastStakingPhase) currentStakingPhase = uint32(currentPhase - 1);
 
         emit RemoveStakingPhase(lastStakingPhase);
     }
 
+    /// @param apyForEachStakingPhase Base APY per phase, in bps (10_000 = 100%); 0 is rejected
     function addStakingPeriod(
         uint256 newStakingPeriod,
         uint256[] memory apyForEachStakingPhase,
@@ -119,11 +134,11 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     ) external onlyContractOwner {
         if (checkIfStakingPeriodExists(newStakingPeriod)) revert StakingPeriodExists(newStakingPeriod);
 
-        if (apyForEachStakingPhase.length != stakingPhaseCount || targetForEachStakingPhase.length != stakingPhaseCount)
-        {
+        uint256 phaseCount = stakingPhaseCount;
+        if (apyForEachStakingPhase.length != phaseCount || targetForEachStakingPhase.length != phaseCount) {
             revert LengthMismatch(
-                stakingPhaseCount,
-                apyForEachStakingPhase.length != stakingPhaseCount
+                phaseCount,
+                apyForEachStakingPhase.length != phaseCount
                     ? apyForEachStakingPhase.length
                     : targetForEachStakingPhase.length
             );
@@ -131,11 +146,14 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         stakingPeriodList.push(newStakingPeriod);
         stakingPeriodList.sortStorage();
 
-        for (uint256 phase = 0; phase < stakingPhaseCount; phase++) {
+        for (uint256 phase = 0; phase < phaseCount;) {
             if (apyForEachStakingPhase[phase] == 0) revert InvalidAPY(0, 1);
             phasePeriodDataList[Types.PhasePeriodDataType.APY][phase][newStakingPeriod] = apyForEachStakingPhase[phase];
             phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][phase][newStakingPeriod] =
                 targetForEachStakingPhase[phase];
+            unchecked {
+                ++phase;
+            }
         }
 
         emit AddStakingPeriod(newStakingPeriod);
@@ -151,8 +169,11 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         if (periodIndex == stakingPeriodList.length) revert StakingPeriodDoesNotExist(stakingPeriod);
 
         uint256 phaseCount = stakingPhaseCount;
-        for (uint256 phase = 0; phase < phaseCount; phase++) {
+        for (uint256 phase = 0; phase < phaseCount;) {
             _clearPhasePeriodConfig(phase, stakingPeriod);
+            unchecked {
+                ++phase;
+            }
         }
 
         stakingPeriodList.removeElementByIndex(periodIndex);
@@ -160,6 +181,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit RemoveStakingPeriod(stakingPeriod);
     }
 
+    /// @dev APY values are bps (10_000 = 100%); APY 0 is rejected.
     function setPhasePeriodData(
         Types.PhasePeriodDataType dataType,
         uint256 stakingPhase,
@@ -175,9 +197,10 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     function changeStakingPhase(uint256 phaseToSwitch) external onlyContractOwner {
-        if (stakingPhaseCount == 0) revert NoStakingPhasesAddedYet();
-        if (phaseToSwitch >= stakingPhaseCount) revert StakingPhaseDoesNotExist(phaseToSwitch);
-        currentStakingPhase = phaseToSwitch;
+        uint256 phaseCount = stakingPhaseCount;
+        if (phaseCount == 0) revert NoStakingPhasesAddedYet();
+        if (phaseToSwitch >= phaseCount) revert StakingPhaseDoesNotExist(phaseToSwitch);
+        currentStakingPhase = uint32(phaseToSwitch);
 
         emit ChangeStakingPhase(phaseToSwitch);
     }
@@ -190,55 +213,39 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     // ======================================
-    // =           Whitelist Control        =
+    // =      Voucher, Limit & Treasury     =
     // ======================================
-    /// @notice Enable or disable the staking whitelist.
-    /// @dev When disabled, anyone can stake. When enabled, only whitelisted addresses can stake.
-    function setWhitelistEnabled(bool enabled) external onlyContractOwner {
-        whitelistEnabled = enabled;
-        emit UpdateWhitelistStatus(enabled);
+    /// @notice Set the voucher signer; address(0) disables staking (stakeWithVoucher reverts VoucherSignerNotSet).
+    function setVoucherSigner(address signer) external onlyContractOwner {
+        voucherSigner = signer;
+        emit UpdateVoucherSigner(signer);
     }
 
-    /// @notice Add or remove an address from the staking whitelist.
-    function setWhitelistAddress(address userAddress, bool allowed) external onlyContractOwner {
-        _setWhitelistAddress(userAddress, allowed);
+    /// @notice Highest extra APY (bps) a voucher may carry.
+    function setMaxExtraApyBps(uint256 value) external onlyContractOwner {
+        maxExtraApyBps = SafeCast.toUint32(value);
+        emit UpdateMaxExtraApyBps(value);
     }
 
-    /// @notice Batch add or remove multiple addresses from the staking whitelist.
-    /// @param userAddresses List of addresses to update.
-    /// @param allowed Whitelist status to apply to all provided addresses.
-    function setWhitelistAddresses(address[] calldata userAddresses, bool allowed) external onlyContractOwner {
-        uint256 length = userAddresses.length;
-        for (uint256 i = 0; i < length; i++) {
-            _setWhitelistAddress(userAddresses[i], allowed);
-        }
+    /// @notice Highest extra limit a voucher may carry.
+    function setMaxExtraLimit(uint256 value) external onlyContractOwner {
+        maxExtraLimit = SafeCast.toUint128(value);
+        emit UpdateMaxExtraLimit(value);
     }
 
-    /// @dev Internal helper to update whitelist mapping and emit event.
-    function _setWhitelistAddress(address userAddress, bool allowed) internal {
-        if (userAddress == address(0)) revert ZeroAddressProvided();
-        isWhitelisted[userAddress] = allowed;
-        emit UpdateWhitelist(userAddress, allowed);
+    /// @notice Set the receiver of seized deposits.
+    function setTreasury(address newTreasury) external onlyContractOwner {
+        if (newTreasury == address(0)) revert ZeroAddressProvided();
+        treasury = newTreasury;
+        emit UpdateTreasury(newTreasury);
     }
 
-    // ======================================
-    // =        Staking Limit Control       =
-    // ======================================
-    /// @notice Set the limit controller contract address; zero disables limit checks.
-    /// @param controllerAddress The address of the LimitController contract or zero to disable
+    /// @notice Set the limit controller contract address. Staking requires one: with address(0) stakeWithVoucher
+    ///         reverts LimitControllerNotSet.
+    /// @param controllerAddress The address of the LimitController contract
     function setLimitController(address controllerAddress) external onlyContractOwner {
         limitController = controllerAddress;
         emit UpdateLimitController(controllerAddress);
-    }
-
-    // ======================================
-    // =        Requirement Control         =
-    // ======================================
-    /// @notice Set the external requirement checker contract address; zero disables requirement checks.
-    /// @param checkerAddress The address of the RequirementChecker contract or zero to disable
-    function setRequirementChecker(address checkerAddress) external onlyContractOwner {
-        requirementChecker = checkerAddress;
-        emit UpdateRequirementChecker(checkerAddress);
     }
 
     // ======================================

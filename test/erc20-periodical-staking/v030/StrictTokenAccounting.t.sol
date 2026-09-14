@@ -24,6 +24,7 @@ contract StrictTokenAccountingTest is V030Base {
         targets[0] = TARGET;
         targets[1] = TARGET;
         feeStaking.pushStakingPhase(apys, targets);
+        _enableVoucherStaking(feeStaking);
 
         feeToken.transfer(userOne, 1_000 ether);
     }
@@ -46,16 +47,19 @@ contract StrictTokenAccountingTest is V030Base {
         uint256 amount = STAKE_AMOUNT;
         uint256 received = amount - (amount * FEE_BPS) / 10_000;
 
+        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(feeStaking, userOne, 0, 0, 0, 0);
         vm.startPrank(userOne);
         feeToken.approve(address(feeStaking), amount);
         // Indefinite stake needs no pool, so the only failure is the delta check.
         vm.expectRevert(abi.encodeWithSelector(Errors.UnexpectedTokenAmount.selector, amount, received));
-        feeStaking.safeStake(0, 0, amount, APY);
+        feeStaking.stakeWithVoucher(v, sig, amount, APY);
         vm.stopPrank();
 
         assertEq(feeStaking.totalDataList(Types.DataType.STAKING), 0);
         assertEq(feeStaking.checkDepositCountOfAddress(userOne), 0);
         assertEq(feeToken.balanceOf(address(feeStaking)), 0);
+        // The whole call reverted, so the voucher nonce was not burned.
+        assertFalse(feeStaking.isVoucherNonceUsed(userOne, v.nonce));
     }
 
     function test_ZeroFeeTokenPassesDeltaCheck() public {
@@ -68,11 +72,20 @@ contract StrictTokenAccountingTest is V030Base {
         apys[0] = APY;
         targets[0] = TARGET;
         s.pushStakingPhase(apys, targets);
+        _enableVoucherStaking(s);
 
         zeroFee.approve(address(s), 100 ether);
         s.provideReward(100 ether);
         assertEq(s.rewardPool(), 100 ether);
         assertEq(zeroFee.balanceOf(address(s)), 100 ether);
+
+        // A voucher stake with a zero-fee token passes the delta check too.
+        zeroFee.transfer(userOne, STAKE_AMOUNT);
+        vm.prank(userOne);
+        zeroFee.approve(address(s), STAKE_AMOUNT);
+        _stakeV(s, userOne, 0, PERIOD_SHORT, STAKE_AMOUNT);
+        assertEq(zeroFee.balanceOf(address(s)), 100 ether + STAKE_AMOUNT);
+        assertEq(s.totalDataList(Types.DataType.STAKING), STAKE_AMOUNT);
     }
 
     /// @notice Standard token: the contract balance always equals staked principal + reward pool.

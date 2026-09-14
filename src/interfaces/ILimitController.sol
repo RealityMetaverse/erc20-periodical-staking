@@ -31,4 +31,12 @@ interface ILimitController {
         external
         view
         returns (uint256[] memory allowed);
+
+    /// @notice Limit and current usage for one wallet/phase/period in a single call.
+    /// @return allowed Wallet-specific limit if set (even 0), else the phase/period default.
+    /// @return used Stake held in the staking contract plus the legacy contract, for the SAME phase and period. Never reverts for unknown phase/period.
+    function getAllowedAndUsed(address wallet, uint256 phase, uint256 period)
+        external
+        view
+        returns (uint256 allowed, uint256 used);
 }
