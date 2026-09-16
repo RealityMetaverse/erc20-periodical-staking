@@ -1,0 +1,2 @@
+# DeployV040 wallet-limit fixtures: the CRLF endings are the point of the test, never normalise them.
+test/v040/fixtures/*.csv -text

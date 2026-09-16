@@ -5,3 +5,14 @@ libs = ["lib"]
 optimizer = true
 optimizer_runs = 200
 via_ir = true
+# Read-only: lets script/DeployV040.s.sol load an optional WALLET_LIMITS_FILE (deploy/v040/) and its fork test
+# load the CSV fixtures. Nothing else is readable from Solidity.
+fs_permissions = [
+  { access = "read", path = "./deploy/v040" },
+  { access = "read", path = "./test/v040/fixtures" },
+]
+
+# script/deploy-v040.sh passes `--rpc-url deploy-v040` so the RPC URL (which may hold a provider key) stays out of
+# forge's argv. Only resolved when that alias is used.
+[rpc_endpoints]
+deploy-v040 = "${RPC_URL}"
