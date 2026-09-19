@@ -55,11 +55,20 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
         string memory failures;
         uint256 failureCount;
 
+        // Every user action is closed once; every seize trial starts from that `env` snapshot.
+        uint256 pre = vm.snapshot();
+        vm.startPrank(owner);
+        staking.changeActionAvailability(Types.DataType.STAKING, false);
+        staking.changeActionAvailability(Types.DataType.WITHDRAWAL, false);
+        staking.changeActionAvailability(Types.DataType.CLAIM, false);
+        vm.stopPrank();
+        uint256 env = vm.snapshot();
+
         for (uint256 u = 0; u < users.length; u++) {
             uint256 count = staking.checkDepositCountOfAddress(users[u]);
             for (uint256 i = 0; i < count; i++) {
                 if (!staking.isDepositFrozen(users[u], i)) continue;
-                string memory why = _trySeize(users[u], i, treasury);
+                string memory why = _trySeize(users[u], i, treasury, env);
                 if (bytes(why).length != 0) {
                     failureCount++;
                     failures = string.concat(
@@ -69,19 +78,14 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
                 vm.warp(ts);
             }
         }
+        assertTrue(vm.revertTo(pre), "revertTo(pre) failed");
+        vm.warp(ts);
         assertEq(failureCount, 0, string.concat("FROZEN DEPOSITS NOT SEIZABLE:", failures));
     }
 
-    /// @dev Runs one seize inside a snapshot and returns a non-empty reason on any mismatch.
-    function _trySeize(address user, uint256 idx, address treasury) private returns (string memory why) {
-        uint256 snap = vm.snapshot();
-
-        vm.startPrank(owner);
-        staking.changeActionAvailability(Types.DataType.STAKING, false);
-        staking.changeActionAvailability(Types.DataType.WITHDRAWAL, false);
-        staking.changeActionAvailability(Types.DataType.CLAIM, false);
-        vm.stopPrank();
-
+    /// @dev Runs one seize from the `env` snapshot (all actions closed), reverts back to it, and returns a
+    ///      non-empty reason on any mismatch.
+    function _trySeize(address user, uint256 idx, address treasury, uint256 env) private returns (string memory why) {
         ProgramManager.TokenDeposit memory d = staking.getDeposit(user, idx);
         uint256 cellBefore = staking.getUserPhasePeriodData(Types.DataType.STAKING, user, d.stakingPhase, d.stakingPeriod);
         uint256 treasuryBefore = token.balanceOf(treasury);
@@ -112,7 +116,7 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
             why = string.concat("seize reverted: ", vm.toString(reason));
         }
 
-        vm.revertTo(snap);
+        assertTrue(vm.revertTo(env), "revertTo(env) failed");
     }
 
     function _checkSeizedIsFinal(address user, uint256 idx) private returns (string memory) {
@@ -142,10 +146,11 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
         address[] memory users = handler.getUsers();
         uint256 total;
         for (uint256 u = 0; u < users.length; u++) {
-            uint256 count = staking.checkDepositCountOfAddress(users[u]);
-            for (uint256 i = 0; i < count; i++) {
-                ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
-                if (d.withdrawalDate == 0 && d.stakingEndDate != 0) total += d.rewardGenerated;
+            // one call per user; getDepositsInRangeBy returns exactly getDeposit(user, i) for every i
+            ProgramManager.TokenDeposit[] memory ds =
+                lens.getDepositsInRangeBy(users[u], 0, staking.checkDepositCountOfAddress(users[u]));
+            for (uint256 i = 0; i < ds.length; i++) {
+                if (ds[i].withdrawalDate == 0 && ds[i].stakingEndDate != 0) total += ds[i].rewardGenerated;
             }
         }
         return total == staking.totalDataList(Types.DataType.REWARD_EXPECTED);

@@ -20,8 +20,8 @@ contract RewardSolvencyTest is V030Base {
         assertEq(stakingContract.rewardPool(), 0, "no stake-time pool check");
         assertEq(stakingContract.getCollectableReward(), 0);
         assertEq(
-            stakingContract.getRewardPoolShortfall(),
-            stakingContract.getRewardRequiredForTargets() + reward,
+            _lens(stakingContract).getRewardPoolShortfall(),
+            _lens(stakingContract).getRewardRequiredForTargets() + reward,
             "shortfall = required for open targets + existing deficit"
         );
 
@@ -65,7 +65,7 @@ contract RewardSolvencyTest is V030Base {
             uint256(stakingContract.checkDepositStatus(userTwo, 0)),
             uint256(ProgramManager.DepositStatus.READY_TO_CLAIM)
         );
-        assertEq(stakingContract.getRewardPoolShortfall(), stakingContract.getRewardRequiredForTargets() + reward);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), _lens(stakingContract).getRewardRequiredForTargets() + reward);
 
         _fundRewardPool(reward);
         before = myToken.balanceOf(userTwo);
@@ -112,21 +112,21 @@ contract RewardSolvencyTest is V030Base {
         uint256 deficit = _periodicalReward(STAKE_AMOUNT, PERIOD_LONG);
         uint256 required =
             _periodicalReward(target, PERIOD_SHORT) + _periodicalReward(target - STAKE_AMOUNT, PERIOD_LONG);
-        assertEq(stakingContract.getRewardRequiredForTargets(), required);
-        assertEq(stakingContract.getRewardPoolShortfall(), required + deficit, "open deposit's deficit is counted");
+        assertEq(_lens(stakingContract).getRewardRequiredForTargets(), required);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), required + deficit, "open deposit's deficit is counted");
 
         // Funding part of the deficit reduces the shortfall one-for-one.
         _fundRewardPool(deficit / 2);
-        assertEq(stakingContract.getRewardPoolShortfall(), required + deficit - deficit / 2);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), required + deficit - deficit / 2);
 
         // Covering the deficit exactly: shortfall == required, nothing collectable.
         _fundRewardPool(deficit - deficit / 2);
         assertEq(stakingContract.getCollectableReward(), 0);
-        assertEq(stakingContract.getRewardPoolShortfall(), required);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), required);
 
         // Over-funding beyond required floors at 0.
         _fundRewardPool(required + 1);
-        assertEq(stakingContract.getRewardPoolShortfall(), 0);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), 0);
     }
 
     function test_IndefiniteStake_NotReserved() public {
@@ -447,50 +447,50 @@ contract RewardSolvencyTest is V030Base {
         uint256 needLong = _periodicalReward(target, PERIOD_LONG);
         uint256 required = needShort + needLong;
 
-        assertEq(stakingContract.getRewardRequiredForTargets(), required, "empty program: full targets");
-        assertEq(stakingContract.getRewardPoolShortfall(), required, "nothing funded: shortfall == required");
+        assertEq(_lens(stakingContract).getRewardRequiredForTargets(), required, "empty program: full targets");
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), required, "nothing funded: shortfall == required");
 
         // Funding reduces the shortfall one-for-one; over-funding floors it at 0.
         _fundRewardPool(needShort);
-        assertEq(stakingContract.getRewardPoolShortfall(), needLong);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), needLong);
         _fundRewardPool(needLong + 1);
-        assertEq(stakingContract.getRewardPoolShortfall(), 0);
-        assertEq(stakingContract.getRewardRequiredForTargets(), required, "funding does not change requirement");
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), 0);
+        assertEq(_lens(stakingContract).getRewardRequiredForTargets(), required, "funding does not change requirement");
 
         // A periodical stake shrinks the remaining target and reserves its reward: both sides move together.
         _stakeFor(userOne, PERIOD_SHORT, STAKE_AMOUNT);
         uint256 stakeReward = _periodicalReward(STAKE_AMOUNT, PERIOD_SHORT);
         assertEq(
-            stakingContract.getRewardRequiredForTargets(),
+            _lens(stakingContract).getRewardRequiredForTargets(),
             _periodicalReward(target - STAKE_AMOUNT, PERIOD_SHORT) + needLong
         );
         assertEq(stakingContract.getCollectableReward(), required + 1 - stakeReward);
-        assertEq(stakingContract.getRewardPoolShortfall(), 0);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), 0);
 
         // Indefinite stakes are not part of the requirement.
         _stakeFor(userTwo, 0, STAKE_AMOUNT * 5);
         assertEq(
-            stakingContract.getRewardRequiredForTargets(),
+            _lens(stakingContract).getRewardRequiredForTargets(),
             _periodicalReward(target - STAKE_AMOUNT, PERIOD_SHORT) + needLong
         );
 
         // Owner collecting the free pool re-opens the shortfall.
         stakingContract.collectReward(stakingContract.getCollectableReward());
         assertEq(
-            stakingContract.getRewardPoolShortfall(),
+            _lens(stakingContract).getRewardPoolShortfall(),
             _periodicalReward(target - STAKE_AMOUNT, PERIOD_SHORT) + needLong
         );
 
         // A cell at or above target contributes 0; a removed period is no longer counted.
         stakingContract.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, PERIOD_SHORT, STAKE_AMOUNT / 2);
-        assertEq(stakingContract.getRewardRequiredForTargets(), needLong);
+        assertEq(_lens(stakingContract).getRewardRequiredForTargets(), needLong);
         stakingContract.removeStakingPeriod(PERIOD_LONG);
-        assertEq(stakingContract.getRewardRequiredForTargets(), 0);
-        assertEq(stakingContract.getRewardPoolShortfall(), 0);
+        assertEq(_lens(stakingContract).getRewardRequiredForTargets(), 0);
+        assertEq(_lens(stakingContract).getRewardPoolShortfall(), 0);
 
         // No phases at all: 0.
         stakingContract.popStakingPhase();
-        assertEq(stakingContract.getRewardRequiredForTargets(), 0);
+        assertEq(_lens(stakingContract).getRewardRequiredForTargets(), 0);
     }
 
     /// @notice Indefinite principal is never locked: when the free pool cannot cover the accrued reward,

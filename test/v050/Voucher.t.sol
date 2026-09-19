@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./V040Base.sol";
+import "./V050Base.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 
@@ -28,7 +28,7 @@ contract RejectingContractSigner is IERC1271 {
 }
 
 /// @notice Exhaustive tests of the stakeWithVoucher authorisation path.
-contract VoucherTest is V040Base {
+contract VoucherTest is V050Base {
     uint256 internal constant AMOUNT = 1_000 * ONE;
     uint256 internal constant OTHER_KEY = 0xBAD;
     uint256 internal constant ROTATED_KEY = 0xC0FFEE;
@@ -42,17 +42,40 @@ contract VoucherTest is V040Base {
     // ======================================
     // =              Helpers               =
     // ======================================
+    /// @dev A validUntil that is "comfortably in the future" but still inside the contract's
+    ///      `maxVoucherValidity` ceiling. Replaces the old `type(uint256).max`, which no real signer can
+    ///      produce and which now reverts VoucherValidityTooLong. Read through Clock, not block.timestamp,
+    ///      so it is correct after a warp.
+    function _far() internal view returns (uint256) {
+        return _now() + VOUCHER_LIFETIME;
+    }
+
+    /// @dev Single-extraLimit form: budget and per-cell allowance are the same value.
     function _v(address wallet, uint256 phase, uint256 period, uint256 extraApy, uint256 extraLimit, uint256 until, uint256 nonce)
         internal
         pure
         returns (Types.StakeVoucher memory)
     {
+        return _vb(wallet, phase, period, extraApy, extraLimit, extraLimit, until, nonce);
+    }
+
+    function _vb(
+        address wallet,
+        uint256 phase,
+        uint256 period,
+        uint256 extraApy,
+        uint256 extraLimitTotal,
+        uint256 extraLimitPerCell,
+        uint256 until,
+        uint256 nonce
+    ) internal pure returns (Types.StakeVoucher memory) {
         return Types.StakeVoucher({
             wallet: wallet,
             phase: phase,
             period: period,
             extraApyBps: extraApy,
-            extraLimit: extraLimit,
+            extraLimitTotal: extraLimitTotal,
+            extraLimitPerCell: extraLimitPerCell,
             validUntil: until,
             nonce: nonce
         });
@@ -66,7 +89,7 @@ contract VoucherTest is V040Base {
     {
         bytes32 typeHash = keccak256(
             bytes(
-                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimit,uint256 validUntil,uint256 nonce)"
+                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)"
             )
         );
         bytes32 domainTypeHash =
@@ -87,7 +110,8 @@ contract VoucherTest is V040Base {
                 v.phase,
                 v.period,
                 v.extraApyBps,
-                v.extraLimit,
+                v.extraLimitTotal,
+                v.extraLimitPerCell,
                 v.validUntil,
                 v.nonce
             )
@@ -151,8 +175,8 @@ contract VoucherTest is V040Base {
     }
 
     function test_validStake_sameNonceDifferentWallets() external {
-        Types.StakeVoucher memory va = _v(alice, 0, P30, 0, 0, type(uint256).max, 7);
-        Types.StakeVoucher memory vb = _v(bob, 0, P30, 0, 0, type(uint256).max, 7);
+        Types.StakeVoucher memory va = _v(alice, 0, P30, 0, 0, _far(), 7);
+        Types.StakeVoucher memory vb = _v(bob, 0, P30, 0, 0, _far(), 7);
         _stakeRaw(alice, va, signVoucher(va), AMOUNT, APY_P30);
         _stakeRaw(bob, vb, signVoucher(vb), AMOUNT, APY_P30);
         assertTrue(staking.isVoucherNonceUsed(alice, 7));
@@ -324,7 +348,7 @@ contract VoucherTest is V040Base {
         staking.stakeWithVoucher(v, sig, AMOUNT, APY_P30);
 
         // A differently-shaped voucher with the same nonce is also rejected (nonce, not signature, is single-use).
-        Types.StakeVoucher memory other = _v(alice, 0, P90, 5, 1, type(uint256).max, v.nonce);
+        Types.StakeVoucher memory other = _v(alice, 0, P90, 5, 1, _far(), v.nonce);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Errors.VoucherNonceUsed.selector, alice, v.nonce));
         staking.stakeWithVoucher(other, signVoucher(other), AMOUNT, 0);
@@ -335,7 +359,7 @@ contract VoucherTest is V040Base {
     function test_nonceBitmap_acrossWords() external {
         uint256[7] memory nonces = [uint256(0), 255, 256, 511, 512, 1 << 200, type(uint256).max];
         for (uint256 i = 0; i < nonces.length; i++) {
-            Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, nonces[i]);
+            Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), nonces[i]);
             _stakeRaw(alice, v, signVoucher(v), 100 * ONE, APY_P30);
         }
         for (uint256 i = 0; i < nonces.length; i++) {
@@ -346,7 +370,7 @@ contract VoucherTest is V040Base {
             assertFalse(staking.isVoucherNonceUsed(alice, untouched[i]), "neighbour nonce untouched");
         }
         // Word boundary replays are still rejected.
-        Types.StakeVoucher memory replay = _v(alice, 0, P30, 0, 0, type(uint256).max, 256);
+        Types.StakeVoucher memory replay = _v(alice, 0, P30, 0, 0, _far(), 256);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Errors.VoucherNonceUsed.selector, alice, 256));
         staking.stakeWithVoucher(replay, signVoucher(replay), 100 * ONE, 0);
@@ -354,7 +378,7 @@ contract VoucherTest is V040Base {
 
     function testFuzz_nonceBitmap_onlyExactBit(uint256 nonce, uint256 probe) external {
         vm.assume(probe != nonce);
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, nonce);
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), nonce);
         _stakeRaw(alice, v, signVoucher(v), AMOUNT, APY_P30);
         assertTrue(staking.isVoucherNonceUsed(alice, nonce));
         assertFalse(staking.isVoucherNonceUsed(alice, probe));
@@ -365,8 +389,8 @@ contract VoucherTest is V040Base {
     // =          Tampered fields           =
     // ======================================
     function testFuzz_tamperedField_reverts(uint8 field) external {
-        field = uint8(bound(field, 0, 6));
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 100, 1_000 * ONE, type(uint256).max, 11);
+        field = uint8(bound(field, 0, 7));
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 100, 1_000 * ONE, _far(), 11);
         bytes memory sig = signVoucher(v);
         address caller = alice;
 
@@ -380,9 +404,11 @@ contract VoucherTest is V040Base {
         } else if (field == 3) {
             v.extraApyBps = 101;
         } else if (field == 4) {
-            v.extraLimit = 1_000 * ONE + 1;
+            v.extraLimitTotal = 1_000 * ONE + 1;
         } else if (field == 5) {
-            v.validUntil = type(uint256).max - 1;
+            v.extraLimitPerCell = 1_000 * ONE + 1;
+        } else if (field == 6) {
+            v.validUntil = _far() - 1;
         } else {
             v.nonce = 12;
         }
@@ -393,26 +419,28 @@ contract VoucherTest is V040Base {
         assertEq(staking.checkDepositCountOfAddress(caller), 0);
     }
 
-    /// @notice Explicit per-field coverage (the fuzz above may not hit all seven).
+    /// @notice Explicit per-field coverage (the fuzz above may not hit all eight).
     function test_tamperedField_eachField() external {
         bytes memory err = abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector);
-        Types.StakeVoucher memory base = _v(alice, 0, P30, 100, 1_000 * ONE, type(uint256).max, 11);
+        Types.StakeVoucher memory base = _v(alice, 0, P30, 100, 1_000 * ONE, _far(), 11);
         bytes memory sig = signVoucher(base);
 
         Types.StakeVoucher memory t = base;
-        t = _v(bob, 0, P30, 100, 1_000 * ONE, type(uint256).max, 11);
+        t = _v(bob, 0, P30, 100, 1_000 * ONE, _far(), 11);
         _expectStakeRevert(bob, t, sig, AMOUNT, 0, err);
-        t = _v(alice, 1, P30, 100, 1_000 * ONE, type(uint256).max, 11);
+        t = _v(alice, 1, P30, 100, 1_000 * ONE, _far(), 11);
         _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
-        t = _v(alice, 0, P90, 100, 1_000 * ONE, type(uint256).max, 11);
+        t = _v(alice, 0, P90, 100, 1_000 * ONE, _far(), 11);
         _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
-        t = _v(alice, 0, P30, 0, 1_000 * ONE, type(uint256).max, 11);
+        t = _v(alice, 0, P30, 0, 1_000 * ONE, _far(), 11);
         _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
-        t = _v(alice, 0, P30, 100, 50_000 * ONE, type(uint256).max, 11);
+        t = _v(alice, 0, P30, 100, 50_000 * ONE, _far(), 11);
         _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
-        t = _v(alice, 0, P30, 100, 1_000 * ONE, _now() + 1 days, 11);
+        t = _vb(alice, 0, P30, 100, 1_000 * ONE, 50_000 * ONE, _far(), 11);
         _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
-        t = _v(alice, 0, P30, 100, 1_000 * ONE, type(uint256).max, 0);
+        t = _v(alice, 0, P30, 100, 1_000 * ONE, _far() - 1, 11);
+        _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
+        t = _v(alice, 0, P30, 100, 1_000 * ONE, _far(), 0);
         _expectStakeRevert(alice, t, sig, AMOUNT, 0, err);
 
         _stakeRaw(alice, base, sig, AMOUNT, APY_P30 + 100);
@@ -431,7 +459,7 @@ contract VoucherTest is V040Base {
     }
 
     function test_voucherForOtherPhase_revertsUntilPhaseSwitch() external {
-        Types.StakeVoucher memory v = _v(alice, 1, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 1, P30, 0, 0, _far(), 0);
         bytes memory sig = signVoucher(v);
         _expectStakeRevert(
             alice, v, sig, AMOUNT, 0, abi.encodeWithSelector(Errors.IncorrectStakingPhase.selector, 1, 0)
@@ -445,7 +473,7 @@ contract VoucherTest is V040Base {
         assertEq(_cell(alice, 1, P30), AMOUNT);
 
         // A phase-0 voucher is now stale.
-        Types.StakeVoucher memory stale = _v(alice, 0, P30, 0, 0, type(uint256).max, 1);
+        Types.StakeVoucher memory stale = _v(alice, 0, P30, 0, 0, _far(), 1);
         _expectStakeRevert(
             alice,
             stale,
@@ -458,7 +486,7 @@ contract VoucherTest is V040Base {
 
     function testFuzz_voucherForNonCurrentPhase_reverts(uint256 phase) external {
         vm.assume(phase != 0);
-        Types.StakeVoucher memory v = _v(alice, phase, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, phase, P30, 0, 0, _far(), 0);
         _expectStakeRevert(
             alice,
             v,
@@ -473,7 +501,7 @@ contract VoucherTest is V040Base {
         staking.popStakingPhase();
         staking.popStakingPhase();
         assertEq(staking.stakingPhaseCount(), 0);
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), 0);
         _expectStakeRevert(
             alice, v, signVoucher(v), AMOUNT, 0, abi.encodeWithSelector(Errors.StakingPhaseDoesNotExist.selector, 0)
         );
@@ -481,7 +509,7 @@ contract VoucherTest is V040Base {
 
     function testFuzz_voucherForUnknownPeriod_reverts(uint256 period) external {
         vm.assume(period != P0 && period != P30 && period != P90);
-        Types.StakeVoucher memory v = _v(alice, 0, period, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 0, period, 0, 0, _far(), 0);
         _expectStakeRevert(
             alice,
             v,
@@ -495,7 +523,7 @@ contract VoucherTest is V040Base {
     /// @notice Regression for the APY-cell existence check: removing a period invalidates vouchers for it in every
     ///         phase, and re-adding it makes them valid again.
     function test_removedPeriod_revertsAndReAddRestores() external {
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), 0);
         bytes memory sig = signVoucher(v);
 
         staking.removeStakingPeriod(P30);
@@ -553,7 +581,7 @@ contract VoucherTest is V040Base {
         fresh.addStakingPeriod(P30, new uint256[](0), new uint256[](0));
         fresh.pushStakingPhase(one, _fill(1, TARGET));
 
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), 0);
         bytes memory sig = _signVoucher(address(fresh), v, VOUCHER_SIGNER_KEY);
 
         vm.prank(alice);
@@ -608,14 +636,14 @@ contract VoucherTest is V040Base {
     }
 
     function test_extraLimit_boundByMaxAndAddsHeadroom() external {
-        Types.StakeVoucher memory over = voucherFor(alice, P30, 0, MAX_EXTRA_LIMIT + 1);
+        Types.StakeVoucher memory over = voucherFor(alice, P30, 0, MAX_EXTRA_LIMIT_TOTAL + 1);
         _expectStakeRevert(
             alice,
             over,
             signVoucher(over),
             AMOUNT,
             0,
-            abi.encodeWithSelector(Errors.VoucherExtraLimitTooHigh.selector, MAX_EXTRA_LIMIT + 1, MAX_EXTRA_LIMIT)
+            abi.encodeWithSelector(Errors.VoucherExtraLimitTotalTooHigh.selector, MAX_EXTRA_LIMIT_TOTAL + 1, MAX_EXTRA_LIMIT_TOTAL)
         );
 
         uint256 extra = 10_000 * ONE;
@@ -727,7 +755,7 @@ contract VoucherTest is V040Base {
         assertEq(
             staking.VOUCHER_TYPEHASH(),
             keccak256(
-                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimit,uint256 validUntil,uint256 nonce)"
+                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)"
             )
         );
     }
@@ -755,7 +783,7 @@ contract VoucherTest is V040Base {
     }
 
     function test_eip712_offchainSignatureStakes() external {
-        Types.StakeVoucher memory v = _v(alice, 0, P90, 1, 1, type(uint256).max, 999);
+        Types.StakeVoucher memory v = _v(alice, 0, P90, 1, 1, _far(), 999);
         bytes memory sig = _sign(VOUCHER_SIGNER_KEY, _offchainDigest(block.chainid, address(staking), v));
         uint256 n = _stakeRaw(alice, v, sig, AMOUNT, APY_P90 + 1);
         assertEq(_deposit(alice, n).APY, APY_P90 + 1);
@@ -763,14 +791,14 @@ contract VoucherTest is V040Base {
 
     function test_eip712_crossContractReplayRejected() external {
         address otherContract = makeAddr("otherStakingDeployment");
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), 0);
         bytes memory sig = _sign(VOUCHER_SIGNER_KEY, _offchainDigest(block.chainid, otherContract, v));
         _expectStakeRevert(alice, v, sig, AMOUNT, 0, abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector));
     }
 
     function test_eip712_crossChainReplayRejected() external {
         uint256 originalChain = block.chainid;
-        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, type(uint256).max, 0);
+        Types.StakeVoucher memory v = _v(alice, 0, P30, 0, 0, _far(), 0);
         bytes memory otherChainSig = _sign(VOUCHER_SIGNER_KEY, _offchainDigest(originalChain + 1, address(staking), v));
         _expectStakeRevert(
             alice, v, otherChainSig, AMOUNT, 0, abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector)

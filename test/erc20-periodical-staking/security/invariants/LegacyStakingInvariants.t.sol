@@ -16,6 +16,9 @@ interface VmExtra {
 ///         period-removal lockup and the v0.2.4 accounting gaps (zeroed cells, unprotected reward pool), so a future regression cannot slip
 ///         through silently. It is skipped unless INVARIANT_LEGACY=true is set, so the normal test
 ///         run stays green.
+///         Expected failing set: ALL SIX. Four fail through their own check; reserveRespected and
+///         tokenConservation fail at the end of every run through InvariantBase.afterInvariant(), whose
+///         full-grid cell sums see the v0.2.4 zeroed cells.
 /// @dev    INVARIANT_LEGACY=true FOUNDRY_INVARIANT_RUNS=32 FOUNDRY_INVARIANT_DEPTH=40 \
 ///           forge test --match-contract LegacyStakingInvariants
 contract LegacyStakingInvariants is InvariantBase {

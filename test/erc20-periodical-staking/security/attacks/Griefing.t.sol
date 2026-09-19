@@ -167,9 +167,9 @@ contract GriefingTest is VoucherAttackBase {
         staking.checkClaimableDataFor(alice);
         assertLt(g - gasleft(), 10_000_000);
         g = gasleft();
-        staking.getDepositsInRangeBy(alice, 0, SPAM);
+        _lens(staking).getDepositsInRangeBy(alice, 0, SPAM);
         assertLt(g - gasleft(), 10_000_000);
-        assertEq(staking.getDepositsInRangeBy(alice, 100, 150).length, 50);
+        assertEq(_lens(staking).getDepositsInRangeBy(alice, 100, 150).length, 50);
     }
 
     /// @dev Hypothesis: 300 stakers make stakeWithVoucher for a new user more expensive (stakerAddressList push

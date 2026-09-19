@@ -38,21 +38,22 @@ contract DefensiveGuardsTest is V030Base {
         _stakeFor(userOne, PERIOD_SHORT, STAKE_AMOUNT);
         _stakeFor(userOne, PERIOD_LONG, STAKE_AMOUNT);
 
+        _lens(stakingContract);
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidRange.selector, 2, 1));
-        stakingContract.getDepositsInRangeBy(userOne, 2, 1);
+        _lens(stakingContract).getDepositsInRangeBy(userOne, 2, 1);
 
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidRange.selector, 0, 3));
-        stakingContract.getDepositsInRangeBy(userOne, 0, 3);
+        _lens(stakingContract).getDepositsInRangeBy(userOne, 0, 3);
 
-        ProgramManager.TokenDeposit[] memory all = stakingContract.getDepositsInRangeBy(userOne, 0, 2);
+        ProgramManager.TokenDeposit[] memory all = _lens(stakingContract).getDepositsInRangeBy(userOne, 0, 2);
         assertEq(all.length, 2);
         assertEq(all[0].stakingPeriod, PERIOD_SHORT);
         assertEq(all[1].stakingPeriod, PERIOD_LONG);
 
-        ProgramManager.TokenDeposit[] memory none = stakingContract.getDepositsInRangeBy(userOne, 1, 1);
+        ProgramManager.TokenDeposit[] memory none = _lens(stakingContract).getDepositsInRangeBy(userOne, 1, 1);
         assertEq(none.length, 0);
 
-        ProgramManager.TokenDeposit[] memory last = stakingContract.getDepositsInRangeBy(userOne, 1, 2);
+        ProgramManager.TokenDeposit[] memory last = _lens(stakingContract).getDepositsInRangeBy(userOne, 1, 2);
         assertEq(last.length, 1);
         assertEq(last[0].stakingPeriod, PERIOD_LONG);
     }

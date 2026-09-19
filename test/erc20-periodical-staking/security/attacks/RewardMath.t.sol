@@ -165,7 +165,7 @@ contract RewardMathTest is VoucherAttackBase {
         _stake(alice, 0, P30, 1_000 * ONE);
         assertEq(_total(Types.DataType.REWARD_EXPECTED), reward);
         assertEq(staking.getCollectableReward(), 0, "owner cannot collect promised reward");
-        assertGe(staking.getRewardPoolShortfall(), reward - pool, "shortfall includes the deficit");
+        assertGe(_lens(staking).getRewardPoolShortfall(), reward - pool, "shortfall includes the deficit");
         _assertAccounting();
 
         _warpDays(31);

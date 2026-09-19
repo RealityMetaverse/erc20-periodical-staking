@@ -17,7 +17,7 @@ import {Types} from "../../src/common/Types.sol";
 ///         signer, treasury, funded pool, 2 phases x periods [0, 30, 90].
 /// @dev Inherits Events so tests can `emit` inside vm.expectEmit. Never read `block.timestamp` after a warp in a
 ///      test body (via_ir hazard): use `_now()`.
-abstract contract V040Base is VoucherHelper, Events {
+abstract contract V050Base is VoucherHelper, Events {
     Clock internal clock = new Clock();
 
     uint256 internal constant ONE = 1e18;
@@ -35,7 +35,8 @@ abstract contract V040Base is VoucherHelper, Events {
     uint256 internal constant USER_FUNDS = 200_000 * ONE;
     uint256 internal constant DEFAULT_LIMIT = 100_000 * ONE;
     uint256 internal constant MAX_EXTRA_APY_BPS = 2_000;
-    uint256 internal constant MAX_EXTRA_LIMIT = 50_000 * ONE;
+    uint256 internal constant MAX_EXTRA_LIMIT_TOTAL = 50_000 * ONE;
+    uint256 internal constant MAX_EXTRA_LIMIT_PER_CELL = 50_000 * ONE;
 
     TestToken internal token;
     ERC20PeriodicalStaking internal staking;
@@ -82,7 +83,9 @@ abstract contract V040Base is VoucherHelper, Events {
 
         staking.setVoucherSigner(_voucherSignerAddr());
         staking.setMaxExtraApyBps(MAX_EXTRA_APY_BPS);
-        staking.setMaxExtraLimit(MAX_EXTRA_LIMIT);
+        staking.setMaxExtraLimitTotal(MAX_EXTRA_LIMIT_TOTAL);
+        staking.setMaxExtraLimitPerCell(MAX_EXTRA_LIMIT_PER_CELL);
+        staking.setMaxVoucherValidity(VOUCHER_LIFETIME);
         staking.setTreasury(treasury);
         staking.setLimitController(address(controller));
 
@@ -115,6 +118,15 @@ abstract contract V040Base is VoucherHelper, Events {
         }
     }
 
+    /// @notice Base APY for a cell.
+    /// @dev GOTCHA: this is an EXTERNAL call, so it consumes a pending `vm.prank` or `vm.expectRevert`. Resolve it
+    ///      into a local BEFORE the cheatcode, never inline as an argument to the pranked call:
+    ///          uint256 apy = _baseApy(phase, period);   // <- first
+    ///          vm.prank(wallet);
+    ///          staking.stakeWithVoucher(v, sig, amount, apy);
+    ///      Inline, the prank lands on this staticcall and the stake arrives from the test contract, surfacing as
+    ///      VoucherWalletMismatch; with expectRevert it surfaces as "next call did not revert as expected". The
+    ///      same applies to `_now()` and any other helper that reaches out of the test contract.
     function _baseApy(uint256 phase, uint256 period) internal view returns (uint256) {
         return staking.phasePeriodDataList(Types.PhasePeriodDataType.APY, phase, period);
     }

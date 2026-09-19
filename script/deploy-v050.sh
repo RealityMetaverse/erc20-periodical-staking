@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Deploy ERC20PeriodicalStaking v0.4.0 + LimitController with script/DeployV040.s.sol.
+# Deploy ERC20PeriodicalStaking v0.5.0 + LimitController with script/DeployV050.s.sol.
 #
-#   ./script/deploy-v040.sh <network> [--broadcast]
+#   ./script/deploy-v050.sh <network> [--broadcast]
 #
-# Loads deploy/v040/<network>.env (and nothing else), checks the RPC is really that network, prints the
+# Loads deploy/v050/<network>.env (and nothing else), checks the RPC is really that network, prints the
 # non-secret settings and SIMULATES by default. Transactions are sent only with --broadcast.
 #
 # Secrets never reach forge's argv: PRIVATE_KEY and ETHERSCAN_API_KEY are passed as environment variables, and the
-# RPC URL through the `deploy-v040` alias in foundry.toml ([rpc_endpoints] deploy-v040 = "${RPC_URL}").
+# RPC URL through the `deploy-v050` alias in foundry.toml ([rpc_endpoints] deploy-v050 = "${RPC_URL}").
 set -euo pipefail
 
-die() { echo "deploy-v040: error: $*" >&2; exit 1; }
-warn() { echo "deploy-v040: WARNING: $*" >&2; }
+die() { echo "deploy-v050: error: $*" >&2; exit 1; }
+warn() { echo "deploy-v050: WARNING: $*" >&2; }
 
 usage() {
   echo "usage: $0 <polygon|amoy> [--broadcast]" >&2
@@ -38,21 +38,22 @@ case "$NETWORK" in
   *) die "unknown network '$NETWORK' (expected polygon or amoy)" ;;
 esac
 
-ENV_FILE="$ROOT/deploy/v040/$NETWORK.env"
+ENV_FILE="$ROOT/deploy/v050/$NETWORK.env"
 [ -f "$ENV_FILE" ] || die "missing $ENV_FILE
-  create it with: cp deploy/v040/$NETWORK.env.example deploy/v040/$NETWORK.env   (then fill in the placeholders)"
+  create it with: cp deploy/v050/$NETWORK.env.example deploy/v050/$NETWORK.env   (then fill in the placeholders)"
 
-# Variables DeployV040.s.sol reads. Every one is exported below, empty meaning "use the default"
+# Variables DeployV050.s.sol reads. Every one is exported below, empty meaning "use the default"
 # (the script treats an empty value as unset).
-SCRIPT_VARS=(SOURCE_STAKING REQUIREMENT_CHECKER_V2 VOUCHER_SIGNER TREASURY MAX_EXTRA_APY_BPS MAX_EXTRA_LIMIT
+SCRIPT_VARS=(SOURCE_STAKING REQUIREMENT_CHECKER_V2 VOUCHER_SIGNER TREASURY MAX_EXTRA_APY_BPS MAX_EXTRA_LIMIT_TOTAL
+  MAX_EXTRA_LIMIT_PER_CELL MAX_VOUCHER_VALIDITY
   NEW_OWNER ADMINS OPEN_STAKING REWARD_TOP_UP WALLET_LIMITS_FILE RESUME_STAKING RESUME_CONTROLLER PRIVATE_KEY)
 # Variables forge itself reads for this run (the rpc alias in foundry.toml, --verify).
 FORGE_VARS=(RPC_URL ETHERSCAN_API_KEY)
 # Wrapper-only settings.
-WRAPPER_VARS=(CHAIN_NAME DEPLOYER_ADDRESS DEPLOYER_ACCOUNT POLYGONSCAN_API_KEY FORGE_ARGS
+WRAPPER_VARS=(CHAIN_NAME DEPLOYER_ADDRESS DEPLOYER_ACCOUNT POLYGONSCAN_API_KEY FORGE_ARGS BACKEND_VALIDITY_SECONDS
   GAS_ESTIMATE_MULTIPLIER RPC_TIMEOUT TX_TIMEOUT VERIFY_RETRIES VERIFY_DELAY RPC_RETRIES RPC_RETRY_DELAY)
 
-# forge (and cast) auto-load $ROOT/.env without overriding variables already set. Anything DeployV040 or forge reads
+# forge (and cast) auto-load $ROOT/.env without overriding variables already set. Anything DeployV050 or forge reads
 # that is defined there could silently change this deployment, so refuse instead of warning.
 if [ -f "$ROOT/.env" ]; then
   ROOT_ENV_NAMES="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/p' "$ROOT/.env" | sort -u)"
@@ -66,7 +67,7 @@ if [ -f "$ROOT/.env" ]; then
   done
   if [ ${#CONFLICTS[@]} -gt 0 ]; then
     die "$ROOT/.env defines ${CONFLICTS[*]}.
-  forge auto-loads that file, so these could override or add to deploy/v040/$NETWORK.env for this deployment.
+  forge auto-loads that file, so these could override or add to deploy/v050/$NETWORK.env for this deployment.
   Remove them from $ROOT/.env (or move the file away) and run again."
   fi
   warn "$ROOT/.env exists; forge auto-loads it. It defines nothing this deployment reads, so it is ignored."
@@ -112,7 +113,7 @@ rpc_read() {
       return 0
     fi
     if [ "$attempt" -lt "${RPC_RETRIES:-3}" ]; then
-      echo "deploy-v040: RPC read failed (attempt $attempt/${RPC_RETRIES:-3}), retrying in ${RPC_RETRY_DELAY:-3}s..." >&2
+      echo "deploy-v050: RPC read failed (attempt $attempt/${RPC_RETRIES:-3}), retrying in ${RPC_RETRY_DELAY:-3}s..." >&2
       sleep "${RPC_RETRY_DELAY:-3}"
     fi
   done
@@ -128,7 +129,49 @@ fi
 need_addr VOUCHER_SIGNER
 need_addr TREASURY
 need_uint MAX_EXTRA_APY_BPS
-need_uint MAX_EXTRA_LIMIT
+need_uint MAX_EXTRA_LIMIT_TOTAL
+need_uint MAX_EXTRA_LIMIT_PER_CELL
+need_uint MAX_VOUCHER_VALIDITY
+# The contract rejects 0 (it would revert every stake and reads like "disabled" when it is the opposite).
+if [ "$MAX_VOUCHER_VALIDITY" = "0" ]; then
+  die "MAX_VOUCHER_VALIDITY must be non-zero in $ENV_FILE: 0 would make every voucher revert. This protection
+  has no off switch - lower the value instead."
+fi
+# Cross-repo: the backend signs vouchers with validUntil = now + validity_seconds (its model bounds it 60-1800).
+# It DOES read this ceiling on chain and refuses to sign with a 503 before allocating a nonce, exactly as it
+# does for the other three caps, so a ceiling below its setting fails closed rather than stranding users. This
+# check is defence in depth: it turns a whole-programme outage that nobody sees until the first stake attempt
+# into a deploy that stops. BACKEND_VALIDITY_SECONDS lets ops state the backend's real setting; without it the
+# only value that is safe for certain is the backend's hard maximum.
+BACKEND_VALIDITY_MAX=1800
+if [ -n "${BACKEND_VALIDITY_SECONDS:-}" ] && [[ "$BACKEND_VALIDITY_SECONDS" != *"<"* ]]; then
+  need_uint BACKEND_VALIDITY_SECONDS
+  [ "$BACKEND_VALIDITY_SECONDS" -ge 60 ] && [ "$BACKEND_VALIDITY_SECONDS" -le "$BACKEND_VALIDITY_MAX" ] ||
+    die "BACKEND_VALIDITY_SECONDS is $BACKEND_VALIDITY_SECONDS in $ENV_FILE, outside the 60-$BACKEND_VALIDITY_MAX range the
+  backend accepts for validity_seconds: this cannot be the backend's setting. Read it from the staking voucher
+  config (admin panel or StakingVoucherConfig.validity_seconds) and copy it verbatim."
+  if [ "$MAX_VOUCHER_VALIDITY" -lt "$BACKEND_VALIDITY_SECONDS" ]; then
+    die "MAX_VOUCHER_VALIDITY is $MAX_VOUCHER_VALIDITY but the backend signs vouchers valid for
+  BACKEND_VALIDITY_SECONDS=$BACKEND_VALIDITY_SECONDS ($ENV_FILE): every voucher would revert VoucherValidityTooLong
+  after the user paid for the approve. Raise MAX_VOUCHER_VALIDITY to at least $BACKEND_VALIDITY_SECONDS, or lower
+  the backend's validity_seconds first and update BACKEND_VALIDITY_SECONDS."
+  fi
+elif [ "$MAX_VOUCHER_VALIDITY" -lt "$BACKEND_VALIDITY_MAX" ]; then
+  BACKEND_VALIDITY_SECONDS=""
+  warn "MAX_VOUCHER_VALIDITY is $MAX_VOUCHER_VALIDITY and BACKEND_VALIDITY_SECONDS is not set, so this check is
+  WEAKER than it should be: without the backend's real validity_seconds the only value known to be safe is its
+  hard maximum of $BACKEND_VALIDITY_MAX, and $MAX_VOUCHER_VALIDITY is below that. If the backend is configured above
+  $MAX_VOUCHER_VALIDITY, every voucher will revert VoucherValidityTooLong after the user paid for the approve.
+  Set BACKEND_VALIDITY_SECONDS in $ENV_FILE to the backend's value and the wrapper refuses instead of warning."
+else
+  BACKEND_VALIDITY_SECONDS=""
+fi
+# A zero per-cell ceiling disables the voucher bonus outright (every voucher carrying a non-zero
+# extraLimitPerCell reverts). Catch it here rather than after the deploy. Set both to 0 to disable it on purpose.
+if [ "$MAX_EXTRA_LIMIT_PER_CELL" = "0" ] && [ "$MAX_EXTRA_LIMIT_TOTAL" != "0" ]; then
+  die "MAX_EXTRA_LIMIT_PER_CELL is 0 while MAX_EXTRA_LIMIT_TOTAL is $MAX_EXTRA_LIMIT_TOTAL in $ENV_FILE: no voucher could
+  ever spend its bonus. Set a per-cell ceiling, or set MAX_EXTRA_LIMIT_TOTAL to 0 to disable the bonus deliberately."
+fi
 for v in SOURCE_STAKING REQUIREMENT_CHECKER_V2 NEW_OWNER DEPLOYER_ADDRESS RESUME_STAKING RESUME_CONTROLLER; do
   if [ -n "${!v:-}" ]; then need_addr "$v"; fi
 done
@@ -146,9 +189,9 @@ if [ -n "${ADMINS:-}" ]; then
   done
 fi
 if [ -n "${WALLET_LIMITS_FILE:-}" ]; then
-  # foundry.toml only grants the script read access to deploy/v040/ (and the test fixtures).
-  [[ "$WALLET_LIMITS_FILE" == deploy/v040/* && "$WALLET_LIMITS_FILE" != *..* ]] ||
-    die "WALLET_LIMITS_FILE must be a relative path under deploy/v040/ (got '$WALLET_LIMITS_FILE')"
+  # foundry.toml only grants the script read access to deploy/v050/ (and the test fixtures).
+  [[ "$WALLET_LIMITS_FILE" == deploy/v050/* && "$WALLET_LIMITS_FILE" != *..* ]] ||
+    die "WALLET_LIMITS_FILE must be a relative path under deploy/v050/ (got '$WALLET_LIMITS_FILE')"
   [ -f "$ROOT/$WALLET_LIMITS_FILE" ] || die "WALLET_LIMITS_FILE $WALLET_LIMITS_FILE does not exist"
 fi
 if [ -n "${DEPLOYER_ACCOUNT:-}" ] && [[ "$DEPLOYER_ACCOUNT" == *"<"* ]]; then DEPLOYER_ACCOUNT=""; fi
@@ -180,6 +223,13 @@ done
   die "GAS_ESTIMATE_MULTIPLIER must be at least 100 (100 = the bare estimate, no headroom); got $GAS_ESTIMATE_MULTIPLIER"
 
 cd "$ROOT"
+
+# Size gate. `forge script` and `forge test` do not enforce the 24,576-byte EIP-170 runtime limit, so an oversized
+# contract is otherwise found out on chain, as a failed deployment. v0.5.0 was 957 bytes over for a while with
+# every test green.
+echo "=== contract size check (EIP-170 limit: 24576 bytes) ==="
+forge build --sizes --skip "test/**" --skip "script/**" >/dev/null 2>&1 \
+  || die "a contract is over the 24,576-byte runtime limit (or src does not compile) and cannot be deployed. See: forge build --sizes --skip 'test/**' --skip 'script/**'"
 
 # The RPC must be the network the env file is for. ETH_RPC_URL keeps the URL out of cast's argv.
 rpc_read chain-id ||
@@ -267,17 +317,20 @@ fi
 
 RPC_HOST="$(printf '%s' "$RPC_URL" | sed -E 's#^([a-z]+://[^/?]+).*#\1#')"
 show() { printf '  %-24s %s\n' "$1" "$2"; }
-echo "=== deploy-v040: $NETWORK ==="
+echo "=== deploy-v050: $NETWORK ==="
 show "env file" "${ENV_FILE#"$ROOT"/}"
 show "chain id" "$CHAIN_ID"
-show "rpc" "$RPC_HOST/... (alias deploy-v040)"
+show "rpc" "$RPC_HOST/... (alias deploy-v050)"
 show "mode" "$($BROADCAST && echo 'BROADCAST' || echo 'simulation (no transactions)')"
-show "SOURCE_STAKING" "${SOURCE_STAKING:-<empty: per-chain table in DeployV040.s.sol>}"
-show "REQUIREMENT_CHECKER_V2" "${REQUIREMENT_CHECKER_V2:-<empty: per-chain table in DeployV040.s.sol>}"
+show "SOURCE_STAKING" "${SOURCE_STAKING:-<empty: per-chain table in DeployV050.s.sol>}"
+show "REQUIREMENT_CHECKER_V2" "${REQUIREMENT_CHECKER_V2:-<empty: per-chain table in DeployV050.s.sol>}"
 show "VOUCHER_SIGNER" "$VOUCHER_SIGNER"
 show "TREASURY" "$TREASURY"
 show "MAX_EXTRA_APY_BPS" "$MAX_EXTRA_APY_BPS"
-show "MAX_EXTRA_LIMIT" "$MAX_EXTRA_LIMIT"
+show "MAX_EXTRA_LIMIT_TOTAL" "$MAX_EXTRA_LIMIT_TOTAL"
+show "MAX_EXTRA_LIMIT_PER_CELL" "$MAX_EXTRA_LIMIT_PER_CELL"
+show "MAX_VOUCHER_VALIDITY" "$MAX_VOUCHER_VALIDITY seconds"
+show "BACKEND_VALIDITY_SECONDS" "${BACKEND_VALIDITY_SECONDS:-<not set: checked only against the backend hard maximum of $BACKEND_VALIDITY_MAX>}"
 show "NEW_OWNER" "${NEW_OWNER:-<empty: 0x0000000000000000000000000000000000000000, deployer keeps ownership>}"
 show "ADMINS" "${ADMINS:-<empty: none>}"
 show "OPEN_STAKING" "${OPEN_STAKING:-false (empty: default)}"
@@ -296,12 +349,12 @@ show "rpc timeout" "${RPC_TIMEOUT}s per request (RPC_TIMEOUT)"
 show "receipt timeout" "$($BROADCAST && echo "${TX_TIMEOUT}s (TX_TIMEOUT)" || echo 'n/a (simulation)')"
 show "verify retries" "$([ ${#VERIFY_ARGS[@]} -gt 0 ] && echo "$VERIFY_RETRIES every ${VERIFY_DELAY}s (VERIFY_RETRIES/VERIFY_DELAY)" || echo 'n/a (not verifying)')"
 show "forge flags" "${ROBUST_ARGS[*]} ${EXTRA_ARGS[*]+${EXTRA_ARGS[*]}}"
-echo "  CHECK: the script prints its resolved settings under '=== DeployV040: source (v0.2.4) ===' (source staking,"
+echo "  CHECK: the script prints its resolved settings under '=== DeployV050: source (v0.2.4) ===' (source staking,"
 echo "  RequirementCheckerV2, voucher signer, treasury, caps, new owner, admins, open staking, reward top-up, wallet"
 echo "  limits file). They must equal the values above; if anything differs, stop and do not broadcast."
 echo
 
-CMD=("$FORGE" script script/DeployV040.s.sol --rpc-url deploy-v040 "${SIGN_ARGS[@]}" "${ROBUST_ARGS[@]}" "${EXTRA_ARGS[@]}")
+CMD=("$FORGE" script script/DeployV050.s.sol --rpc-url deploy-v050 "${SIGN_ARGS[@]}" "${ROBUST_ARGS[@]}" "${EXTRA_ARGS[@]}")
 if $BROADCAST; then CMD+=(--broadcast "${VERIFY_ARGS[@]}"); fi
 
 exec "${CMD[@]}"

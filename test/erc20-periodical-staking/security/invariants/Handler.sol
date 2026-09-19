@@ -83,6 +83,21 @@ contract Handler is VoucherHelper {
     uint256[] internal everSeenPeriods;
     mapping(uint256 => bool) internal seenPeriod;
 
+    /// @dev Every (user, phase, period) STAKING cell a successful stake has written to, and every (phase, period)
+    ///      pair with at least one such cell. The per-call sum checks read only these cells; the full grid
+    ///      (users x phases x every period ever seen) is read once per run in InvariantBase.afterInvariant(),
+    ///      which is what catches a write into a cell nobody staked into.
+    struct StakingCell {
+        address user;
+        uint256 phase;
+        uint256 period;
+    }
+
+    StakingCell[] internal touchedCells;
+    mapping(address => mapping(uint256 => mapping(uint256 => bool))) internal cellTouched;
+    uint256[2][] internal touchedPhasePeriods;
+    mapping(uint256 => mapping(uint256 => bool)) internal phasePeriodTouched;
+
     /// @dev Reverts that no precondition explains. Must stay empty.
     string[] public ghost_unexpectedReverts;
     /// @dev Payout mismatches versus what the deposit committed to. Must stay zero.
@@ -190,6 +205,16 @@ contract Handler is VoucherHelper {
         return everSeenPeriods;
     }
 
+    /// @notice Every (user, phase, period) STAKING cell a stake ever wrote to.
+    function getTouchedCells() external view returns (StakingCell[] memory) {
+        return touchedCells;
+    }
+
+    /// @notice Every (phase, period) pair with at least one touched STAKING cell.
+    function getTouchedPhasePeriods() external view returns (uint256[2][] memory) {
+        return touchedPhasePeriods;
+    }
+
     /// @notice block.timestamp behind an external call. With via_ir the optimizer rematerializes a
     ///         `block.timestamp` local at its use site, so a value captured before vm.warp / vm.revertTo
     ///         can silently change; an external call result cannot be rematerialized.
@@ -266,6 +291,7 @@ contract Handler is VoucherHelper {
         }
         if (ok) {
             ghost_userIn += amount;
+            _markCellTouched(user, phase, period);
         } else {
             if (!ghost_actionOpen[0]) {
                 _expectSelector("stake_notOpen", "stake", reason, Errors.NotOpen.selector);
@@ -810,6 +836,17 @@ contract Handler is VoucherHelper {
             }
         }
         return bound(seed >> 16, 0, MAX_PERIOD_DAYS);
+    }
+
+    function _markCellTouched(address user, uint256 phase, uint256 period) internal {
+        if (!cellTouched[user][phase][period]) {
+            cellTouched[user][phase][period] = true;
+            touchedCells.push(StakingCell({user: user, phase: phase, period: period}));
+        }
+        if (!phasePeriodTouched[phase][period]) {
+            phasePeriodTouched[phase][period] = true;
+            touchedPhasePeriods.push([phase, period]);
+        }
     }
 
     function _markPeriodSeen(uint256 period) internal {

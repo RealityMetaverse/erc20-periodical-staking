@@ -15,7 +15,7 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard, EIP
     using ArrayLibrary for uint256[];
 
     bytes32 public constant VOUCHER_TYPEHASH = keccak256(
-        "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimit,uint256 validUntil,uint256 nonce)"
+        "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)"
     );
 
     // ======================================
@@ -34,7 +34,15 @@ abstract contract ComplianceCheck is AccessControl, Events, ReentrancyGuard, EIP
         return _hashTypedDataV4(
             keccak256(
                 abi.encode(
-                    VOUCHER_TYPEHASH, v.wallet, v.phase, v.period, v.extraApyBps, v.extraLimit, v.validUntil, v.nonce
+                    VOUCHER_TYPEHASH,
+                    v.wallet,
+                    v.phase,
+                    v.period,
+                    v.extraApyBps,
+                    v.extraLimitTotal,
+                    v.extraLimitPerCell,
+                    v.validUntil,
+                    v.nonce
                 )
             )
         );

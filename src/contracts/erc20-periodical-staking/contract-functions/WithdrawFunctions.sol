@@ -61,6 +61,8 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
             depositAmount,
             depositReward
         );
+        // The principal has left the staking counters, so the bonus it consumed goes back to the budget.
+        _releaseBonus(msg.sender, depositNumber, targetDeposit.stakingPhase, targetDeposit.stakingPeriod);
         _updateActiveDepositStartIndex(msg.sender);
 
         emit Withdraw(msg.sender, depositNumber, depositAmount, depositReward);

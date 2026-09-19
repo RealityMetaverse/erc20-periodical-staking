@@ -55,7 +55,21 @@ abstract contract Events {
 
     event UpdateVoucherSigner(address indexed signer);
     event UpdateMaxExtraApyBps(uint256 maxExtraApyBps);
-    event UpdateMaxExtraLimit(uint256 maxExtraLimit);
+    event UpdateMaxExtraLimitTotal(uint256 maxExtraLimitTotal);
+    event UpdateMaxExtraLimitPerCell(uint256 maxExtraLimitPerCell);
+    /// @param validitySeconds Furthest ahead of now a voucher's validUntil may sit, in seconds.
+    event UpdateMaxVoucherValidity(uint256 validitySeconds);
+    /// @notice Emitted when a wallet is barred from, or restored to, opening new stakes.
+    event UpdateWalletBlocked(address indexed wallet, bool blocked);
+
+    /// @notice Emitted when a stake spends part of the wallet's voucher bonus budget (above its controller limit).
+    event BonusConsumed(
+        address indexed wallet, uint256 indexed phase, uint256 period, uint256 depositNumber, uint256 amount
+    );
+    /// @notice Emitted when closing a deposit returns the bonus it consumed to the wallet's budget.
+    event BonusReleased(
+        address indexed wallet, uint256 indexed phase, uint256 period, uint256 depositNumber, uint256 amount
+    );
     event UpdateTreasury(address indexed treasury);
 
     event FreezeDeposit(address indexed wallet, uint256 indexed depositNumber, address indexed by);

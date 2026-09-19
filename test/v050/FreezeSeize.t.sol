@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./V040Base.sol";
+import "./V050Base.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 /// @notice Freeze / unfreeze / seize for v0.4.0: access control, blocking of claim and withdraw, batch-claim
 ///         skipping, principal-only seizes (periodical releases its reservation, indefinite leaves its accrual in
 ///         the pool, the reward pool is never touched), close accounting, batches and events.
-contract FreezeSeizeTest is V040Base {
+contract FreezeSeizeTest is V050Base {
     bytes4 internal constant UNAUTHORIZED = bytes4(keccak256("UnauthorizedAccess(uint8)"));
     uint8 internal constant TIER_ADMIN = 0;
     uint8 internal constant TIER_OWNER = 1;
@@ -620,7 +620,7 @@ contract FreezeSeizeTest is V040Base {
         // Views: no unpaid accrual, now or later.
         assertEq(uint256(_status(alice, n)), uint256(ProgramManager.DepositStatus.SEIZED));
         assertEq(_deposit(alice, n).rewardGenerated, 0, "getDeposit shows no accrual");
-        assertEq(staking.getDepositsInRangeBy(alice, 0, 1)[0].rewardGenerated, 0, "range view shows no accrual");
+        assertEq(_lens(staking).getDepositsInRangeBy(alice, 0, 1)[0].rewardGenerated, 0, "range view shows no accrual");
         (,, uint256 cIndef) = staking.checkClaimableDataFor(alice);
         assertEq(cIndef, 0);
 
@@ -638,7 +638,7 @@ contract FreezeSeizeTest is V040Base {
         _assertSeizedPaysNothing(alice, n);
         _warpDays(365);
         assertEq(_deposit(alice, n).rewardGenerated, 0, "no accrual after seize");
-        assertEq(staking.getDepositsInRangeBy(alice, 0, 1)[0].rewardGenerated, 0);
+        assertEq(_lens(staking).getDepositsInRangeBy(alice, 0, 1)[0].rewardGenerated, 0);
         _assertConservation();
     }
 

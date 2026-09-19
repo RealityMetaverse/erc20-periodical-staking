@@ -75,8 +75,21 @@ contract ProgramManager is Errors {
 
     // Slot C
     uint128 public minimumDeposit;
-    /// @notice Highest extra limit a voucher may carry.
-    uint128 public maxExtraLimit;
+    /// @notice Highest total extra limit (bonus budget) a voucher may carry, across all phases.
+    uint128 public maxExtraLimitTotal;
+
+    // Slot D
+    /// @notice Highest per-cell extra limit a voucher may carry. Hard ceiling on blast radius in any one cell.
+    /// @dev Slot C (minimumDeposit + maxExtraLimitTotal) is already full, and every other slot is packed deliberately,
+    ///      so this takes a fresh slot rather than disturbing an existing one. This is a new deployment, not an
+    ///      upgrade, so there is no layout to preserve. maxVoucherValidity shares this slot; see its note below
+    ///      for the running byte count.
+    uint128 public maxExtraLimitPerCell;
+    /// @notice Furthest ahead of now a voucher's `validUntil` may sit, in seconds. Never 0: the constructor
+    ///         defaults it to 1800 and the setter rejects 0, so this protection cannot be switched off.
+    /// @dev Shares slot D with maxExtraLimitPerCell: 16 + 4 = 20 of 32 bytes used, 12 still free. uint32 of
+    ///      seconds is ~136 years, far beyond any sane voucher lifetime.
+    uint32 public maxVoucherValidity;
 
     /// @notice Receiver of seized deposits.
     address public treasury;
@@ -97,10 +110,48 @@ contract ProgramManager is Errors {
     mapping(Types.DataType => uint256) public totalDataList;
     mapping(address wallet => mapping(uint256 word => uint256 bitmap)) internal voucherNonceBitmap;
 
+    /// @notice Wallets barred from opening NEW stakes. Does not touch existing deposits.
+    /// @dev A block stops staking ONLY. Withdraw, claim, and every other exit stay open to a blocked wallet --
+    ///      a block must never trap funds. Do not "tighten" this into a lock.
+    ///      This exists because it is the only lever that still works when the voucher SIGNING KEY is
+    ///      compromised: the attacker signs their own vouchers, so the backend's issuance blocklist is useless,
+    ///      and the limit controller cannot tell the attacker's stake from a legitimate one.
+    mapping(address wallet => bool) public walletBlocked;
+
+    // ======================================
+    // =        Voucher Bonus Metering      =
+    // ======================================
+    /// @dev Bonus consumed by a wallet, i.e. how much of the voucher's `extraLimitTotal` it currently holds
+    ///      open. ONE budget for the wallet across EVERY phase: advancing the phase does not refill it.
+    ///      CONCURRENT, not lifetime: closing a deposit returns its bonus here, exactly as the LimitController's
+    ///      own limits free up when stake leaves. So a wallet can spend its 50,000 many times over the life of
+    ///      the program, but never hold more than 50,000 of bonus open at once.
+    mapping(address wallet => uint256) internal walletBonusUsed;
+    /// @dev Bonus consumed by a wallet within one CELL, against `extraLimitPerCell`. A cell is (phase, period):
+    ///      the same period in a different phase is a different cell with its own cap, exactly as the
+    ///      LimitController keys `allowed` and `used`.
+    ///      The asymmetry with walletBonusUsed -- total global, cell per (phase, period) -- is the product
+    ///      model, not an oversight. It also makes this the right number to subtract from the controller's
+    ///      `used`, which describes the same cell. Do not re-scope one without the other: a meter keyed more
+    ///      widely than `used` floors that subtraction at 0 while the cell already holds base stake, and hands
+    ///      the wallet its whole base allowance again at every phase change.
+    mapping(uint256 phase => mapping(uint256 period => mapping(address wallet => uint256))) internal
+        walletBonusUsedInCell;
+    /// @dev Bonus attributable to one deposit, so closing it releases exactly what it consumed.
+    mapping(address wallet => mapping(uint256 depositNumber => uint256)) internal depositBonusUsed;
+
     constructor(IERC20Metadata tokenAddress) {
         if (address(tokenAddress) == address(0)) revert ZeroAddressProvided();
         STAKING_TOKEN = tokenAddress;
         minimumDeposit = 100;
+        // Never leave this at 0: setMaxVoucherValidity rejects 0 because it makes every stake revert, so the
+        // contract must not be born in the one state its own setter forbids. 1800 is the maximum the backend's
+        // own validity_seconds can be configured to (bounded 60-1800 in staking_voucher/constants.py), so this
+        // default can never reject a voucher the backend is able to sign, and never allows a window wider than
+        // the backend's own ceiling. The deploy script still requires MAX_VOUCHER_VALIDITY explicitly and
+        // asserts it afterwards. This is a safety net for a deployment made outside that script -- a fork test,
+        // a local anvil run, a hand deploy -- NOT the operational value. Ops sets that.
+        maxVoucherValidity = 1800;
 
         stakingOpen = true;
         withdrawalOpen = true;

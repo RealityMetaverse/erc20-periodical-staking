@@ -4,7 +4,7 @@ pragma solidity 0.8.20;
 import {Test} from "forge-std/Test.sol";
 import {console2} from "forge-std/console2.sol";
 
-import {DeployV040} from "../../script/DeployV040.s.sol";
+import {DeployV050} from "../../script/DeployV050.s.sol";
 import {LimitController} from "../../src/contracts/LimitController.sol";
 
 interface IVmSkipWL {
@@ -22,13 +22,13 @@ interface ILegacyLimitControllerWL {
 
 /// @notice WALLET_LIMITS_FILE end to end on a fork: the source controller's owner sets wallet limits, the script
 ///         loads a CRLF CSV fixture of them, deploys, and the new controller must allow exactly what the old one does.
-/// @dev Opt-in like DeployV040Fork.t.sol (FORK_RPC_URL / POLYGON_RPC_URL, optional FORK_BLOCK). The fixture only
+/// @dev Opt-in like DeployV050Fork.t.sol (FORK_RPC_URL / POLYGON_RPC_URL, optional FORK_BLOCK). The fixture only
 ///      uses phase 0 / period 0, the one cell configured on both Polygon and Amoy.
-contract DeployV040ForkWalletLimitsTest is Test {
+contract DeployV050ForkWalletLimitsTest is Test {
     IVmSkipWL private constant VM_SKIP = IVmSkipWL(address(uint160(uint256(keccak256("hevm cheat code")))));
 
-    string internal constant FIXTURE = "test/v040/fixtures/wallet-limits-crlf.csv";
-    string internal constant FIXTURE_MISMATCH = "test/v040/fixtures/wallet-limits-mismatch.csv";
+    string internal constant FIXTURE = "test/v050/fixtures/wallet-limits-crlf.csv";
+    string internal constant FIXTURE_MISMATCH = "test/v050/fixtures/wallet-limits-mismatch.csv";
 
     // Rows of FIXTURE, in file order. W2 is the limit-0 row (never set on chain).
     address internal constant W1 = 0x000000000000000000000000000000000000a001;
@@ -40,13 +40,13 @@ contract DeployV040ForkWalletLimitsTest is Test {
     uint256 internal constant L4 = 1;
 
     bool internal forkOn;
-    DeployV040 internal script;
-    DeployV040.OldConfig internal old;
+    DeployV050 internal script;
+    DeployV050.OldConfig internal old;
     ILegacyLimitControllerWL internal oldController;
 
     modifier onlyFork() {
         if (!forkOn) {
-            console2.log("DeployV040ForkWalletLimitsTest skipped: set FORK_RPC_URL (or POLYGON_RPC_URL)");
+            console2.log("DeployV050ForkWalletLimitsTest skipped: set FORK_RPC_URL (or POLYGON_RPC_URL)");
             VM_SKIP.skip(true);
             return;
         }
@@ -61,7 +61,7 @@ contract DeployV040ForkWalletLimitsTest is Test {
         else vm.createSelectFork(rpc, forkBlock);
         forkOn = true;
 
-        script = new DeployV040();
+        script = new DeployV050();
         address source = vm.envOr("SOURCE_STAKING", script.sourceStakingFor(block.chainid));
         require(source != address(0), "no source staking contract for this chain; set SOURCE_STAKING");
         old = script.readOldConfig(source);
@@ -80,10 +80,10 @@ contract DeployV040ForkWalletLimitsTest is Test {
     function test_fork_walletLimitsFileCopiedExactly() external onlyFork {
         assertTrue(_contains(bytes(vm.readFile(FIXTURE)), "\r\n"), "fixture lost its CRLF line endings");
 
-        DeployV040.WalletLimitRow[] memory rows = script.loadWalletLimits(FIXTURE, old);
+        DeployV050.WalletLimitRow[] memory rows = script.loadWalletLimits(FIXTURE, old);
         assertEq(rows.length, 3, "limit-0 row dropped, header/comment/blank skipped");
 
-        (, DeployV040.Deployment memory d) = script.deployFrom(_params(old.staking), rows);
+        (, DeployV050.Deployment memory d) = script.deployFrom(_params(old.staking), rows);
         LimitController c = d.controller;
 
         address[4] memory all = [W1, W2, W3, W4];
@@ -103,7 +103,7 @@ contract DeployV040ForkWalletLimitsTest is Test {
         vm.expectRevert(
             bytes(
                 string.concat(
-                    "DeployV040: wallet limit line 2 does not match the source controller (on-chain ",
+                    "DeployV050: wallet limit line 2 does not match the source controller (on-chain ",
                     vm.toString(L1),
                     ")"
                 )
@@ -112,14 +112,16 @@ contract DeployV040ForkWalletLimitsTest is Test {
         script.loadWalletLimits(FIXTURE_MISMATCH, old);
     }
 
-    function _params(address source) internal returns (DeployV040.Params memory p) {
-        p = DeployV040.Params({
+    function _params(address source) internal returns (DeployV050.Params memory p) {
+        p = DeployV050.Params({
             sourceStaking: source,
             requirementCheckerV2: script.requirementCheckerV2For(block.chainid),
             voucherSigner: makeAddr("voucherSigner"),
             treasury: makeAddr("treasury"),
             maxExtraApyBps: 500,
-            maxExtraLimit: 50_000e18,
+            maxExtraLimitTotal: 50_000e18,
+            maxExtraLimitPerCell: 50_000e18,
+            maxVoucherValidity: 1 days,
             newOwner: address(0),
             admins: new address[](0),
             openStaking: false,

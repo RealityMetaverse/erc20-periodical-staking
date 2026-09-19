@@ -111,9 +111,9 @@ contract AdminAbuseTest is VoucherAttackBase {
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, P30, 1_000 * ONE);
 
         // views that subtract staked from target saturate instead of underflowing
-        staking.getRewardRequiredForTargets();
-        staking.getRewardPoolShortfall();
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getRewardRequiredForTargets();
+        _lens(staking).getRewardPoolShortfall();
+        _lens(staking).getProgramDataWithUserData(alice);
 
         _expectStakeRevert(
             bob, 0, P30, 100, _apy(0, P30), abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, P30, 1_000 * ONE)
@@ -271,7 +271,7 @@ contract AdminAbuseTest is VoucherAttackBase {
         assertEq(_total(Types.DataType.REWARD_EXPECTED), reward);
         assertEq(staking.rewardPool(), 0, "no stake-time pool check");
         assertEq(staking.getCollectableReward(), 0);
-        assertGe(staking.getRewardPoolShortfall(), reward, "shortfall counts the existing deficit");
+        assertGe(_lens(staking).getRewardPoolShortfall(), reward, "shortfall counts the existing deficit");
         // the owner cannot take reward promised to an open deposit, even though the pool holds nothing
         vm.expectRevert(abi.encodeWithSelector(Errors.RewardPoolBelowReserved.selector, 1, 0));
         staking.collectReward(1);
@@ -291,7 +291,7 @@ contract AdminAbuseTest is VoucherAttackBase {
         uint256 b = _stake(bob, 0, P30, 1_000 * ONE);
         assertEq(_total(Types.DataType.REWARD_EXPECTED), 2 * reward);
         assertEq(staking.rewardPool(), reward, "pool below REWARD_EXPECTED is allowed");
-        assertGe(staking.getRewardPoolShortfall(), reward);
+        assertGe(_lens(staking).getRewardPoolShortfall(), reward);
         _assertAccounting();
 
         _warpDays(31);
@@ -628,8 +628,9 @@ contract AdminAbuseTest is VoucherAttackBase {
         staking.setLimitController(rando);
 
         _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), "");
+        _lens(staking);
         vm.expectRevert();
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getProgramDataWithUserData(alice);
         staking.getProgramData(); // does not consult the controller
 
         _warpDays(30);
@@ -639,13 +640,13 @@ contract AdminAbuseTest is VoucherAttackBase {
         _expectStakeRevert(
             alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(Errors.LimitControllerNotSet.selector)
         );
-        (,,,,, uint256[][] memory limits, uint256[][] memory remaining) = staking.getProgramDataWithUserData(alice);
+        (,,,,, uint256[][] memory limits, uint256[][] memory remaining) = _lens(staking).getProgramDataWithUserData(alice);
         assertEq(limits[0][1], 0, "no controller => zero-filled limits");
         assertEq(remaining[0][1], 0, "no controller => zero-filled remaining (no whole-pool fallback)");
 
         staking.setLimitController(address(new OpenLimitController(address(staking))));
         _stake(alice, 0, P30, 1_000 * ONE);
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getProgramDataWithUserData(alice);
         _assertAccounting();
     }
 
@@ -660,7 +661,7 @@ contract AdminAbuseTest is VoucherAttackBase {
             alice, 0, P30, 1_000 * ONE, _apy(0, P30), abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector)
         );
         staking.getProgramData();
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getProgramDataWithUserData(alice);
         staking.checkClaimableDataFor(alice);
 
         _warpDays(30);

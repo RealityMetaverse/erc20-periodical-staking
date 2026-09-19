@@ -5,14 +5,27 @@ libs = ["lib"]
 optimizer = true
 optimizer_runs = 200
 via_ir = true
-# Read-only: lets script/DeployV040.s.sol load an optional WALLET_LIMITS_FILE (deploy/v040/) and its fork test
+# Read-only: lets script/DeployV050.s.sol load an optional WALLET_LIMITS_FILE (deploy/v050/) and its fork test
 # load the CSV fixtures. Nothing else is readable from Solidity.
 fs_permissions = [
-  { access = "read", path = "./deploy/v040" },
-  { access = "read", path = "./test/v040/fixtures" },
+  { access = "read", path = "./deploy/v050" },
+  { access = "read", path = "./test/v050/fixtures" },
 ]
+# Day-to-day speed. Compiling all 85 test files takes ~29 min (one solc process, via_ir) and the 32 invariant
+# campaigns run ~13 min, so the default profile avoids both:
+#   - sparse_mode: `forge test --match-path <file>` compiles only that file and its imports (1-2.5 min cold).
+#   - no_match_path: plain `forge test` leaves the invariant campaigns out.
+# Compiler settings are untouched, so the shipped bytecode is identical in every profile.
+# The full run is `FOUNDRY_PROFILE=full forge test`; CI runs it on every pull request to main.
+sparse_mode = true
+no_match_path = "test/erc20-periodical-staking/security/invariants/**"
 
-# script/deploy-v040.sh passes `--rpc-url deploy-v040` so the RPC URL (which may hold a provider key) stays out of
+# Everything: all test files compiled, invariant campaigns included. Used by CI and before a release.
+[profile.full]
+sparse_mode = false
+no_match_path = "test/__none__/**"
+
+# script/deploy-v050.sh passes `--rpc-url deploy-v050` so the RPC URL (which may hold a provider key) stays out of
 # forge's argv. Only resolved when that alias is used.
 [rpc_endpoints]
-deploy-v040 = "${RPC_URL}"
+deploy-v050 = "${RPC_URL}"

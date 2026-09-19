@@ -51,6 +51,43 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     }
 
     // ======================================
+    // =            Wallet Block            =
+    // ======================================
+    /// @notice Bar a wallet from opening new stakes, or restore it. Admins and the owner.
+    /// @dev Stakes ONLY. A blocked wallet keeps every exit: withdraw, withdrawDepositPartial, claim, claimAll,
+    ///      claimRange all work exactly as before, and its open deposits keep accruing. A block must never trap
+    ///      funds -- if you are here to "tighten" it into a lock, that is a different feature with a different
+    ///      risk profile, and freeze/seize already cover holding a specific deposit.
+    ///      onlyAdmins, matching freeze rather than seize: a block is reversible and takes nobody's money, and
+    ///      it is a security response where waiting on the owner key may be too slow. Seize moves funds, so it
+    ///      stays owner-only.
+    ///      This is the last lever standing if the voucher SIGNING KEY leaks: the attacker mints their own
+    ///      vouchers, so the backend's issuance blocklist never sees them, and the limit controller cannot tell
+    ///      their stake from anyone else's. Blocking the wallet on-chain is what stops it.
+    function setWalletBlocked(address wallet, bool blocked) external onlyAdmins {
+        _setWalletBlocked(wallet, blocked);
+    }
+
+    /// @notice Block or unblock many wallets in one transaction. Admins and the owner.
+    /// @dev All wallets get the same `blocked` value. Unbounded loop: the caller chooses the batch size.
+    function setWalletsBlocked(address[] calldata wallets, bool blocked) external onlyAdmins {
+        uint256 len = wallets.length;
+        for (uint256 i = 0; i < len;) {
+            _setWalletBlocked(wallets[i], blocked);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Writes and emits unconditionally, so an ops replay is idempotent and always leaves a log line.
+    function _setWalletBlocked(address wallet, bool blocked) private {
+        if (wallet == address(0)) revert ZeroAddressProvided();
+        walletBlocked[wallet] = blocked;
+        emit UpdateWalletBlocked(wallet, blocked);
+    }
+
+    // ======================================
     // =                Seize               =
     // ======================================
     /// @notice Seize a frozen deposit to the treasury. Owner only.
@@ -139,6 +176,9 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
         d.flags = FLAG_SEIZED;
 
         _updateAllDataAfterAction(Types.DataType.WITHDRAWAL, wallet, d.stakingPhase, d.stakingPeriod, principal, 0);
+        // Seizing closes the deposit, so its bonus returns to the wallet's budget. `wallet`, not msg.sender:
+        // the caller here is the owner, not the staker.
+        _releaseBonus(wallet, depositNumber, d.stakingPhase, d.stakingPeriod);
         _updateActiveDepositStartIndex(wallet);
 
         emit SeizeDeposit(wallet, depositNumber, to, principal);

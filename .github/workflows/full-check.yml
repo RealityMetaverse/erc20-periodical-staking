@@ -1,0 +1,52 @@
+# The heavy run: every test file compiled and all 32 invariant campaigns at full depth (256 runs x 500 calls).
+# Locally this is ~45 minutes, so nobody runs it day to day (see the default profile in foundry.toml).
+# It runs here instead, on every pull request to main, and can be started by hand from the Actions tab.
+name: full-check
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: full-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_PROFILE: full
+
+jobs:
+  full-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      # forge-std lives inside the OpenZeppelin submodule, so the checkout must be recursive.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+
+      # Compiling is the slow part (~30 min from nothing). With the previous build restored, forge only recompiles
+      # the files that changed.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            out
+            cache
+          key: forge-build-${{ hashFiles('foundry.toml') }}-${{ hashFiles('src/**/*.sol', 'test/**/*.sol', 'script/**/*.sol') }}
+          restore-keys: |
+            forge-build-${{ hashFiles('foundry.toml') }}-
+
+      # Neither `forge build` nor `forge test` fails on a contract above the 24,576-byte EIP-170 limit; only --sizes
+      # does. v0.5.0 sat 957 bytes over that limit with every test green, so this gate is not optional.
+      - name: Contract size gate (EIP-170)
+        run: forge build --sizes --skip "test/**" --skip "script/**"
+
+      - name: Build everything
+        run: forge build
+
+      - name: Run every test, invariant campaigns included
+        run: forge test
