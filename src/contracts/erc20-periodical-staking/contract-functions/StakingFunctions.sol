@@ -10,8 +10,12 @@ import "../../../common/Types.sol";
 abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
     /// @notice Open a deposit authorised by a backend-signed voucher.
     /// @dev The voucher fixes the phase and period; its extraApyBps is added to the base APY for the deposit's
-    ///      whole life and its extraLimit is added to the controller limit for this stake only. The signature is
-    ///      checked with SignatureChecker, so a contract signer (ERC-1271) works too.
+    ///      whole life. Its extraLimitTotal / extraLimitPerCell are a bonus BUDGET, not a per-stake grant: the
+    ///      part of this stake that goes above the wallet's controller limit is metered against them, so
+    ///      re-presenting a voucher (or issuing a fresh one with the same numbers) never hands the bonus out
+    ///      twice. One budget covers every phase, and it is concurrent -- closing the deposit frees it again,
+    ///      but advancing the phase does not refill it. The signature is checked with SignatureChecker, so a
+    ///      contract signer (ERC-1271) works too.
     ///      No reward-pool check is performed at stake time. Periodical deposits (period != 0) add their full
     ///      reward to `totalDataList[REWARD_EXPECTED]`, which `collectReward` can never take from the pool; if the
     ///      pool is short when the deposit matures, `claimDeposit` reverts `NotEnoughFundsInRewardPool` until the
@@ -28,6 +32,9 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
         uint256 expectedApyBps
     ) external nonReentrant returns (uint256 depositNumber) {
         if (!stakingOpen) revert NotOpen(Types.DataType.STAKING);
+        // First, before the nonce is consumed and before any storage read that costs real gas. A blocked wallet
+        // must not be able to burn a nonce or pay for work it can never complete.
+        if (walletBlocked[msg.sender]) revert WalletBlocked(msg.sender);
         address controller = limitController;
 
         address signer = voucherSigner;
@@ -35,6 +42,15 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
         if (controller == address(0)) revert LimitControllerNotSet();
         if (voucher.wallet != msg.sender) revert VoucherWalletMismatch(voucher.wallet, msg.sender);
         if (block.timestamp > voucher.validUntil) revert VoucherExpired(voucher.validUntil, block.timestamp);
+        // Bounds validUntil relative to NOW, not to issuance time (which the voucher does not carry). Stateless
+        // and self-enforcing: an old voucher with little time left still passes, a long-dated one never does,
+        // so a leaked signer key cannot mint vouchers good for years.
+        {
+            uint256 maxValidUntil = block.timestamp + maxVoucherValidity;
+            if (voucher.validUntil > maxValidUntil) {
+                revert VoucherValidityTooLong(voucher.validUntil, maxValidUntil);
+            }
+        }
 
         uint256 word = voucher.nonce >> 8;
         uint256 mask = 1 << (voucher.nonce & 0xff);
@@ -42,7 +58,12 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
         if ((bitmap & mask) != 0) revert VoucherNonceUsed(msg.sender, voucher.nonce);
 
         if (voucher.extraApyBps > maxExtraApyBps) revert VoucherExtraApyTooHigh(voucher.extraApyBps, maxExtraApyBps);
-        if (voucher.extraLimit > maxExtraLimit) revert VoucherExtraLimitTooHigh(voucher.extraLimit, maxExtraLimit);
+        if (voucher.extraLimitTotal > maxExtraLimitTotal) {
+            revert VoucherExtraLimitTotalTooHigh(voucher.extraLimitTotal, maxExtraLimitTotal);
+        }
+        if (voucher.extraLimitPerCell > maxExtraLimitPerCell) {
+            revert VoucherExtraLimitPerCellTooHigh(voucher.extraLimitPerCell, maxExtraLimitPerCell);
+        }
 
         if (!SignatureChecker.isValidSignatureNow(signer, getVoucherDigest(voucher), signature)) {
             revert InvalidVoucherSignature();
@@ -72,12 +93,53 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
             if (tokenAmount + staked > target) revert AmountExceedsTarget(phase, period, target);
         }
 
+        // Part of this stake paid for out of the voucher's bonus budget, i.e. what sits above the wallet's
+        // controller limit. Metered below, once the deposit number is known.
+        uint256 bonusNow;
         {
             (uint256 allowed, uint256 used) = ILimitController(controller).getAllowedAndUsed(msg.sender, phase, period);
-            uint256 extraLimit = voucher.extraLimit;
-            uint256 cap = allowed > type(uint256).max - extraLimit ? type(uint256).max : allowed + extraLimit;
-            uint256 headroom = used >= cap ? 0 : cap - used;
+
+            // `used` is the wallet's WHOLE open stake in this cell (this contract plus legacy). The part of it that
+            // was paid for out of the bonus budget is already charged to the meter below; counting it against
+            // `allowed` as well would fill both pools with the same tokens, so a VIP holding a bonus-funded
+            // deposit would be refused base stake it is entitled to, and closing a base-funded deposit would not
+            // give the base room back. Take the metered part out first. Legacy stake is never in the meter, so it
+            // keeps shrinking baseRoom, which is right: it is base stake.
+            // The meter and `used` must describe the SAME cell -- both are keyed (phase, period). If this meter
+            // is ever re-scoped wider (per period across phases, say), this subtraction floors at 0 while the
+            // cell already holds base stake, and the wallet gets its whole base allowance again at every phase
+            // change. Saturating is defensive here, not reachable: bonus counted in this cell is part of this
+            // cell's `used` and both fall together on close, so the meter can never exceed `used`.
+            uint256 spentCell = walletBonusUsedInCell[phase][period][msg.sender];
+            uint256 baseUsed = used > spentCell ? used - spentCell : 0;
+            uint256 baseRoom = baseUsed >= allowed ? 0 : allowed - baseUsed;
+
+            // No wallet-block check here, deliberately. Zero means one thing everywhere in the LimitController:
+            // no BASE allowance. That is exactly what LimitController.setWalletLimit's NatSpec ("a limit of 0
+            // blocks the wallet") and DeployV050.s.sol's wallet-limit comment describe, and both are correct --
+            // for base staking, where `getRemaining` really does return 0. Neither is talking about vouchers.
+            // The voucher's budget is INDEPENDENT headroom stacked on top of `allowed`, so a wallet on 0 can
+            // still stake its bonus. Blocking a wallet is a separate switch with its own meaning:
+            // `walletBlocked`, checked at the top of this function.
+            uint256 spentTotal = walletBonusUsed[msg.sender];
+            uint256 totalLeft = voucher.extraLimitTotal > spentTotal ? voucher.extraLimitTotal - spentTotal : 0;
+            uint256 cellLeft = voucher.extraLimitPerCell > spentCell ? voucher.extraLimitPerCell - spentCell : 0;
+            uint256 bonusLeft = totalLeft < cellLeft ? totalLeft : cellLeft;
+
+            // Saturating: `allowed` is an unconstrained uint256 and type(uint256).max is what an operator types
+            // for "unlimited"; a plain add would panic-revert every stake on that cell.
+            //
+            // DEPENDS ON PackedDeposit.amount BEING uint128 -- if you are widening it, read this.
+            // Saturating makes `headroom` larger than baseRoom + bonusLeft, so in principle `bonusNow` below
+            // could exceed `bonusLeft` and over-charge the meter past the voucher's budget. It cannot today:
+            // `bonusLeft` is bounded by the uint128 maxExtraLimitTotal / maxExtraLimitPerCell ceilings, so this
+            // branch only fires when baseRoom > 2^256 - 2^128, while `tokenAmount` can never reach 2^128 (a
+            // larger one reverts downstream at SafeCast.toUint128 in the deposit push). Saturation therefore
+            // implies tokenAmount < baseRoom, hence bonusNow == 0. Widen the deposit amount past uint128 and
+            // the over-charge becomes reachable -- nothing at the packing site will tell you that.
+            uint256 headroom = baseRoom > type(uint256).max - bonusLeft ? type(uint256).max : baseRoom + bonusLeft;
             if (tokenAmount > headroom) revert StakingLimitExceeded(msg.sender, phase, period, tokenAmount, headroom);
+            bonusNow = tokenAmount > baseRoom ? tokenAmount - baseRoom : 0;
         }
 
         voucherNonceBitmap[msg.sender][word] = bitmap | mask;
@@ -110,6 +172,13 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
                 apyBps: SafeCast.toUint32(effectiveApyBps)
             })
         );
+
+        if (bonusNow != 0) {
+            walletBonusUsed[msg.sender] += bonusNow;
+            walletBonusUsedInCell[phase][period][msg.sender] += bonusNow;
+            depositBonusUsed[msg.sender][depositNumber] = bonusNow;
+            emit BonusConsumed(msg.sender, phase, period, depositNumber, bonusNow);
+        }
 
         emit Stake(
             msg.sender, phase, period, effectiveApyBps, voucher.extraApyBps, tokenAmount, depositNumber, voucher.nonce

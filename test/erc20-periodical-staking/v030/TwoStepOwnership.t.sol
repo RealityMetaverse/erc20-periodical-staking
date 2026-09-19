@@ -118,18 +118,18 @@ contract TwoStepOwnershipTest is V030Base {
         vm.expectRevert(notOwner);
         stakingContract.setMaxExtraApyBps(1);
         vm.expectRevert(notOwner);
-        stakingContract.setMaxExtraLimit(1);
+        stakingContract.setMaxExtraLimitTotal(1);
 
         vm.startPrank(userOne);
         stakingContract.setVoucherSigner(address(0xBEEF));
         stakingContract.setTreasury(userTwo);
         stakingContract.setMaxExtraApyBps(250);
-        stakingContract.setMaxExtraLimit(1 ether);
+        stakingContract.setMaxExtraLimitTotal(1 ether);
         vm.stopPrank();
         assertEq(stakingContract.voucherSigner(), address(0xBEEF));
         assertEq(stakingContract.treasury(), userTwo);
         assertEq(stakingContract.maxExtraApyBps(), 250);
-        assertEq(stakingContract.maxExtraLimit(), 1 ether);
+        assertEq(stakingContract.maxExtraLimitTotal(), 1 ether);
     }
 
     function test_NonOwner_CannotPropose() public {

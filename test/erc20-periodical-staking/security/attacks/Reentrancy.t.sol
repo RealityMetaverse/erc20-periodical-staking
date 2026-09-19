@@ -403,10 +403,11 @@ contract ReentrancyTest is VoucherAttackBase {
         _stake(alice, 0, P30, 1_000 * ONE);
         _assertAccounting();
         // 2 phases x 3 periods = 6 cells, the controller returns 5
+        _lens(staking);
         vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 6, 5));
-        staking.getPhasePeriodUserData(alice);
+        _lens(staking).getPhasePeriodUserData(alice);
         vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, 6, 5));
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getProgramDataWithUserData(alice);
         // Reads that do not touch the controller keep working
         staking.getProgramData();
         staking.checkClaimableDataFor(alice);
@@ -436,7 +437,7 @@ contract ReentrancyTest is VoucherAttackBase {
     }
 
     /// @dev Hypothesis: a controller returning max allowed, combined with a max extraLimit, overflows the cap.
-    function test_maliciousLC_allowAll_maxExtraLimit_noOverflow() public {
+    function test_maliciousLC_allowAll_maxExtraLimitTotal_noOverflow() public {
         _useMLC(MaliciousLimitController.Mode.ALLOW_ALL);
         _stakeVWith(staking, alice, 0, P30, 1_000 * ONE, 0, type(uint128).max);
         assertEq(staking.checkDepositCountOfAddress(alice), 1);
@@ -528,7 +529,7 @@ contract ReentrancyTest is VoucherAttackBase {
         staking.setVoucherSigner(_voucherSignerAddr());
         staking.setLimitController(address(new OpenLimitController(address(staking))));
         _stake(alice, 0, P30, 1_000 * ONE);
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getProgramDataWithUserData(alice);
         _assertAccounting();
     }
 }

@@ -3,7 +3,7 @@ pragma solidity 0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-import {V040Base} from "./V040Base.sol";
+import {V050Base} from "./V050Base.sol";
 import {LimitController} from "../../src/contracts/LimitController.sol";
 import {Errors} from "../../src/common/Errors.sol";
 import {Types} from "../../src/common/Types.sol";
@@ -16,7 +16,7 @@ import {ERC20PeriodicalStaking as LegacyV024} from
 ///         phase and period, unknown phase/period read 0 and never revert, wallet overrides (isSet, explicit 0),
 ///         the stake-path boundary `used + amount <= allowed + extraLimit`, batch == single reads, and legacy
 ///         stake shrinking frees room.
-contract LimitControllerLegacyTest is V040Base {
+contract LimitControllerLegacyTest is V050Base {
     event LegacyStakingContractSet(address indexed legacyStakingContract);
     event StakingContractSet(address indexed stakingContract);
 
@@ -332,9 +332,15 @@ contract LimitControllerLegacyTest is V040Base {
         assertEq(controller.getRemaining(alice, 0, P90), _sat(defaultLimit, legacyAmount));
     }
 
-    // ======================================
-    // =   used + amount <= allowed + extra  =
-    // ======================================
+    // ======================================================================
+    // =   headroom = (allowed - used) + unspent bonus                      =
+    // ======================================================================
+    // BEHAVIOUR CHANGE, 2026-09-18, v0.4.0 bonus-budget rework. These two tests used to assert the pre-fix rule
+    // `headroom = (allowed + extra) - used`, where stake already sitting above the controller limit ate into the
+    // voucher's extra. That was found to mean a wallet whose LEGACY position overshot its new limit arrived with
+    // part of its VIP perk silently already spent -- on day one, for exactly the users most likely to be VIPs.
+    // The fix makes the bonus INDEPENDENT headroom stacked on top of the base allowance, so an overshoot shrinks
+    // `baseRoom` and nothing else. Do not restore the old assertions.
     function testFuzz_stakeBoundary_exact(
         uint256 newStaked,
         uint256 legacyAmount,
@@ -344,7 +350,7 @@ contract LimitControllerLegacyTest is V040Base {
     ) public {
         newStaked = bound(newStaked, 0, 60_000 * ONE);
         legacyAmount = bound(legacyAmount, 0, 150_000 * ONE);
-        extraLimit = bound(extraLimit, 0, MAX_EXTRA_LIMIT);
+        extraLimit = bound(extraLimit, 0, MAX_EXTRA_LIMIT_TOTAL);
         overrideLimit = bound(overrideLimit, 0, 150_000 * ONE);
 
         // Stake in the new contract first, before legacy stake and overrides can block it.
@@ -363,8 +369,11 @@ contract LimitControllerLegacyTest is V040Base {
         assertEq(cAllowed, allowed);
         assertEq(cUsed, used);
 
-        uint256 cap = allowed + extraLimit;
-        uint256 headroom = _sat(cap, used);
+        // The bonus is not reduced by an overshoot: unused base room, PLUS the whole voucher budget. The first
+        // stake above consumed no bonus (it fits inside DEFAULT_LIMIT before the legacy stake and override land),
+        // so the meter is still empty here.
+        uint256 baseRoom = _sat(allowed, used);
+        uint256 headroom = baseRoom + extraLimit;
 
         // One over the headroom (at least the minimum deposit, which is checked earlier) reverts.
         uint256 over = headroom + 1 < MIN_DEPOSIT ? MIN_DEPOSIT : headroom + 1;
@@ -372,21 +381,37 @@ contract LimitControllerLegacyTest is V040Base {
 
         if (headroom < MIN_DEPOSIT) return;
 
-        // Exactly the headroom succeeds: used + amount == allowed + extraLimit.
+        // Exactly the headroom succeeds, and the part above baseRoom is what the meter records.
         stakeWith(alice, P30, headroom, 0, extraLimit);
         assertEq(_cell(alice, 0, P30), newStaked + headroom);
         (, cUsed) = controller.getAllowedAndUsed(alice, 0, P30);
-        assertEq(cUsed, cap, "used lands exactly on allowed + extraLimit");
+        assertEq(cUsed, used + headroom, "every token landed in the cell");
+        (uint256 spentTotal,) = staking.getBonusUsage(alice, 0, P30);
+        assertEq(spentTotal, extraLimit, "the whole budget was spent, and only the budget");
 
-        // Now nothing more fits under the same voucher allowance.
+        // Nothing more fits: base room is gone and the budget is exhausted, so a fresh voucher with the same
+        // numbers finds zero. Under the old rule this held for the wrong reason.
         _expectLimitRevert(alice, P30, MIN_DEPOSIT, extraLimit, 0);
     }
 
-    function test_stakeBoundary_legacyAboveAllowedGivesZeroHeadroom() public {
-        // Legacy stake above the new limit (e.g. limits were lowered after the migration): saturates, no underflow.
-        legacy.setStaked(alice, 0, P30, DEFAULT_LIMIT + MAX_EXTRA_LIMIT + 1);
-        assertEq(controller.getRemaining(alice, 0, P30), 0);
-        _expectLimitRevert(alice, P30, MIN_DEPOSIT, MAX_EXTRA_LIMIT, 0);
+    /// @notice Legacy stake above the limit zeroes the BASE room and leaves the voucher bonus fully intact.
+    /// @dev This is the case the rework exists for. A wallet migrated with a legacy position larger than its new
+    ///      limit (limits were lowered after the migration) still gets its whole VIP bonus; previously the
+    ///      overshoot was treated as bonus already consumed, so the perk was gone before the wallet ever used it.
+    ///      The saturation this test originally guarded is still asserted: `getRemaining` is 0, not an underflow,
+    ///      and a voucher carrying no bonus still gets nothing.
+    function test_stakeBoundary_legacyAboveAllowed_zeroesBaseRoomButNotTheBonus() public {
+        legacy.setStaked(alice, 0, P30, DEFAULT_LIMIT + MAX_EXTRA_LIMIT_TOTAL + 1);
+        assertEq(controller.getRemaining(alice, 0, P30), 0, "base room saturates at 0, no underflow");
+
+        // No bonus on the voucher: still nothing.
+        _expectLimitRevert(alice, P30, MIN_DEPOSIT, 0, 0);
+
+        // With a bonus: exactly the bonus, undiminished by the overshoot.
+        _expectLimitRevert(alice, P30, MAX_EXTRA_LIMIT_TOTAL + 1, MAX_EXTRA_LIMIT_TOTAL, MAX_EXTRA_LIMIT_TOTAL);
+        stakeWith(alice, P30, MAX_EXTRA_LIMIT_TOTAL, 0, MAX_EXTRA_LIMIT_TOTAL);
+        (uint256 spentTotal,) = staking.getBonusUsage(alice, 0, P30);
+        assertEq(spentTotal, MAX_EXTRA_LIMIT_TOTAL, "the overshoot did not pre-spend the budget");
     }
 
     // ======================================

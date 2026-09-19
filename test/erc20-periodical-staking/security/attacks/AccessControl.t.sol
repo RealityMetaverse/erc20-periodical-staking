@@ -29,7 +29,7 @@ contract AccessControlTest is VoucherAttackBase {
         calls[13] = abi.encodeCall(staking.setLimitController, (address(0)));
         calls[14] = abi.encodeCall(staking.setVoucherSigner, (address(0)));
         calls[15] = abi.encodeCall(staking.setMaxExtraApyBps, (1));
-        calls[16] = abi.encodeCall(staking.setMaxExtraLimit, (1));
+        calls[16] = abi.encodeCall(staking.setMaxExtraLimitTotal, (1));
         calls[17] = abi.encodeCall(staking.setTreasury, (rando));
         calls[18] = abi.encodeCall(staking.collectReward, (1));
         calls[19] = abi.encodeCall(staking.rescueTokens, (address(token), 1));
@@ -207,11 +207,11 @@ contract AccessControlTest is VoucherAttackBase {
         Types.StakeVoucher memory v = _makeVoucher(alice, 0, P30, 0, 0);
         vm.startPrank(rando);
         staking.getProgramData();
-        staking.getProgramDataWithUserData(alice);
+        _lens(staking).getProgramDataWithUserData(alice);
         staking.checkTotalClaimableData();
         staking.getCollectableReward();
-        staking.getRewardPoolShortfall();
-        staking.getPhasePeriodDataAll(Types.PhasePeriodDataType.STAKED);
+        _lens(staking).getRewardPoolShortfall();
+        _lens(staking).getPhasePeriodDataAll(Types.PhasePeriodDataType.STAKED);
         staking.getUserPhasePeriodData(Types.DataType.STAKING, alice, 0, P30);
         staking.isDepositFrozen(alice, 0);
         staking.isVoucherNonceUsed(alice, 0);
@@ -258,17 +258,22 @@ contract AccessControlTest is VoucherAttackBase {
     /// @dev Fuzz: altering any signed field after signing (to raise the APY, lift the limit, extend expiry,
     ///      move period or phase, or reuse a nonce) invalidates the signature.
     function testFuzz_voucher_tamperedField_rejected(uint8 field, uint256 delta) public {
-        field = uint8(bound(field, 0, 5));
+        field = uint8(bound(field, 0, 6));
         delta = bound(delta, 1, 1_000);
         staking.changeStakingPhase(1);
+        // This test dates its voucher a day out and then tampers the field by up to 1000 more, so it needs a
+        // ceiling wider than both. Raised here, in the test, so the dependency is visible: without it the
+        // stake reverts VoucherValidityTooLong and never reaches the signature check under test.
+        staking.setMaxVoucherValidity(2 days);
         Types.StakeVoucher memory v = _makeVoucher(alice, 1, P30, 100, 1_000 * ONE);
         v.validUntil = _now() + 1 days;
         bytes memory sig = _signVoucher(address(staking), v, VOUCHER_SIGNER_KEY);
         if (field == 0) v.extraApyBps += delta;
-        else if (field == 1) v.extraLimit += delta;
+        else if (field == 1) v.extraLimitTotal += delta;
         else if (field == 2) v.validUntil += delta;
         else if (field == 3) v.period = P90; // exists, so only the signature can reject it
         else if (field == 4) v.nonce += delta;
+        else if (field == 5) v.extraLimitPerCell += delta;
         else v.extraApyBps -= 1; // lowering is tampering too
         uint256 apy = _apy(1, v.period);
         vm.prank(alice);
@@ -385,7 +390,7 @@ contract AccessControlTest is VoucherAttackBase {
     ///      for a validly signed voucher, and lowering a cap retroactively blocks already-issued vouchers.
     function test_voucher_extrasCappedByOwner_evenWhenValidlySigned() public {
         staking.setMaxExtraApyBps(300);
-        staking.setMaxExtraLimit(5_000 * ONE);
+        staking.setMaxExtraLimitTotal(5_000 * ONE);
         uint256 apy = _apy(0, P30);
 
         (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 301, 0);
@@ -395,7 +400,7 @@ contract AccessControlTest is VoucherAttackBase {
 
         (v, sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 5_000 * ONE + 1);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherExtraLimitTooHigh.selector, 5_000 * ONE + 1, 5_000 * ONE));
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherExtraLimitTotalTooHigh.selector, 5_000 * ONE + 1, 5_000 * ONE));
         staking.stakeWithVoucher(v, sig, 1_000 * ONE, apy);
 
         // exactly at the caps is fine
@@ -412,7 +417,7 @@ contract AccessControlTest is VoucherAttackBase {
         vm.expectRevert();
         staking.setMaxExtraApyBps(uint256(type(uint32).max) + 1);
         vm.expectRevert();
-        staking.setMaxExtraLimit(uint256(type(uint128).max) + 1);
+        staking.setMaxExtraLimitTotal(uint256(type(uint128).max) + 1);
     }
 
     /// @dev Rotating the signer invalidates every outstanding voucher of the old key; unsetting it stops staking

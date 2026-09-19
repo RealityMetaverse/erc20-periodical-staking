@@ -88,7 +88,12 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
     }
 
     /// @dev Hypothesis: lowering a limit below the staked amount underflows getRemaining / the stake headroom, or
-    ///      blocks closing. A voucher extraLimit smaller than the overshoot must still give no headroom.
+    ///      blocks closing. The saturation is still asserted; what changed is that a voucher bonus is NOT
+    ///      cancelled by the overshoot -- an operator tightening a limit must not confiscate unspent budget.
+    // BEHAVIOUR CHANGE, 2026-09-18, v0.4.0 bonus-budget rework: the voucher bonus is INDEPENDENT headroom on top
+    // of the base allowance, not something an overshoot eats into. Previously a wallet whose stake already sat
+    // above its controller limit arrived with part of its VIP perk silently spent -- on day one, for exactly the
+    // users most likely to be VIPs. Do not restore the old `allowed + extra - used` assertions.
     function test_limitLoweredBelowStaked_noUnderflow_closingWorks() public {
         uint256 d = _stake(alice, 0, P30, 8_000 * ONE);
         lc.setWalletLimit(alice, 0, P30, 5_000 * ONE);
@@ -99,10 +104,11 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         uint256 apy = _apy(0, P30);
         _expectStakeRevert(alice, 0, P30, 100, apy, _limitErr(alice, 0, P30, 100, 0));
 
+        // A voucher bonus survives the tightening in full: base room is 0, the 2,000 budget is untouched.
         (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 2_000 * ONE);
         vm.prank(alice);
-        vm.expectRevert(_limitErr(alice, 0, P30, 100, 0));
-        staking.stakeWithVoucher(v, sig, 100, apy);
+        vm.expectRevert(_limitErr(alice, 0, P30, 2_000 * ONE + 1, 2_000 * ONE));
+        staking.stakeWithVoucher(v, sig, 2_000 * ONE + 1, apy);
 
         _warpDays(30);
         _claim(alice, d);
@@ -147,14 +153,18 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
 
         // the controller views never include voucher extras
         assertEq(lc.getRemaining(alice, 0, P30), 0);
-        (, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        (, uint256[][] memory rem) = _lens(staking).getPhasePeriodUserData(alice);
         assertEq(rem[0][1], 0);
         _assertAccounting();
     }
 
-    /// @dev Fuzz: for any wallet limit, voucher extraLimit and legacy stake, a stake is accepted iff
-    ///      amount <= max(0, limit + extra - legacyStake), and the revert reports exactly that headroom.
-    function testFuzz_headroom_limitPlusExtraMinusLegacy(uint256 limit, uint256 extra, uint256 legacyAmt, uint256 amount)
+    /// @dev Fuzz: for any wallet limit, voucher bonus and legacy stake, a stake is accepted iff
+    ///      amount <= max(0, limit - legacyStake) + extra, and the revert reports exactly that headroom.
+    // BEHAVIOUR CHANGE, 2026-09-18, v0.4.0 bonus-budget rework: the voucher bonus is INDEPENDENT headroom on top
+    // of the base allowance, not something an overshoot eats into. Previously a wallet whose stake already sat
+    // above its controller limit arrived with part of its VIP perk silently spent -- on day one, for exactly the
+    // users most likely to be VIPs. Do not restore the old `allowed + extra - used` assertions.
+    function testFuzz_headroom_baseRoomPlusBonus(uint256 limit, uint256 extra, uint256 legacyAmt, uint256 amount)
         public
     {
         limit = bound(limit, 0, 100_000 * ONE);
@@ -167,8 +177,8 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         legacy.setStaked(alice, 0, P0, legacyAmt);
         lc.setWalletLimit(alice, 0, P0, limit);
 
-        uint256 cap = limit + extra;
-        uint256 headroom = legacyAmt >= cap ? 0 : cap - legacyAmt;
+        uint256 baseRoom = legacyAmt >= limit ? 0 : limit - legacyAmt;
+        uint256 headroom = baseRoom + extra;
         uint256 apy = _apy(0, P0);
         (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P0, 0, extra);
 
@@ -208,7 +218,7 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         (allowed, used) = lc.getAllowedAndUsed(bob, 99, 12345);
         assertEq(allowed + used, 0, "unknown cell reads 0 in both contracts");
 
-        (, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        (, uint256[][] memory rem) = _lens(staking).getPhasePeriodUserData(alice);
         assertEq(rem[0][1], 0, "phase 0 / P30 full (8k legacy + 2k new)");
         assertEq(rem[0][0], 10_000 * ONE, "phase 0 / P0 untouched");
         assertEq(rem[1][1], 0);
@@ -326,7 +336,7 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         lc.setWalletLimit(alice, 0, P90, 3_000 * ONE);
         _stake(alice, 0, P90, 1_000 * ONE);
         _stake(alice, 0, P30, 4_000 * ONE);
-        (uint256[][] memory limits, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        (uint256[][] memory limits, uint256[][] memory rem) = _lens(staking).getPhasePeriodUserData(alice);
         for (uint256 ph = 0; ph < 2; ph++) {
             for (uint256 i = 0; i < PERIODS.length; i++) {
                 assertEq(limits[ph][i], lc.getAllowed(alice, ph, PERIODS[i]));
@@ -345,7 +355,7 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         _expectStakeRevert(
             bob, 0, P30, TARGET / 2, _apy(0, P30), abi.encodeWithSelector(Errors.LimitControllerNotSet.selector)
         );
-        (uint256[][] memory limits, uint256[][] memory rem) = staking.getPhasePeriodUserData(alice);
+        (uint256[][] memory limits, uint256[][] memory rem) = _lens(staking).getPhasePeriodUserData(alice);
         assertEq(limits[0][1], 0);
         assertEq(rem[0][1], 0);
         _warpDays(30);
@@ -353,8 +363,12 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         _assertAccounting();
     }
 
-    /// @dev Hypothesis: hostile controller figures (max allowed, max used, allowed + extra overflowing) make the
-    ///      stake-side headroom math wrap or panic. It must saturate: cap at max, headroom at 0.
+    /// @dev Hypothesis: hostile controller figures (max allowed, max used, baseRoom + bonus overflowing) make the
+    ///      stake-side headroom math wrap or panic. It must saturate: headroom caps at max, base room floors at 0.
+    // BEHAVIOUR CHANGE, 2026-09-18, v0.4.0 bonus-budget rework: the voucher bonus is INDEPENDENT headroom on top
+    // of the base allowance, not something an overshoot eats into. Previously a wallet whose stake already sat
+    // above its controller limit arrived with part of its VIP perk silently spent -- on day one, for exactly the
+    // users most likely to be VIPs. Do not restore the old `allowed + extra - used` assertions.
     function test_hostileControllerFigures_overflowSafe() public {
         FixedLimitController f = new FixedLimitController();
         staking.setLimitController(address(f));
@@ -366,18 +380,30 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         f.set(type(uint256).max - 1, 0);
         _stakeVWith(staking, alice, 0, P0, 1_000 * ONE, 0, bigExtra);
 
+        // allowed == used == max: base room saturates to 0 (no underflow). With NO bonus there is no headroom.
         f.set(type(uint256).max, type(uint256).max);
+        _expectStakeRevert(alice, 0, P0, 1_000 * ONE, apy, _limitErr(alice, 0, P0, 1_000 * ONE, 0));
+
+        // Same figures WITH a bonus: the bonus is independent of the overshoot, so it is the whole headroom, and
+        // `baseRoom + bonusLeft` must saturate rather than wrap.
         (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P0, 0, bigExtra);
         vm.prank(alice);
-        vm.expectRevert(_limitErr(alice, 0, P0, 1_000 * ONE, 0));
         staking.stakeWithVoucher(v, sig, 1_000 * ONE, apy);
+        (uint256 spentTotal,) = staking.getBonusUsage(alice, 0, P0);
+        assertEq(spentTotal, 1_000 * ONE, "the whole stake came out of the bonus");
 
         f.set(0, type(uint256).max);
         _expectStakeRevert(alice, 0, P0, 1_000 * ONE, apy, _limitErr(alice, 0, P0, 1_000 * ONE, 0));
 
+        // Ordinary small figures, on a FRESH wallet. Bob has to be used here rather than alice: since the
+        // 2026-09-18 two-meter fix, `baseUsed` is `used - walletBonusUsedInCell[phase][period][wallet]`, and
+        // alice is holding 1,000 RMV of bonus in this very cell from the stake above. The fake controller
+        // reports used == 3 while 1,000 RMV is really staked, so the subtraction saturates to 0 and baseRoom
+        // becomes the whole `allowed`. That is a lying controller meeting a real meter -- a different thing
+        // from the overflow safety this test is named for. Bob's meter is 0, so `allowed - used` is the answer.
         f.set(5, 3);
-        _expectStakeRevert(alice, 0, P0, 100, apy, _limitErr(alice, 0, P0, 100, 2));
-        assertEq(staking.checkDepositCountOfAddress(alice), 2);
+        _expectStakeRevert(bob, 0, P0, 100, apy, _limitErr(bob, 0, P0, 100, 2));
+        assertEq(staking.checkDepositCountOfAddress(alice), 3);
         _assertAccounting();
     }
 

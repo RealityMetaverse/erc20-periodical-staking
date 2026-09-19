@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./V040Base.sol";
+import "./V050Base.sol";
 
 /// @notice End-to-end smoke test of the v0.4.0 fixture: voucher stake, claim, freeze + seize.
-contract SmokeTest is V040Base {
+contract SmokeTest is V050Base {
     function test_smoke_voucherStake() external {
         uint256 amount = 1_000 * ONE;
         Types.StakeVoucher memory v = voucherFor(alice, P30, 25, 0);

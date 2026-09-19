@@ -314,7 +314,7 @@ contract StakingScenarious is AuxiliaryFunctions {
 
     function test_Staking_ExtraLimitAboveMax() external {
         _addPhasesAndPeriods();
-        stakingContract.setMaxExtraLimit(5e18);
+        stakingContract.setMaxExtraLimitTotal(5e18);
         _increaseAllowance(userOne, amountToStake);
 
         (Types.StakeVoucher memory v, bytes memory sig) =
@@ -325,7 +325,7 @@ contract StakingScenarious is AuxiliaryFunctions {
             sig,
             amountToStake,
             0,
-            abi.encodeWithSelector(Errors.VoucherExtraLimitTooHigh.selector, 5e18 + 1, 5e18)
+            abi.encodeWithSelector(Errors.VoucherExtraLimitTotalTooHigh.selector, 5e18 + 1, 5e18)
         );
     }
 

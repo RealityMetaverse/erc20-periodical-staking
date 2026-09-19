@@ -160,7 +160,7 @@ contract SolvencyPoC is VoucherHelper {
         assertEq(staking.rewardPool(), 0);
         assertEq(staking.totalDataList(Types.DataType.REWARD_EXPECTED), reserved);
         assertEq(staking.getCollectableReward(), 0);
-        assertGe(staking.getRewardPoolShortfall(), reserved, "shortfall includes the existing deficit");
+        assertGe(_lens(staking).getRewardPoolShortfall(), reserved, "shortfall includes the existing deficit");
 
         vm.prank(owner);
         (bool collected,) = address(staking).call(abi.encodeCall(staking.collectReward, (1)));

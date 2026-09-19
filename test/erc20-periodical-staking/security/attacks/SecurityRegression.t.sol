@@ -10,7 +10,7 @@ pragma solidity 0.8.20;
 ///  which probes for `getCollectableReward()`. Since v0.4.0 (voucher-only staking) it compiles against the
 ///  current sources only, so the v0.2.4 branches document the original bug and are no longer executed.
 ///   - `test_v024_*`  reproduce v0.2.4 (deployed 0xa816...) bugs and assert the fix.
-///   - `test_v030_*` / `test_v040_*` exercise behaviour introduced in that version.
+///   - `test_v030_*` / `test_v050_*` exercise behaviour introduced in that version.
 ///   - `test_known_*` document accepted limitations.
 ///   - `test_sound_*` document behaviour verified correct.
 ///  APY is in basis points since v0.4.0: APY = 1000 is the same 10% the original figures were computed with.
@@ -395,7 +395,7 @@ contract SecurityRegression is VoucherHelper {
     // =====================================================================================
     /// v0.3.0 treated `limitController == address(0)` as "headroom = remaining target", so one wallet could fill
     /// the whole pool. v0.4.0 refuses to stake without a controller.
-    function test_v040_noLimitControllerMeansNoStaking() public {
+    function test_v050_noLimitControllerMeansNoStaking() public {
         _fund(1_000 * ONE);
         staking.setLimitController(address(0));
         _expectStakeRevert(attacker, PERIOD_90, 100_000 * ONE, abi.encodeWithSelector(Errors.LimitControllerNotSet.selector));
@@ -405,7 +405,7 @@ contract SecurityRegression is VoucherHelper {
 
     /// The plain v0.3.0 stake entry point is gone (no fallback either) and an unsigned voucher is refused:
     /// eligibility can only come from the backend's signature.
-    function test_v040_stakeWithoutVoucherImpossible() public {
+    function test_v050_stakeWithoutVoucherImpossible() public {
         vm.prank(attacker);
         (bool ok, bytes memory ret) = address(staking).call(
             abi.encodeWithSignature("safeStake(uint256,uint256,uint256,uint256)", 0, PERIOD_90, 1_000 * ONE, APY)
@@ -496,7 +496,7 @@ contract SecurityRegression is VoucherHelper {
         staking.removeStakingPeriod(PERIOD_90);
 
         // while removed: totalDataList[STAKING] != sum of visible STAKED cells (view inconsistency)
-        uint256[][] memory stakedCells = staking.getPhasePeriodDataAll(Types.PhasePeriodDataType.STAKED);
+        uint256[][] memory stakedCells = _lens(staking).getPhasePeriodDataAll(Types.PhasePeriodDataType.STAKED);
         uint256 visible;
         for (uint256 i = 0; i < stakedCells[0].length; i++) visible += stakedCells[0][i];
         assertEq(visible, 0);
@@ -509,7 +509,7 @@ contract SecurityRegression is VoucherHelper {
         staking.addStakingPeriod(PERIOD_90, apy, tgt);
 
         // no underflow: the reward-for-targets view saturates the over-target cell at 0
-        assertEq(staking.getRewardRequiredForTargets(), 0);
+        assertEq(_lens(staking).getRewardRequiredForTargets(), 0);
         _expectStakeRevert(
             bob, PERIOD_90, 100 * ONE, abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_90, 1_000 * ONE)
         );
@@ -566,7 +566,7 @@ contract SecurityRegression is VoucherHelper {
         uint256 dep = _stake(alice, PERIOD_90, 1_000 * ONE); // pool is empty
         uint256 reward = staking.calculateReward(1_000 * ONE, APY, PERIOD_90);
         assertEq(staking.rewardPool(), 0);
-        assertGe(staking.getRewardPoolShortfall(), reward, "shortfall reports the existing deficit");
+        assertGe(_lens(staking).getRewardPoolShortfall(), reward, "shortfall reports the existing deficit");
         _warpBy(91 days);
 
         vm.prank(alice);
@@ -712,7 +712,7 @@ contract SecurityRegression is VoucherHelper {
         _stake(alice, PERIOD_90, 5_000 * ONE);
         staking.setPhasePeriodData(Types.PhasePeriodDataType.STAKING_TARGET, 0, PERIOD_90, 100 * ONE);
 
-        assertEq(staking.getRewardRequiredForTargets(), 0, "over-target cell saturates, no underflow");
+        assertEq(_lens(staking).getRewardRequiredForTargets(), 0, "over-target cell saturates, no underflow");
         _expectStakeRevert(
             bob, PERIOD_90, 100 * ONE, abi.encodeWithSelector(Errors.AmountExceedsTarget.selector, 0, PERIOD_90, 100 * ONE)
         );

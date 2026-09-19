@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./V040Base.sol";
+import "./V050Base.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /// @notice v0.4.0 APYs in basis points (x.yz%) and the voucher extra-APY / extra-limit caps.
-contract ApyBpsTest is V040Base {
+contract ApyBpsTest is V050Base {
     uint256 internal constant REF_DENOMINATOR = 10_000 * 365;
 
     /// @dev Exact floor(amount * apyBps * days / 3_650_000) computed independently of mulDiv:
@@ -321,13 +321,13 @@ contract ApyBpsTest is V040Base {
     // =         Extra limit cap            =
     // ======================================
     function test_extraLimit_equalToMax_passesAndAddsHeadroom() external {
-        uint256 amount = DEFAULT_LIMIT + MAX_EXTRA_LIMIT;
-        uint256 n = stakeWith(alice, P30, amount, 0, MAX_EXTRA_LIMIT);
+        uint256 amount = DEFAULT_LIMIT + MAX_EXTRA_LIMIT_TOTAL;
+        uint256 n = stakeWith(alice, P30, amount, 0, MAX_EXTRA_LIMIT_TOTAL);
         assertEq(_deposit(alice, n).amount, amount);
         assertEq(_cell(alice, 0, P30), amount);
 
         // The extra limit is per stake, not persistent: without enough extra there is no headroom left.
-        Types.StakeVoucher memory v = voucherFor(alice, P30, 0, MAX_EXTRA_LIMIT);
+        Types.StakeVoucher memory v = voucherFor(alice, P30, 0, MAX_EXTRA_LIMIT_TOTAL);
         bytes memory sig = signVoucher(v);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, alice, 0, P30, ONE, 0));
@@ -335,8 +335,8 @@ contract ApyBpsTest is V040Base {
     }
 
     function test_extraLimit_oneOverHeadroom_reverts() external {
-        uint256 headroom = DEFAULT_LIMIT + MAX_EXTRA_LIMIT;
-        Types.StakeVoucher memory v = voucherFor(alice, P30, 0, MAX_EXTRA_LIMIT);
+        uint256 headroom = DEFAULT_LIMIT + MAX_EXTRA_LIMIT_TOTAL;
+        Types.StakeVoucher memory v = voucherFor(alice, P30, 0, MAX_EXTRA_LIMIT_TOTAL);
         bytes memory sig = signVoucher(v);
         vm.prank(alice);
         vm.expectRevert(
@@ -346,24 +346,24 @@ contract ApyBpsTest is V040Base {
     }
 
     function testFuzz_extraLimit_aboveMax_reverts(uint256 extraLimit) external {
-        extraLimit = bound(extraLimit, MAX_EXTRA_LIMIT + 1, type(uint256).max);
+        extraLimit = bound(extraLimit, MAX_EXTRA_LIMIT_TOTAL + 1, type(uint256).max);
         Types.StakeVoucher memory v = voucherFor(alice, P30, 0, extraLimit);
         bytes memory sig = signVoucher(v);
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(Errors.VoucherExtraLimitTooHigh.selector, extraLimit, MAX_EXTRA_LIMIT)
+            abi.encodeWithSelector(Errors.VoucherExtraLimitTotalTooHigh.selector, extraLimit, MAX_EXTRA_LIMIT_TOTAL)
         );
         staking.stakeWithVoucher(v, sig, ONE, 0);
         assertFalse(staking.isVoucherNonceUsed(alice, v.nonce), "nonce not burnt");
     }
 
-    function test_setMaxExtraLimit_uint128Bound() external {
-        staking.setMaxExtraLimit(type(uint128).max);
-        assertEq(staking.maxExtraLimit(), type(uint128).max);
+    function test_setMaxExtraLimitTotal_uint128Bound() external {
+        staking.setMaxExtraLimitTotal(type(uint128).max);
+        assertEq(staking.maxExtraLimitTotal(), type(uint128).max);
 
         uint256 tooBig = uint256(type(uint128).max) + 1;
         vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 128, tooBig));
-        staking.setMaxExtraLimit(tooBig);
+        staking.setMaxExtraLimitTotal(tooBig);
     }
 
     // ======================================

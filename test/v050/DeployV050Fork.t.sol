@@ -5,7 +5,7 @@ import {console2} from "forge-std/console2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {VoucherHelper} from "../shared/VoucherHelper.sol";
-import {DeployV040, ILegacyStakingV024, ILegacyLimitControllerV024} from "../../script/DeployV040.s.sol";
+import {DeployV050, ILegacyStakingV024, ILegacyLimitControllerV024} from "../../script/DeployV050.s.sol";
 import {ERC20PeriodicalStaking} from "../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 import {LimitController} from "../../src/contracts/LimitController.sol";
 import {Errors} from "../../src/common/Errors.sol";
@@ -22,26 +22,28 @@ interface ILegacyStakingV024Write {
     function safeStake(uint256 stakingPhase, uint256 stakingPeriod, uint256 tokenAmount, uint256 expectedAPY) external;
 }
 
-/// @notice Runs DeployV040 against a fork of any network with a known source contract and compares the result with
+/// @notice Runs DeployV050 against a fork of any network with a known source contract and compares the result with
 ///         that network's live v0.2.4 contract.
 /// @dev Opt-in: FORK_RPC_URL (any network; falls back to POLYGON_RPC_URL), optionally FORK_BLOCK and SOURCE_STAKING.
 ///      Without an RPC every test is skipped with a log.
-contract DeployV040ForkTest is VoucherHelper {
+contract DeployV050ForkTest is VoucherHelper {
     IVmSkip private constant VM_SKIP = IVmSkip(address(uint160(uint256(keccak256("hevm cheat code")))));
 
     uint256 internal constant MAX_EXTRA_APY_BPS = 500;
-    uint256 internal constant MAX_EXTRA_LIMIT = 50_000e18;
+    uint256 internal constant MAX_EXTRA_LIMIT_TOTAL = 50_000e18;
+    uint256 internal constant MAX_EXTRA_LIMIT_PER_CELL = 50_000e18;
+    uint256 internal constant MAX_VOUCHER_VALIDITY = 1 days;
 
     bool internal forkOn;
-    DeployV040 internal script;
-    DeployV040.OldConfig internal old;
+    DeployV050 internal script;
+    DeployV050.OldConfig internal old;
     ERC20PeriodicalStaking internal staking;
     LimitController internal controller;
     address internal admin = makeAddr("admin");
 
     modifier onlyFork() {
         if (!forkOn) {
-            console2.log("DeployV040ForkTest skipped: set FORK_RPC_URL (or POLYGON_RPC_URL) to run against a fork");
+            console2.log("DeployV050ForkTest skipped: set FORK_RPC_URL (or POLYGON_RPC_URL) to run against a fork");
             VM_SKIP.skip(true);
             return;
         }
@@ -56,19 +58,21 @@ contract DeployV040ForkTest is VoucherHelper {
         else vm.createSelectFork(rpc, forkBlock);
         forkOn = true;
 
-        script = new DeployV040();
+        script = new DeployV050();
         address source = vm.envOr("SOURCE_STAKING", script.sourceStakingFor(block.chainid));
         require(source != address(0), "no source staking contract for this chain; set SOURCE_STAKING");
 
         address[] memory admins = new address[](1);
         admins[0] = admin;
-        DeployV040.Params memory p = DeployV040.Params({
+        DeployV050.Params memory p = DeployV050.Params({
             sourceStaking: source,
             requirementCheckerV2: script.requirementCheckerV2For(block.chainid),
             voucherSigner: _voucherSignerAddr(),
             treasury: treasury,
             maxExtraApyBps: MAX_EXTRA_APY_BPS,
-            maxExtraLimit: MAX_EXTRA_LIMIT,
+            maxExtraLimitTotal: MAX_EXTRA_LIMIT_TOTAL,
+            maxExtraLimitPerCell: MAX_EXTRA_LIMIT_PER_CELL,
+            maxVoucherValidity: MAX_VOUCHER_VALIDITY,
             newOwner: address(0),
             admins: admins,
             openStaking: false,
@@ -77,8 +81,8 @@ contract DeployV040ForkTest is VoucherHelper {
             resumeStaking: address(0),
             resumeController: address(0)
         });
-        (DeployV040.OldConfig memory o, DeployV040.Deployment memory d) =
-            script.deployFrom(p, new DeployV040.WalletLimitRow[](0));
+        (DeployV050.OldConfig memory o, DeployV050.Deployment memory d) =
+            script.deployFrom(p, new DeployV050.WalletLimitRow[](0));
         old = o;
         staking = d.staking;
         controller = d.controller;
@@ -132,7 +136,9 @@ contract DeployV040ForkTest is VoucherHelper {
         assertEq(staking.voucherSigner(), _voucherSignerAddr(), "voucher signer");
         assertEq(staking.treasury(), treasury, "treasury");
         assertEq(staking.maxExtraApyBps(), MAX_EXTRA_APY_BPS, "max extra apy");
-        assertEq(staking.maxExtraLimit(), MAX_EXTRA_LIMIT, "max extra limit");
+        assertEq(staking.maxExtraLimitTotal(), MAX_EXTRA_LIMIT_TOTAL, "max extra limit");
+        assertEq(staking.maxExtraLimitPerCell(), MAX_EXTRA_LIMIT_PER_CELL, "max extra limit per cell");
+        assertEq(staking.maxVoucherValidity(), MAX_VOUCHER_VALIDITY, "max voucher validity");
         assertTrue(staking.contractAdmins(admin), "admin");
         assertEq(staking.contractOwner(), address(script), "owner = deployer context");
     }

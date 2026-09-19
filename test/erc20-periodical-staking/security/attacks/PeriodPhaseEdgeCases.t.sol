@@ -193,7 +193,7 @@ contract PeriodPhaseEdgeCasesTest is VoucherAttackBase {
         assertEq(s.stakingPhaseCount(), 1);
         // views work
         s.getProgramData();
-        s.getProgramDataWithUserData(alice);
+        _lens(s).getProgramDataWithUserData(alice);
         s.checkTotalClaimableData();
     }
 
@@ -349,7 +349,7 @@ contract PeriodPhaseEdgeCasesTest is VoucherAttackBase {
         assertEq(periods[1], P90);
         assertEq(apys[0][1], APY_PHASE0[2]);
         assertEq(staked[0][1], 1_000 * ONE);
-        uint256[][] memory all = staking.getPhasePeriodDataAll(Types.PhasePeriodDataType.STAKED);
+        uint256[][] memory all = _lens(staking).getPhasePeriodDataAll(Types.PhasePeriodDataType.STAKED);
         assertEq(all[0][1], 1_000 * ONE);
         assertEq(all.length, 2);
     }

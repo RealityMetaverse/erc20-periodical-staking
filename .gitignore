@@ -8,6 +8,6 @@
 *.Identifier
 /out-*
 /cache-*
-# Filled-in DeployV040 settings (may hold RPC keys); the templates stay tracked.
-/deploy/v040/*.env
-!/deploy/v040/example.env
+# Filled-in DeployV050 settings (may hold RPC keys); the templates stay tracked.
+/deploy/v050/*.env
+!/deploy/v050/example.env

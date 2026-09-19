@@ -214,7 +214,7 @@ contract MainManagementScenarios is AuxiliaryFunctions {
             vm.expectRevert();
             stakingContract.setMaxExtraApyBps(1);
             vm.expectRevert();
-            stakingContract.setMaxExtraLimit(1);
+            stakingContract.setMaxExtraLimitTotal(1);
             vm.expectRevert();
             stakingContract.setTreasury(userOne);
             vm.expectRevert();
@@ -241,10 +241,10 @@ contract MainManagementScenarios is AuxiliaryFunctions {
         vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 32, 1 << 32));
         stakingContract.setMaxExtraApyBps(1 << 32);
 
-        stakingContract.setMaxExtraLimit(5e18);
-        assertEq(stakingContract.maxExtraLimit(), 5e18);
+        stakingContract.setMaxExtraLimitTotal(5e18);
+        assertEq(stakingContract.maxExtraLimitTotal(), 5e18);
         vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 128, 1 << 128));
-        stakingContract.setMaxExtraLimit(1 << 128);
+        stakingContract.setMaxExtraLimitTotal(1 << 128);
 
         stakingContract.setTreasury(userThree);
         assertEq(stakingContract.treasury(), userThree);

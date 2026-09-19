@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "./V040Base.sol";
+import "./V050Base.sol";
 
 /// @notice Absolute gas budgets for the hot paths (design item 9, spec section 11). All state is prepared in setUp so
 ///         each test body runs as a separate transaction with cold storage access, like a real call. The bounds are
 ///         the first measurement plus about 10% headroom; a regression such as unpacking PackedDeposit, a second
 ///         controller call or reintroducing per-user phase-period cells blows through them.
-contract GasBudgetTest is V040Base {
+contract GasBudgetTest is V050Base {
     uint256 internal constant AMOUNT = 1_000 * ONE;
     uint256 internal constant CLAIM_ALL_COUNT = 10;
 

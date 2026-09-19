@@ -228,9 +228,29 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     }
 
     /// @notice Highest extra limit a voucher may carry.
-    function setMaxExtraLimit(uint256 value) external onlyContractOwner {
-        maxExtraLimit = SafeCast.toUint128(value);
-        emit UpdateMaxExtraLimit(value);
+    /// @dev Lowering this below what wallets already hold open is silent and safe: open deposits keep the bonus
+    ///      they were granted, and the remaining figures simply floor at 0 until enough is released. It caps NEW
+    ///      vouchers, it does not claw back.
+    function setMaxExtraLimitTotal(uint256 value) external onlyContractOwner {
+        maxExtraLimitTotal = SafeCast.toUint128(value);
+        emit UpdateMaxExtraLimitTotal(value);
+    }
+
+    /// @notice Highest per-cell extra limit a voucher may carry.
+    /// @dev Same as setMaxExtraLimitTotal: lowering it caps new vouchers only and never claws back bonus already
+    ///      held open.
+    function setMaxExtraLimitPerCell(uint256 value) external onlyContractOwner {
+        maxExtraLimitPerCell = SafeCast.toUint128(value);
+        emit UpdateMaxExtraLimitPerCell(value);
+    }
+
+    /// @notice Furthest ahead of now a voucher's validUntil may sit, in seconds.
+    /// @dev Rejects 0: it would revert every stake, and it reads like "disabled" when it is the opposite. This
+    ///      protection has no off switch -- lower it instead.
+    function setMaxVoucherValidity(uint256 validitySeconds) external onlyContractOwner {
+        if (validitySeconds == 0) revert ZeroAmountProvided();
+        maxVoucherValidity = SafeCast.toUint32(validitySeconds);
+        emit UpdateMaxVoucherValidity(validitySeconds);
     }
 
     /// @notice Set the receiver of seized deposits.
@@ -242,6 +262,10 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
 
     /// @notice Set the limit controller contract address. Staking requires one: with address(0) stakeWithVoucher
     ///         reverts LimitControllerNotSet.
+    /// @dev The bonus accounting trusts this contract's `getAllowedAndUsed`: `used` MUST include this staking
+    ///      contract's own open stake. A controller that excludes it makes the bonus meter exceed `used`, so the
+    ///      saturation in stakeWithVoucher stops being defensive and base room is handed back that the wallet
+    ///      has already spent. Point this only at a controller whose stakingContract() is this address.
     /// @param controllerAddress The address of the LimitController contract
     function setLimitController(address controllerAddress) external onlyContractOwner {
         limitController = controllerAddress;

@@ -7,6 +7,7 @@ import {Handler} from "./Handler.sol";
 import {TestToken} from "../../../shared/TestToken.sol";
 import {ERC20PeriodicalStaking} from
     "../../../../src/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
+import {StakingLens} from "../../../../src/contracts/erc20-periodical-staking/StakingLens.sol";
 import {ProgramManager} from "../../../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
 import {Errors} from "../../../../src/common/Errors.sol";
 import {Types} from "../../../../src/common/Types.sol";
@@ -25,6 +26,7 @@ abstract contract InvariantBase is Test {
 
     Handler internal handler;
     ERC20PeriodicalStaking internal staking;
+    StakingLens internal lens;
     TestToken internal token;
     address internal owner;
     address internal admin;
@@ -52,6 +54,7 @@ abstract contract InvariantBase is Test {
     function _deploy(bool legacy) internal {
         handler = new Handler(legacy);
         staking = handler.staking();
+        lens = new StakingLens(staking);
         token = handler.token();
         owner = handler.owner();
         admin = handler.admin();
@@ -94,6 +97,56 @@ abstract contract InvariantBase is Test {
         token.approve(address(staking), type(uint256).max);
         staking.provideReward(LIVENESS_TOPUP);
         vm.stopPrank();
+    }
+
+
+    // ======================================
+    // =      Once-per-run full-grid checks  =
+    // ======================================
+
+    /// @dev ORIGINAL full-grid version of _check_phasePeriodStakedSum: every phase x every period ever seen.
+    function _check_phasePeriodStakedSum_fullGrid() internal {
+        uint256[] memory periods = handler.getEverSeenPeriods();
+        uint256 phases = handler.ghost_maxPhaseCount();
+        uint256 sum;
+        for (uint256 p = 0; p < phases; p++) {
+            for (uint256 k = 0; k < periods.length; k++) {
+                sum += staking.getPhasePeriodData(Types.PhasePeriodDataType.STAKED, p, periods[k]);
+            }
+        }
+        assertEq(sum, staking.totalDataList(Types.DataType.STAKING), "sum(phasePeriod STAKED) != totalDataList[STAKING] (full grid)");
+    }
+
+    /// @dev ORIGINAL full-grid version of _check_userPhasePeriodSums: every user x phase x period ever seen.
+    function _check_userPhasePeriodSums_fullGrid() internal {
+        address[] memory users = handler.getUsers();
+        uint256[] memory periods = handler.getEverSeenPeriods();
+        uint256 phases = handler.ghost_maxPhaseCount();
+
+        for (uint256 u = 0; u < users.length; u++) {
+            uint256 sum;
+            for (uint256 p = 0; p < phases; p++) {
+                for (uint256 k = 0; k < periods.length; k++) {
+                    sum += staking.getUserPhasePeriodData(Types.DataType.STAKING, users[u], p, periods[k]);
+                }
+            }
+            assertEq(
+                sum,
+                staking.userDataList(Types.DataType.STAKING, users[u]),
+                string.concat("sum(STAKING cells) != userDataList[STAKING] (full grid) for user ", vm.toString(users[u]))
+            );
+        }
+    }
+
+    /// @notice Runs once at the end of every invariant run (forge discovers it by name, on every suite that
+    ///         inherits InvariantBase). The per-call sum checks read only the cells a stake ever wrote to; this
+    ///         reads the full grid, which is what catches a write into a cell nobody staked into. State persists
+    ///         to the end of the run, so such a write is still reported in the same run, only at the end of the
+    ///         sequence instead of at the exact call. The one thing neither sees: a wrong write undone by a
+    ///         second wrong write inside the same run, with totals still matching.
+    function afterInvariant() external {
+        _check_phasePeriodStakedSum_fullGrid();
+        _check_userPhasePeriodSums_fullGrid();
     }
 
     // ======================================
@@ -160,6 +213,12 @@ abstract contract InvariantBase is Test {
         assertEq(staking.rewardPool(), expected, "rewardPool != provided - collected - rewardsPaid (ghost)");
     }
 
+    /// @dev All deposits of a user in one call. getDepositsInRangeBy returns exactly getDeposit(user, i) for
+    ///      every index, so this is the same data as the per-index reads, minus one external call per deposit.
+    function _depositsOf(address user) internal view returns (ProgramManager.TokenDeposit[] memory) {
+        return lens.getDepositsInRangeBy(user, 0, staking.checkDepositCountOfAddress(user));
+    }
+
     /// @dev Frozen deposits cannot be claimed or withdrawn by design; liveness checks skip them.
     function _isFrozen(address user, uint256 idx) internal view returns (bool) {
         return !handler.legacy() && staking.isDepositFrozen(user, idx);
@@ -182,32 +241,29 @@ abstract contract InvariantBase is Test {
         }
     }
 
-    /// @dev Sum of phasePeriodDataList[STAKED] over every phase/period that ever existed == total staked.
+    /// @dev Per call: sum of phasePeriodDataList[STAKED] over every (phase, period) a stake ever wrote to == total
+    ///      staked. Cells no stake ever wrote to are read once per run, in afterInvariant().
     function _check_phasePeriodStakedSum() internal {
-        uint256[] memory periods = handler.getEverSeenPeriods();
-        uint256 phases = handler.ghost_maxPhaseCount();
+        uint256[2][] memory cells = handler.getTouchedPhasePeriods();
         uint256 sum;
-        for (uint256 p = 0; p < phases; p++) {
-            for (uint256 k = 0; k < periods.length; k++) {
-                sum += staking.getPhasePeriodData(Types.PhasePeriodDataType.STAKED, p, periods[k]);
-            }
+        for (uint256 k = 0; k < cells.length; k++) {
+            sum += staking.getPhasePeriodData(Types.PhasePeriodDataType.STAKED, cells[k][0], cells[k][1]);
         }
         assertEq(sum, staking.totalDataList(Types.DataType.STAKING), "sum(phasePeriod STAKED) != totalDataList[STAKING]");
     }
 
-    /// @dev Per user: sum over (phase, period) of the STAKING cell (getUserPhasePeriodData) == userDataList[STAKING].
+    /// @dev Per call, per user: sum over the STAKING cells that user's stakes ever wrote to == userDataList[STAKING].
+    ///      Cells no stake ever wrote to are read once per run, in afterInvariant().
     ///      Since v0.4.0 only STAKING is tracked per phase/period.
     function _check_userPhasePeriodSums() internal {
         address[] memory users = handler.getUsers();
-        uint256[] memory periods = handler.getEverSeenPeriods();
-        uint256 phases = handler.ghost_maxPhaseCount();
+        Handler.StakingCell[] memory cells = handler.getTouchedCells();
 
         for (uint256 u = 0; u < users.length; u++) {
             uint256 sum;
-            for (uint256 p = 0; p < phases; p++) {
-                for (uint256 k = 0; k < periods.length; k++) {
-                    sum += staking.getUserPhasePeriodData(Types.DataType.STAKING, users[u], p, periods[k]);
-                }
+            for (uint256 k = 0; k < cells.length; k++) {
+                if (cells[k].user != users[u]) continue;
+                sum += staking.getUserPhasePeriodData(Types.DataType.STAKING, users[u], cells[k].phase, cells[k].period);
             }
             assertEq(
                 sum,
@@ -223,11 +279,10 @@ abstract contract InvariantBase is Test {
         address[] memory users = handler.getUsers();
         uint256 total;
         for (uint256 u = 0; u < users.length; u++) {
-            uint256 count = staking.checkDepositCountOfAddress(users[u]);
+            ProgramManager.TokenDeposit[] memory ds = _depositsOf(users[u]);
             uint256 userSum;
-            for (uint256 i = 0; i < count; i++) {
-                ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
-                if (d.withdrawalDate == 0 && d.stakingEndDate != 0) userSum += d.rewardGenerated;
+            for (uint256 i = 0; i < ds.length; i++) {
+                if (ds[i].withdrawalDate == 0 && ds[i].stakingEndDate != 0) userSum += ds[i].rewardGenerated;
             }
             assertEq(
                 staking.userDataList(Types.DataType.REWARD_EXPECTED, users[u]),
@@ -251,14 +306,19 @@ abstract contract InvariantBase is Test {
         string memory failures;
         uint256 failureCount;
 
+        // The closable environment is the same for every trial, so it is built once; every trial starts from
+        // the `env` snapshot and reverts back to it (vm.revertTo keeps the snapshot). Status / frozen flags are
+        // read under `env` but only action availability and the pool differ from the pre-state.
+        uint256 pre = vm.snapshot();
+        _makeClosableEnvironment();
+        uint256 env = vm.snapshot();
+
         for (uint256 u = 0; u < users.length; u++) {
-            uint256 count = staking.checkDepositCountOfAddress(users[u]);
-            for (uint256 i = 0; i < count; i++) {
+            ProgramManager.TokenDeposit[] memory ds = _depositsOf(users[u]);
+            for (uint256 i = 0; i < ds.length; i++) {
                 if (!_isOpen(staking.checkDepositStatus(users[u], i)) || _isFrozen(users[u], i)) continue;
 
-                uint256 snap = vm.snapshot();
-                _makeClosableEnvironment();
-                ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
+                ProgramManager.TokenDeposit memory d = ds[i];
                 if (d.stakingEndDate != 0 && block.timestamp < d.stakingEndDate) vm.warp(d.stakingEndDate);
 
                 bytes memory reason;
@@ -294,10 +354,12 @@ abstract contract InvariantBase is Test {
                         "]"
                     );
                 }
-                vm.revertTo(snap);
+                assertTrue(vm.revertTo(env), "revertTo(env) failed");
                 vm.warp(ts);
             }
         }
+        assertTrue(vm.revertTo(pre), "revertTo(pre) failed");
+        vm.warp(ts);
         assertEq(failureCount, 0, string.concat("LOCKED DEPOSITS:", failures));
     }
 
@@ -313,16 +375,19 @@ abstract contract InvariantBase is Test {
         string memory failures;
         uint256 failureCount;
 
+        // Only CLAIM is reopened, once; every trial starts from that snapshot.
+        uint256 pre = vm.snapshot();
+        vm.prank(owner);
+        staking.changeActionAvailability(Types.DataType.CLAIM, true);
+        uint256 env = vm.snapshot();
+
         for (uint256 u = 0; u < users.length; u++) {
-            uint256 count = staking.checkDepositCountOfAddress(users[u]);
-            for (uint256 i = 0; i < count; i++) {
-                ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
+            ProgramManager.TokenDeposit[] memory ds = _depositsOf(users[u]);
+            for (uint256 i = 0; i < ds.length; i++) {
+                ProgramManager.TokenDeposit memory d = ds[i];
                 if (d.withdrawalDate != 0 || d.stakingEndDate == 0) continue; // closed or indefinite
                 if (_isFrozen(users[u], i)) continue; // frozen: claim blocked by design
 
-                uint256 snap = vm.snapshot();
-                vm.prank(owner);
-                staking.changeActionAvailability(Types.DataType.CLAIM, true);
                 if (block.timestamp < d.stakingEndDate) vm.warp(d.stakingEndDate);
 
                 bytes memory reason;
@@ -356,10 +421,12 @@ abstract contract InvariantBase is Test {
                         "]"
                     );
                 }
-                vm.revertTo(snap);
+                assertTrue(vm.revertTo(env), "revertTo(env) failed");
                 vm.warp(ts);
             }
         }
+        assertTrue(vm.revertTo(pre), "revertTo(pre) failed");
+        vm.warp(ts);
         assertEq(
             failureCount,
             0,
@@ -412,10 +479,17 @@ abstract contract InvariantBase is Test {
     function _check_claimableDataMatchesPayout() internal {
         address[] memory users = handler.getUsers();
         uint256 ts = handler.currentTime(); // external call: immune to via_ir timestamp rematerialization
+        string memory failures;
+        uint256 failureCount;
+
+        // Closable environment built once; every user's claimAll trial starts from the `env` snapshot. Failures
+        // are collected and asserted only after the final revert (a revert would undo ds-test's failed flag).
+        uint256 pre = vm.snapshot();
+        _makeClosableEnvironment();
+        uint256 env = vm.snapshot();
+
         for (uint256 u = 0; u < users.length; u++) {
             if (staking.checkDepositCountOfAddress(users[u]) == 0) continue;
-            uint256 snap = vm.snapshot();
-            _makeClosableEnvironment();
 
             (uint256 cStaking, uint256 cPeriodical, uint256 cIndefinite) = staking.checkClaimableDataFor(users[u]);
             uint256 balBefore = token.balanceOf(users[u]);
@@ -428,18 +502,31 @@ abstract contract InvariantBase is Test {
                 reason = r;
             }
             uint256 got = token.balanceOf(users[u]) - balBefore;
-            vm.revertTo(snap);
+            assertTrue(vm.revertTo(env), "revertTo(env) failed");
             vm.warp(ts);
 
-            assertTrue(
-                ok, string.concat("claimAll reverted for ", vm.toString(users[u]), ": ", vm.toString(reason))
-            );
-            assertEq(
-                got,
-                cStaking + cPeriodical + cIndefinite,
-                string.concat("claimAll payout != checkClaimableDataFor for ", vm.toString(users[u]))
-            );
+            if (!ok) {
+                failureCount++;
+                failures = string.concat(
+                    failures, " [claimAll reverted for ", vm.toString(users[u]), ": ", vm.toString(reason), "]"
+                );
+            } else if (got != cStaking + cPeriodical + cIndefinite) {
+                failureCount++;
+                failures = string.concat(
+                    failures,
+                    " [claimAll payout != checkClaimableDataFor for ",
+                    vm.toString(users[u]),
+                    ": paid=",
+                    vm.toString(got),
+                    " expected=",
+                    vm.toString(cStaking + cPeriodical + cIndefinite),
+                    "]"
+                );
+            }
         }
+        assertTrue(vm.revertTo(pre), "revertTo(pre) failed");
+        vm.warp(ts);
+        assertEq(failureCount, 0, string.concat("CLAIMABLE DATA MISMATCH:", failures));
     }
 
     /// @dev Per-action payout reconciliation recorded by the handler.
@@ -479,11 +566,10 @@ abstract contract InvariantBase is Test {
     function _check_noPhantomReservations() internal {
         address[] memory users = handler.getUsers();
         for (uint256 u = 0; u < users.length; u++) {
-            uint256 count = staking.checkDepositCountOfAddress(users[u]);
+            ProgramManager.TokenDeposit[] memory ds = _depositsOf(users[u]);
             bool hasOpenPeriodical;
-            for (uint256 i = 0; i < count; i++) {
-                ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
-                if (d.withdrawalDate == 0 && d.stakingEndDate != 0) {
+            for (uint256 i = 0; i < ds.length; i++) {
+                if (ds[i].withdrawalDate == 0 && ds[i].stakingEndDate != 0) {
                     hasOpenPeriodical = true;
                     break;
                 }

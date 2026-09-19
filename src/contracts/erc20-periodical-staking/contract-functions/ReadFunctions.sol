@@ -30,26 +30,6 @@ abstract contract ReadFunctions is ComplianceCheck {
         return (currentStakingPhase, stakingPeriodList, targets, apysBps, staked);
     }
 
-    /// @notice getProgramData plus the user's controller limits and remaining amounts (legacy stake included,
-    ///         voucher extras not included).
-    function getProgramDataWithUserData(address userAddress)
-        external
-        view
-        returns (
-            uint256 currentPhase,
-            uint256[] memory periods,
-            uint256[][] memory targets,
-            uint256[][] memory apysBps,
-            uint256[][] memory staked,
-            uint256[][] memory limits,
-            uint256[][] memory remaining
-        )
-    {
-        (targets, apysBps, staked) = getPhasePeriodCombinedData();
-        (limits, remaining) = getPhasePeriodUserData(userAddress);
-        return (currentStakingPhase, stakingPeriodList, targets, apysBps, staked, limits, remaining);
-    }
-
     function getStakingPeriods() external view returns (uint256[] memory) {
         return stakingPeriodList;
     }
@@ -92,148 +72,8 @@ abstract contract ReadFunctions is ComplianceCheck {
         return (phasePeriodTargets, phasePeriodAPYs, phasePeriodStaked);
     }
 
-    /// @notice The user's controller limit and remaining amount per [phase][periodIndex].
-    /// @dev Both come from the LimitController and include legacy-contract stake; voucher extras are not included.
-    ///      Zero-filled when userAddress or limitController is address(0). Reverts if the controller reverts or
-    ///      returns arrays of the wrong length.
-    function getPhasePeriodUserData(address userAddress)
-        public
-        view
-        returns (uint256[][] memory phasePeriodLimits, uint256[][] memory phasePeriodRemainingAmountForUser)
-    {
-        uint256 _stakingPhaseCount = stakingPhaseCount;
-        uint256[] memory periods = stakingPeriodList;
-        uint256 stakingPeriodListLength = periods.length;
-        address controller = limitController;
-
-        phasePeriodLimits = new uint256[][](_stakingPhaseCount);
-        phasePeriodRemainingAmountForUser = new uint256[][](_stakingPhaseCount);
-
-        bool query = userAddress != address(0) && controller != address(0);
-        uint256[] memory batchLimits;
-        uint256[] memory batchRemaining;
-
-        if (query) {
-            uint256 totalCombinations = _stakingPhaseCount * stakingPeriodListLength;
-            address[] memory wallets = new address[](totalCombinations);
-            uint256[] memory phases = new uint256[](totalCombinations);
-            uint256[] memory periodsFlat = new uint256[](totalCombinations);
-
-            uint256 idx;
-            for (uint256 phase = 0; phase < _stakingPhaseCount;) {
-                for (uint256 periodIndex = 0; periodIndex < stakingPeriodListLength;) {
-                    wallets[idx] = userAddress;
-                    phases[idx] = phase;
-                    periodsFlat[idx] = periods[periodIndex];
-                    unchecked {
-                        ++idx;
-                        ++periodIndex;
-                    }
-                }
-                unchecked {
-                    ++phase;
-                }
-            }
-
-            batchLimits = ILimitController(controller).getAllowedBatch(wallets, phases, periodsFlat);
-            batchRemaining = ILimitController(controller).getRemainingBatch(wallets, phases, periodsFlat);
-            if (batchLimits.length != totalCombinations) revert LengthMismatch(totalCombinations, batchLimits.length);
-            if (batchRemaining.length != totalCombinations) {
-                revert LengthMismatch(totalCombinations, batchRemaining.length);
-            }
-        }
-
-        uint256 batchIdx;
-        for (uint256 phase = 0; phase < _stakingPhaseCount;) {
-            phasePeriodLimits[phase] = new uint256[](stakingPeriodListLength);
-            phasePeriodRemainingAmountForUser[phase] = new uint256[](stakingPeriodListLength);
-
-            if (query) {
-                for (uint256 periodIndex = 0; periodIndex < stakingPeriodListLength;) {
-                    phasePeriodLimits[phase][periodIndex] = batchLimits[batchIdx];
-                    phasePeriodRemainingAmountForUser[phase][periodIndex] = batchRemaining[batchIdx];
-                    unchecked {
-                        ++batchIdx;
-                        ++periodIndex;
-                    }
-                }
-            }
-            unchecked {
-                ++phase;
-            }
-        }
-    }
-
     function getTotalData(Types.DataType dataType) external view returns (uint256) {
         return totalDataList[dataType];
-    }
-
-    function getPhasePeriodDataAll(Types.PhasePeriodDataType dataType) external view returns (uint256[][] memory) {
-        uint256 _stakingPhaseCount = stakingPhaseCount;
-        uint256[] memory _stakingPeriodList = stakingPeriodList;
-
-        uint256[][] memory phasePeriodData = new uint256[][](_stakingPhaseCount);
-        for (uint256 phase = 0; phase < _stakingPhaseCount;) {
-            phasePeriodData[phase] = new uint256[](_stakingPeriodList.length);
-            for (uint256 periodIndex = 0; periodIndex < _stakingPeriodList.length;) {
-                phasePeriodData[phase][periodIndex] =
-                    getPhasePeriodData(dataType, phase, _stakingPeriodList[periodIndex]);
-                unchecked {
-                    ++periodIndex;
-                }
-            }
-            unchecked {
-                ++phase;
-            }
-        }
-        return phasePeriodData;
-    }
-
-    /// @notice Reward the pool must still be able to pay for every configured periodical cell to fill.
-    /// @dev Sum over every (phase < stakingPhaseCount, period in stakingPeriodList, period != 0) of
-    ///      `calculateReward(target - staked, baseApyBps, period)` (0 when the cell is already at or above
-    ///      target). Voucher extra APY is not included. Stakes are never blocked by pool state; this is an ops
-    ///      view so the pool can be funded before deposits mature (a matured periodical claim reverts
-    ///      `NotEnoughFundsInRewardPool` while the pool is short).
-    function getRewardRequiredForTargets() public view returns (uint256 required) {
-        uint256 phaseCount = stakingPhaseCount;
-        uint256[] memory periods = stakingPeriodList;
-        uint256 periodCount = periods.length;
-
-        for (uint256 phase = 0; phase < phaseCount;) {
-            for (uint256 periodIndex = 0; periodIndex < periodCount;) {
-                uint256 period = periods[periodIndex];
-                if (period != 0) {
-                    uint256 target = phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][phase][period];
-                    uint256 staked = phasePeriodDataList[Types.PhasePeriodDataType.STAKED][phase][period];
-                    if (target > staked) {
-                        uint256 apy = phasePeriodDataList[Types.PhasePeriodDataType.APY][phase][period];
-                        required += calculateReward(target - staked, apy, period);
-                    }
-                }
-                unchecked {
-                    ++periodIndex;
-                }
-            }
-            unchecked {
-                ++phase;
-            }
-        }
-    }
-
-    /// @notice Extra reward-pool funding needed so that every already-open periodical deposit AND every
-    ///         open target, once filled, can be paid at maturity.
-    /// @dev `deficit = max(0, totalDataList[REWARD_EXPECTED] - rewardPool)` is what already-open deposits are
-    ///      missing today; `required` is what the remaining target capacity would add.
-    /// @return shortfall `max(0, getRewardRequiredForTargets() + deficit - getCollectableReward())`
-    function getRewardPoolShortfall() external view returns (uint256 shortfall) {
-        uint256 required = getRewardRequiredForTargets();
-        uint256 reserved = totalDataList[Types.DataType.REWARD_EXPECTED];
-        uint256 pool = rewardPool;
-        uint256 deficit = reserved > pool ? reserved - pool : 0;
-        uint256 collectable = pool > reserved ? pool - reserved : 0;
-        uint256 needed = required + deficit;
-        return needed > collectable ? needed - collectable : 0;
     }
 
     function checkTotalClaimableData() external view returns (uint256, uint256, uint256) {
@@ -283,28 +123,6 @@ abstract contract ReadFunctions is ComplianceCheck {
         return depositView;
     }
 
-    /// @notice Get deposits [fromIndex, toIndex) of a user.
-    /// @dev Reverts InvalidRange when fromIndex > toIndex or toIndex exceeds the deposit count.
-    function getDepositsInRangeBy(address userAddress, uint256 fromIndex, uint256 toIndex)
-        external
-        view
-        returns (TokenDeposit[] memory)
-    {
-        if (fromIndex > toIndex || toIndex > stakerDepositList[userAddress].length) {
-            revert InvalidRange(fromIndex, toIndex);
-        }
-        TokenDeposit[] memory userDepositsInRange = new TokenDeposit[](toIndex - fromIndex);
-
-        for (uint256 i = fromIndex; i < toIndex;) {
-            userDepositsInRange[i - fromIndex] = getDeposit(userAddress, i);
-            unchecked {
-                ++i;
-            }
-        }
-
-        return userDepositsInRange;
-    }
-
     function getUserData(Types.DataType dataType, address userAddress) external view returns (uint256) {
         return userDataList[dataType][userAddress];
     }
@@ -346,6 +164,22 @@ abstract contract ReadFunctions is ComplianceCheck {
                 ++i;
             }
         }
+    }
+
+    /// @notice How much of a wallet's voucher bonus budget is currently held open.
+    /// @dev The two figures have DIFFERENT scopes, on purpose. `usedTotal` is global: one budget covers every
+    ///      phase, so advancing the phase does not reset it. `usedInCell` is per (phase, period), so the same
+    ///      period in a new phase starts at 0 with its own cap. Both are concurrent, not lifetime -- closing a
+    ///      deposit lowers them again. Subtract them from the voucher's extraLimitTotal / extraLimitPerCell to
+    ///      get what the wallet can still stake above its controller limit.
+    /// @return usedTotal Bonus held open across every cell, against extraLimitTotal
+    /// @return usedInCell Bonus held open in (`phase`, `period`), against extraLimitPerCell
+    function getBonusUsage(address wallet, uint256 phase, uint256 period)
+        external
+        view
+        returns (uint256 usedTotal, uint256 usedInCell)
+    {
+        return (walletBonusUsed[wallet], walletBonusUsedInCell[phase][period][wallet]);
     }
 
     /// @notice What claimAll would pay the user right now, ignoring pool shortfalls. Frozen deposits are skipped.

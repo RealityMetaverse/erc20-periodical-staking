@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "./VoucherAttackBase.sol";
+import {StakingLens} from "../../../../src/contracts/erc20-periodical-staking/StakingLens.sol";
 
 /// @title DepositIndex
 /// @notice `stakerActiveDepositStartIndex` must never point past an open (or frozen) deposit, `claimAll` must never
@@ -227,15 +228,16 @@ contract DepositIndexTest is VoucherAttackBase {
     function test_getDepositsInRangeBy_badRanges_customError() public {
         _stake(alice, 0, P30, 1_000 * ONE);
         _stake(alice, 0, P30, 1_000 * ONE);
+        _lens(staking);
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidRange.selector, 2, 1));
-        staking.getDepositsInRangeBy(alice, 2, 1);
+        _lens(staking).getDepositsInRangeBy(alice, 2, 1);
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidRange.selector, 0, 3));
-        staking.getDepositsInRangeBy(alice, 0, 3);
-        assertEq(staking.getDepositsInRangeBy(alice, 1, 1).length, 0);
-        assertEq(staking.getDepositsInRangeBy(alice, 0, 2).length, 2);
-        assertEq(staking.getDepositsInRangeBy(bob, 0, 0).length, 0);
-        (bool ok, bytes memory ret) = address(staking).staticcall(
-            abi.encodeCall(staking.getDepositsInRangeBy, (alice, type(uint256).max, 0))
+        _lens(staking).getDepositsInRangeBy(alice, 0, 3);
+        assertEq(_lens(staking).getDepositsInRangeBy(alice, 1, 1).length, 0);
+        assertEq(_lens(staking).getDepositsInRangeBy(alice, 0, 2).length, 2);
+        assertEq(_lens(staking).getDepositsInRangeBy(bob, 0, 0).length, 0);
+        (bool ok, bytes memory ret) = address(_lens(staking)).staticcall(
+            abi.encodeCall(StakingLens.getDepositsInRangeBy, (alice, type(uint256).max, 0))
         );
         assertFalse(ok);
         assertFalse(_isPanic(ret), "must not panic");

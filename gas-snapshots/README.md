@@ -8,6 +8,7 @@ One `forge snapshot` per released version, each produced from that version's own
 | v0.2.4.gas-snapshot | v0.2.4 | e56c3c2 |
 | v0.3.0.gas-snapshot | v0.3.0 | 13699fe |
 | v0.4.0.gas-snapshot | v0.4.0 | the v0.4.0 commit |
+| v0.5.0.gas-snapshot | v0.5.0 | the v0.5.0 commit |
 
 v0.1.0 to v0.2.2 have no snapshot. Those commits do not track their libraries (no `lib/` submodules or remappings), so their tests cannot be rebuilt reliably today.
 

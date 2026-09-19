@@ -44,7 +44,7 @@ abstract contract Errors {
     // =        Target & Limit Errors       =
     // ======================================
     error AmountExceedsTarget(uint256 stakingPhase, uint256 stakingPeriod, uint256 stakingTarget);
-    /// @param allowed Remaining headroom for this stake (controller limit + voucher extraLimit - used), 0 if none.
+    /// @param allowed Remaining headroom for this stake (unused controller limit + unspent voucher bonus), 0 if none.
     error StakingLimitExceeded(address wallet, uint256 phase, uint256 period, uint256 requested, uint256 allowed);
 
     // ======================================
@@ -74,7 +74,17 @@ abstract contract Errors {
     error VoucherExpired(uint256 validUntil, uint256 currentTime);
     error VoucherNonceUsed(address wallet, uint256 nonce);
     error VoucherExtraApyTooHigh(uint256 extraApyBps, uint256 maxExtraApyBps);
-    error VoucherExtraLimitTooHigh(uint256 extraLimit, uint256 maxExtraLimit);
+    /// @notice The voucher's total bonus budget exceeds `maxExtraLimitTotal`. The budget is GLOBAL -- one budget
+    ///         per wallet across every phase, which advancing the phase does not refill.
+    error VoucherExtraLimitTotalTooHigh(uint256 extraLimitTotal, uint256 maxExtraLimitTotal);
+    /// @notice The voucher's per-cell bonus allowance exceeds `maxExtraLimitPerCell`.
+    error VoucherExtraLimitPerCellTooHigh(uint256 extraLimitPerCell, uint256 maxExtraLimitPerCell);
+    /// @notice The voucher is valid for longer than `maxVoucherValidity` allows, measured from now.
+    /// @dev Bounds the blast radius of a leaked signer key: a stolen key cannot mint vouchers good for years.
+    error VoucherValidityTooLong(uint256 validUntil, uint256 maxValidUntil);
+    /// @notice The wallet is barred from opening new stakes. Its existing deposits are unaffected and it can
+    ///         still withdraw and claim -- a block never traps funds.
+    error WalletBlocked(address wallet);
 
     // ======================================
     // =        Access Control Errors       =

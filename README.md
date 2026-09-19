@@ -1,23 +1,72 @@
-# ERC20 Periodical Staking v0.4.0
+# ERC20 Periodical Staking v0.5.0
 
 ## Deployment
 
-- **v0.4.0**: _not yet deployed_
+- **v0.5.0**: _not yet deployed_ (current source; `VERSION()` returns `0.5.0`)
+- **v0.4.0**: _not yet deployed on mainnet_ (an earlier build is on Amoy; its voucher has 7 fields and is NOT compatible)
 - **v0.3.0**: _not yet deployed_
 - **v0.2.4**: `0xa816fC819c2BD73c0AEdf60E0b06daF2Bff9691F` (affected by the period-removal lockup, see Known Issues)
+
+## Changes in v0.5.0
+
+v0.5.0 changes what the voucher's extra limit MEANS, adds an on-chain wallet block, bounds voucher lifetime, and publishes a version string. The voucher struct changes shape, so **every v0.4.0 voucher and signer is incompatible** - see the typehash below.
+
+Three things a reader needs and cannot infer from the code:
+
+- **The bonus is a metered BUDGET, not a per-stake grant.** In v0.4.0 the voucher's `extraLimit` was added to the wallet's limit on every stake, so the same bonus was handed out again in every period and again on every voucher. In v0.5.0 the contract meters what the wallet has actually spent above its controller limit and subtracts it, so re-presenting a voucher (or issuing a fresh one with the same numbers) grants nothing extra.
+- **The total budget is GLOBAL - one per wallet, across every phase.** Advancing the phase does not refill it. It is concurrent, not lifetime: closing a deposit returns its bonus, so a wallet can spend its 50,000 many times over the programme's life but never hold more than 50,000 of bonus open at once.
+- **A "cell" is a `(phase, period)` PAIR.** The same period in a different phase is a different cell with its own per-cell cap, exactly as the LimitController keys `allowed` and `used`. The per-cell cap stops a wallet concentrating its bonus into one period *within* a phase; spreading it across phases is deliberate, because a phase runs about a year, and the global total is the ceiling that spans them.
+
+**The voucher gains a field and one is renamed.** `extraLimit` is gone. The EIP-712 type is now:
+
+```
+StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)
+```
+
+`keccak256` of that string is `0xa7048f901162583d7c998e76f924674fc01196a5a7a84f036f7db892508bd49b`, which is the value compiled into `VOUCHER_TYPEHASH()`. The domain is unchanged: `{ name: "ERC20PeriodicalStaking", version: "1", chainId, verifyingContract }` - the domain `version` is **not** a contract version and stays `"1"`. Field order is the encoding order; a tuple built in the old order produces a valid signature over the wrong digest and every stake reverts `InvalidVoucherSignature`. Check `VERSION()` before blaming the key.
+
+- `extraLimitTotal` is the wallet's whole bonus budget, capped by `maxExtraLimitTotal()` (`VoucherExtraLimitTotalTooHigh`).
+- `extraLimitPerCell` is how much of it may sit in any one cell, capped by the new `maxExtraLimitPerCell()` (`VoucherExtraLimitPerCellTooHigh`).
+
+**The limit rule.** The contract reads `getAllowedAndUsed(wallet, phase, period)`, subtracts the bonus already metered in that cell from `used` to get the base-funded part, and allows `tokenAmount <= baseRoom + min(extraLimitTotal - usedTotal, extraLimitPerCell - usedInCell)` (saturating, `StakingLimitExceeded`). Whatever goes above `baseRoom` is charged to the meter and released when the deposit closes.
+
+**Bonus is released on exactly three paths**, each using the deposit's own phase and period: `withdrawDeposit` / `withdrawDepositPartial`, the `READY_TO_CLAIM` branch of `claimDeposit` (and its batch forms), and `seizeDeposit`. An indefinite-deposit reward claim does **not** release, because it pays reward only and leaves the position open.
+
+**Wallet block.** `setWalletBlocked(address, bool)` and `setWalletsBlocked(address[], bool)` (admins and owner) bar a wallet from opening NEW stakes; `walletBlocked(address)` reads the flag and `stakeWithVoucher` reverts `WalletBlocked`. It is checked first, before the nonce is consumed. **It gates staking only** - withdraw, claim, `claimAll`, `claimRange` and existing deposits are untouched, and a block never traps funds. It exists because it is the only lever that still works if the voucher signing key leaks: the attacker signs their own vouchers, so the backend's issuance blocklist never sees them.
+
+Note this is separate from a LimitController wallet limit of `0`, which removes the wallet's BASE allowance only - a voucher bonus still stakes on top of it.
+
+**Voucher validity ceiling.** `maxVoucherValidity()` (`uint32` seconds) bounds how far ahead `validUntil` may sit, measured from now, so a leaked signer key cannot mint vouchers good for years (`VoucherValidityTooLong`). `setMaxVoucherValidity(uint256)` rejects `0` (`ZeroAmountProvided`) - the protection has no off switch, lower it instead. The constructor defaults it to `1800`, the maximum the backend's own `validity_seconds` can be set to, so a contract deployed outside the script is still usable. The backend reads this ceiling and refuses to sign with a 503 rather than issuing a voucher that would revert.
+
+**Version string.** `VERSION()` returns `"0.5.0"`. Read it at startup and refuse to run when it disagrees with the ABI you built against.
+
+**New views.** `getBonusUsage(address wallet, uint256 phase, uint256 period)` returns `(uint256 usedTotal, uint256 usedInCell)`; `getBonusUsageBatch(address wallet, uint256 phase, uint256[] periods)` (on the **StakingLens**, see below) returns `(uint256 usedTotal, uint256[] usedPerCell)` so a whole period table costs one call. Both report USAGE, not remaining - the budget lives on the voucher. The two returns have different scopes: `usedTotal` is global and does not reset on a phase change, `usedInCell` is per cell and does.
+
+**Contract size and the StakingLens.** With the v0.5.0 additions the staking contract's runtime code reached 25,533 bytes, 957 over the 24,576-byte EIP-170 limit, so it could not be deployed (`forge test` does not enforce that limit; `forge build --sizes` does). No optimizer setting closes the gap. Seven read-only views that only bundle other reads moved to a separate contract, `src/contracts/erc20-periodical-staking/StakingLens.sol`: `getProgramDataWithUserData`, `getPhasePeriodUserData`, `getDepositsInRangeBy`, `getPhasePeriodDataAll`, `getRewardRequiredForTargets`, `getRewardPoolShortfall`, `getBonusUsageBatch`. Names, arguments and return shapes are unchanged - a caller swaps only the address and ABI for these calls. The staking contract is now 23,075 bytes (1,501 spare) and the lens 5,654. No state-changing code moved. `getUserPhasePeriodDataBatch` stays on the staking contract because the LimitController calls it on-chain; `checkTotalClaimableData` stays because it walks the internal staker list.
+
+The lens is bound to one staking contract (`STAKING()`), has no owner, storage or privileges, and only calls public getters, so anyone can deploy or replace it. The `deploy-v050` rpc alias reads `RPC_URL` from `deploy/v050/<network>.env`, not from your shell, so load that file in a subshell: `( set -a; . deploy/v050/<network>.env; set +a; STAKING=<staking address> forge script script/DeployLens.s.sol --rpc-url deploy-v050 --account <KEYSTORE_ACCOUNT> --sender <DEPLOYER_ADDRESS> --broadcast --slow )` (add `--verify` when `ETHERSCAN_API_KEY` is set in that file). Deploy it right after the staking contract and give its address to the frontend; it is manual step 4 below and in the script's own output.
+
+New functions: `setMaxExtraLimitPerCell`, `maxExtraLimitPerCell`, `setMaxVoucherValidity`, `maxVoucherValidity`, `setWalletBlocked`, `setWalletsBlocked`, `walletBlocked`, `getBonusUsage`, `VERSION`; on the lens: `getBonusUsageBatch`.
+New events: `UpdateMaxExtraLimitPerCell`, `UpdateMaxVoucherValidity`, `UpdateWalletBlocked`, `BonusConsumed(wallet, phase, period, depositNumber, amount)`, `BonusReleased(wallet, phase, period, depositNumber, amount)`.
+New errors: `VoucherExtraLimitPerCellTooHigh`, `VoucherValidityTooLong`, `WalletBlocked`.
+Unchanged: the `Stake` event signature, so indexers do not need to change for it.
+
+**Renamed, so the ceilings read like the voucher fields they cap** (`extraLimitTotal` / `extraLimitPerCell`): `maxExtraLimit()` -> `maxExtraLimitTotal()`, `setMaxExtraLimit` -> `setMaxExtraLimitTotal`, event `UpdateMaxExtraLimit` -> `UpdateMaxExtraLimitTotal`, error `VoucherExtraLimitTooHigh(extraLimit, maxExtraLimit)` -> `VoucherExtraLimitTotalTooHigh(extraLimitTotal, maxExtraLimitTotal)`, env var `MAX_EXTRA_LIMIT` -> `MAX_EXTRA_LIMIT_TOTAL`. The deploy tooling is now `script/DeployV050.s.sol`, `script/deploy-v050.sh`, `script/verify-v050.sh` and `deploy/v050/`. The v0.4.0 section below keeps the old names on purpose: that is what a v0.4.0 contract exposes.
+
+Deployment adds two required env vars, `MAX_EXTRA_LIMIT_PER_CELL` and `MAX_VOUCHER_VALIDITY`; both are read back and asserted after deploy, and `deploy-v050.sh` refuses a per-cell ceiling of 0 alongside a non-zero total, which would silently disable the bonus.
 
 ## Changes in v0.4.0
 
 v0.4.0 is a new immutable deployment of `src/contracts/erc20-periodical-staking/`, built on v0.3.0. Staking is only possible with a voucher signed by the backend, which decides eligibility (VIP level, whitelisting) before signing. The voucher can add an extra APY and an extra limit, both capped by maximums stored in the contract. The RequirementChecker hook and the whitelist are removed, APYs move to basis points, the LimitController also counts stake held in the v0.2.4 deployment, and admins/owner can freeze and seize deposits. Deposit storage is packed from 8 slots to 2.
 
-**Voucher-only staking.** `safeStake` is removed. The only entry point is `stakeWithVoucher(StakeVoucher voucher, bytes signature, uint256 tokenAmount, uint256 expectedApyBps) returns (uint256 depositNumber)`. The voucher is EIP-712 typed data with domain `{ name: "ERC20PeriodicalStaking", version: "1", chainId, verifyingContract }` and type `StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimit,uint256 validUntil,uint256 nonce)`. Rules:
+**Voucher-only staking.** `safeStake` is removed. The only entry point is `stakeWithVoucher(StakeVoucher voucher, bytes signature, uint256 tokenAmount, uint256 expectedApyBps) returns (uint256 depositNumber)`. The voucher is EIP-712 typed data with domain `{ name: "ERC20PeriodicalStaking", version: "1", chainId, verifyingContract }` and type `StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimit,uint256 validUntil,uint256 nonce)` - **superseded in v0.5.0, which renamed `extraLimit` and added `extraLimitPerCell`; use the 8-field type above**. Rules:
 
 - the signature must come from `voucherSigner()`; it is checked with OpenZeppelin `SignatureChecker`, so an ERC-1271 contract signer works too;
 - `voucher.wallet` must be `msg.sender` (`VoucherWalletMismatch`);
 - `block.timestamp <= validUntil` — `validUntil` is inclusive unix seconds (`VoucherExpired`);
 - the nonce is single-use per wallet and may be any `uint256`; used nonces are tracked in a per-wallet bitmap (`VoucherNonceUsed`);
 - the voucher fixes the phase and period: the phase must be the current phase and the period must exist in it;
-- `extraApyBps <= maxExtraApyBps()` and `extraLimit <= maxExtraLimit()` (`VoucherExtraApyTooHigh`, `VoucherExtraLimitTooHigh`);
+- `extraApyBps <= maxExtraApyBps()` and `extraLimit <= maxExtraLimit()` (`VoucherExtraApyTooHigh`, `VoucherExtraLimitTooHigh`) - in v0.5.0 this is `extraLimitTotal`, plus a per-cell cap;
 - the effective APY is `baseApyBps + extraApyBps` and must be **at least** `expectedApyBps` (`ApyBelowExpected`). This floor replaces v0.3.0's exact-equality `PhasePeriodAPYChanged` front-running guard.
 
 Checks run in this order: staking open → signer set → limit controller set → wallet → expiry → nonce → extra caps → signature → minimum deposit → phase → period → expected APY → staking target → wallet limit; then the nonce is marked, the deposit and reserved reward are written, `Stake` is emitted and the tokens are pulled last. The stake path is `nonReentrant`. Helper views for the backend signer: `getVoucherDigest(voucher)`, `isVoucherNonceUsed(wallet, nonce)`, `VOUCHER_TYPEHASH()`, `eip712Domain()`.
@@ -26,9 +75,9 @@ Checks run in this order: staking open → signer set → limit controller set �
 
 **APY in basis points.** `10_000` = 100%, so fractional rates work (`225` = 2.25%). This covers `pushStakingPhase` / `addStakingPeriod` / `setPhasePeriodData` inputs, `getPhasePeriodData(APY, …)`, the APYs returned by `getProgramData`, the deposit's APY field, the `Stake` event, the second argument of `calculateReward` and indefinite-deposit accrual. A deposit stores its effective APY (base + extra) for its whole life; later base-rate changes do not affect it. A period exists in a phase exactly when its APY cell is non-zero (APY 0 is still rejected on write).
 
-**Extras and their maximums.** New owner settings `setMaxExtraApyBps(uint256)` and `setMaxExtraLimit(uint256)`, with views `maxExtraApyBps()` (`uint32`) and `maxExtraLimit()` (`uint128`).
+**Extras and their maximums.** New owner settings `setMaxExtraApyBps(uint256)` and `setMaxExtraLimit(uint256)`, with views `maxExtraApyBps()` (`uint32`) and `maxExtraLimit()` (`uint128`). v0.5.0 adds `setMaxExtraLimitPerCell` / `maxExtraLimitPerCell` and `setMaxVoucherValidity` / `maxVoucherValidity`. Lowering any of these caps NEW vouchers only; bonus already held open is never clawed back.
 
-**Limits through the LimitController, including the v0.2.4 deployment.** A stake reverts `LimitControllerNotSet` when no controller is configured; v0.3.0's `address(0)` fallback (`target - staked`) is gone from the stake path. The staking contract makes one call, `getAllowedAndUsed(wallet, phase, period)`, and allows `tokenAmount <= allowed + voucher.extraLimit - used` (saturating at 0, `StakingLimitExceeded`).
+**Limits through the LimitController, including the v0.2.4 deployment.** A stake reverts `LimitControllerNotSet` when no controller is configured; v0.3.0's `address(0)` fallback (`target - staked`) is gone from the stake path. The staking contract makes one call, `getAllowedAndUsed(wallet, phase, period)`, and allows `tokenAmount <= allowed + voucher.extraLimit - used` (saturating at 0, `StakingLimitExceeded`). **v0.5.0 replaces this rule** - the extra is a metered budget, not an addition to the limit; see Changes in v0.5.0.
 
 The LimitController gains an optional `legacyStakingContract`, set with `setLegacyStakingContract(address)` (owner; `address(0)` disables it; rejects the staking contract's own address with `SameStakingAndLegacyContract`; emits `LegacyStakingContractSet`). `used` is the wallet's STAKING cell in the staking contract **plus** the same `(phase, period)` cell in the legacy contract. There is no remapping: a phase or period that does not exist in one of the contracts reads 0 there and never reverts, so phases and periods can change freely. `getUsed` is new; `getRemaining` / `getRemainingBatch` now subtract legacy stake; `getAllowed` / `getAllowedBatch` are unchanged and never include voucher extras. The explicit-zero wallet limit (`hasWalletLimit`) behaves as in v0.3.0. Note that if the legacy contract itself reverts on a read, stakes revert until the owner unsets it.
 
@@ -79,9 +128,9 @@ Removed functions: `safeStake`, `checkIfUserMeetsRequirements`, `checkIfUserExce
 4. Add the new contract to RequirementCheckerV2 (`0x716ff1f64cC2B7c96ba9DDADfc08bB703F8bcA59` on Polygon) so its stake keeps counting toward wallet worth (backend VIP level 0, daily login and event worth checks). As the checker owner call `setPeriodicalStakingContracts([0x29cE6711fA6A8196D2b9538C5cE6293941e98749, 0xa816fC819c2BD73c0AEdf60E0b06daF2Bff9691F, <v0.4.0 address>])`. The setter replaces the whole list, so the two existing contracts must be passed again. Check that `periodicalStakingContractCount()` returns 3 and `periodicalStakingContracts(2)` is the new address. Do this before step 5.
 5. Close v0.2.4 to new stakes with `changeActionAvailability(STAKING, false)`. Claims and withdrawals there stay open.
 
-#### Deploying v0.4.0 with DeployV040.s.sol
+#### Deploying v0.5.0 with DeployV050.s.sol
 
-`script/DeployV040.s.sol` does steps 1–3 as a like-for-like copy of **the same network's** v0.2.4 contract: it reads the program from chain, deploys `ERC20PeriodicalStaking(sourceToken)` and `LimitController(staking)`, applies the copy, then re-reads every value from the new contracts and `require`s it equals the source.
+`script/DeployV050.s.sol` does steps 1–3 as a like-for-like copy of **the same network's** v0.2.4 contract: it reads the program from chain, deploys `ERC20PeriodicalStaking(sourceToken)` and `LimitController(staking)`, applies the copy, then re-reads every value from the new contracts and `require`s it equals the source.
 
 Source resolution (per `block.chainid`, nothing is taken from another network):
 
@@ -103,26 +152,26 @@ Action availability: staking on the new contract is closed right after deploymen
 Settings live in one env file per network, never in the shell:
 
 ```bash
-cp deploy/v040/amoy.env.example deploy/v040/amoy.env   # or polygon.env.example -> polygon.env
-# fill in RPC_URL, VOUCHER_SIGNER, TREASURY, MAX_EXTRA_APY_BPS, MAX_EXTRA_LIMIT, DEPLOYER_ADDRESS, DEPLOYER_ACCOUNT
-./script/deploy-v040.sh amoy               # simulate (default, no transactions)
-./script/deploy-v040.sh amoy --broadcast   # send
+cp deploy/v050/amoy.env.example deploy/v050/amoy.env   # or polygon.env.example -> polygon.env
+# fill in RPC_URL, VOUCHER_SIGNER, TREASURY, MAX_EXTRA_APY_BPS, MAX_EXTRA_LIMIT_TOTAL, DEPLOYER_ADDRESS, DEPLOYER_ACCOUNT
+./script/deploy-v050.sh amoy               # simulate (default, no transactions)
+./script/deploy-v050.sh amoy --broadcast   # send
 ```
 
-`deploy/v040/example.env` documents every variable, grouped into required and optional. The per-network `.env.example` files already hold that network's `SOURCE_STAKING` and `REQUIREMENT_CHECKER_V2`. Filled-in `deploy/v040/*.env` files are git-ignored.
+`deploy/v050/example.env` documents every variable, grouped into required and optional. The per-network `.env.example` files already hold that network's `SOURCE_STAKING` and `REQUIREMENT_CHECKER_V2`. Filled-in `deploy/v050/*.env` files are git-ignored.
 
-Required: `VOUCHER_SIGNER` (backend voucher signer), `TREASURY` (receiver of seized principal), `MAX_EXTRA_APY_BPS` (e.g. 500 = 5.00%), `MAX_EXTRA_LIMIT` (token wei). Optional: `NEW_OWNER` (staking: two-step transfer, NEW_OWNER must `acceptOwnership`; LimitController: OpenZeppelin `Ownable`, transferred immediately), `ADMINS` (comma-separated), `OPEN_STAKING` (default false), `REWARD_TOP_UP` (default 0 = no funding; >0 = approve + `provideReward` from the deployer), `WALLET_LIMITS_FILE`, `SOURCE_STAKING` and `REQUIREMENT_CHECKER_V2` (default: the per-chain table above).
+Required: `VOUCHER_SIGNER` (backend voucher signer), `TREASURY` (receiver of seized principal), `MAX_EXTRA_APY_BPS` (e.g. 500 = 5.00%), `MAX_EXTRA_LIMIT_TOTAL` (token wei). Optional: `NEW_OWNER` (staking: two-step transfer, NEW_OWNER must `acceptOwnership`; LimitController: OpenZeppelin `Ownable`, transferred immediately), `ADMINS` (comma-separated), `OPEN_STAKING` (default false), `REWARD_TOP_UP` (default 0 = no funding; >0 = approve + `provideReward` from the deployer), `WALLET_LIMITS_FILE`, `SOURCE_STAKING` and `REQUIREMENT_CHECKER_V2` (default: the per-chain table above).
 
-`script/deploy-v040.sh <polygon|amoy> [--broadcast]`:
+`script/deploy-v050.sh <polygon|amoy> [--broadcast]`:
 
-- refuses to run when a repo-root `.env` defines any variable this deployment reads (`SOURCE_STAKING`, `REQUIREMENT_CHECKER_V2`, `VOUCHER_SIGNER`, `TREASURY`, `MAX_EXTRA_APY_BPS`, `MAX_EXTRA_LIMIT`, `NEW_OWNER`, `ADMINS`, `OPEN_STAKING`, `REWARD_TOP_UP`, `WALLET_LIMITS_FILE`, `PRIVATE_KEY`, `RPC_URL`, `ETHERSCAN_API_KEY`, or any `ETH_*` / `FOUNDRY_*`), `export NAME=` lines included, and names them. forge auto-loads that file, so it could otherwise fill values the network env file leaves empty. A root `.env` that defines none of them only gets a warning;
-- loads only `deploy/v040/<network>.env` (`set -a; source; set +a`) and fails with the `cp` command if it is missing;
-- rejects placeholders and malformed addresses, numbers, `ADMINS` entries and keys; `WALLET_LIMITS_FILE` must be an existing file under `deploy/v040/`;
+- refuses to run when a repo-root `.env` defines any variable this deployment reads (`SOURCE_STAKING`, `REQUIREMENT_CHECKER_V2`, `VOUCHER_SIGNER`, `TREASURY`, `MAX_EXTRA_APY_BPS`, `MAX_EXTRA_LIMIT_TOTAL`, `NEW_OWNER`, `ADMINS`, `OPEN_STAKING`, `REWARD_TOP_UP`, `WALLET_LIMITS_FILE`, `PRIVATE_KEY`, `RPC_URL`, `ETHERSCAN_API_KEY`, or any `ETH_*` / `FOUNDRY_*`), `export NAME=` lines included, and names them. forge auto-loads that file, so it could otherwise fill values the network env file leaves empty. A root `.env` that defines none of them only gets a warning;
+- loads only `deploy/v050/<network>.env` (`set -a; source; set +a`) and fails with the `cp` command if it is missing;
+- rejects placeholders and malformed addresses, numbers, `ADMINS` entries and keys; `WALLET_LIMITS_FILE` must be an existing file under `deploy/v050/`;
 - checks `cast chain-id` of `RPC_URL` against the network (polygon 137, amoy 80002);
 - exports every variable the script reads, including empty ones. The script treats an empty value as unset and uses the default, so an empty `NEW_OWNER=` really means "keep the deployer";
-- prints the settings as the script resolves them (the RPC as host only), then runs `forge script script/DeployV040.s.sol --rpc-url deploy-v040`. The script prints its own resolved settings under `=== DeployV040: source (v0.2.4) ===`: compare them with the banner and stop if anything differs.
+- prints the settings as the script resolves them (the RPC as host only), then runs `forge script script/DeployV050.s.sol --rpc-url deploy-v050`. The script prints its own resolved settings under `=== DeployV050: source (v0.2.4) ===`: compare them with the banner and stop if anything differs.
 
-Secrets stay out of forge's command line (visible in `ps`): the RPC URL goes through the `deploy-v040` alias in `foundry.toml` (`[rpc_endpoints] deploy-v040 = "${RPC_URL}"`) and reaches `cast chain-id` as `ETH_RPC_URL`; the verification key is exported as `ETHERSCAN_API_KEY` for forge to read; a `PRIVATE_KEY` is exported to the script, which calls `vm.startBroadcast(PRIVATE_KEY)` (and checks it matches `DEPLOYER_ADDRESS` when that is set).
+Secrets stay out of forge's command line (visible in `ps`): the RPC URL goes through the `deploy-v050` alias in `foundry.toml` (`[rpc_endpoints] deploy-v050 = "${RPC_URL}"`) and reaches `cast chain-id` as `ETH_RPC_URL`; the verification key is exported as `ETHERSCAN_API_KEY` for forge to read; a `PRIVATE_KEY` is exported to the script, which calls `vm.startBroadcast(PRIVATE_KEY)` (and checks it matches `DEPLOYER_ADDRESS` when that is set).
 
 Without `--broadcast` the run is a simulation. With `--broadcast` it signs with the Foundry keystore account (`--account "$DEPLOYER_ACCOUNT" --sender "$DEPLOYER_ADDRESS"`, created with `cast wallet import <name> --interactive`), and adds `--verify` when `ETHERSCAN_API_KEY` (or `POLYGONSCAN_API_KEY`) is set. A `PRIVATE_KEY` in the env file is accepted as a fallback but never printed or passed as a flag; with both set the keystore wins. Extra forge flags go in `FORGE_ARGS` (quoted); a flag named there is not added again by the wrapper, so `FORGE_ARGS` also overrides the robustness defaults below.
 
@@ -152,19 +201,19 @@ The wrapper now always passes, and prints in its banner:
 
 **What was and was not reproduced.** The fix is verified end to end: against anvil forks of Amoy and Polygon the wrapper completes with every transaction succeeding and the self-check passing. The original underestimation itself could **not** be reproduced locally. On a fork, forge derives each limit from the script simulation and those numbers are accurate — `pushStakingPhase` estimated 444,698 against 418,541 actually used — and the run succeeds even with the old flags, with instant mining and with a 2s block time alike. So the stale-state explanation above is the reading most consistent with the evidence (a 39,273 limit is the cost of `pushStakingPhase` over an empty period list, which no simulation of this script produces), but it is a hypothesis about that specific live run, not something reproduced here. `--slow` makes the ordering assumption unnecessary either way, and the 200% headroom covers an underestimate of the size actually observed on chain.
 
-**Transaction count was left alone.** v0.4.0 offers no batch setter: `addStakingPeriod(period, apyPerPhase[], targetPerPhase[])` and `pushStakingPhase(apyPerPeriod[], targetPerPeriod[])` each configure one period or one phase, so 8 periods + 2 phases is 10 transactions either way. Pushing phase 0 early and passing per-phase arrays to each `addStakingPeriod` does not reduce the count, makes every period add write two extra cells, and gives up the "all periods exist before any phase is pushed" property the self-check relies on. The ordering is unchanged and the fix is in the gas accounting.
+**Transaction count was left alone.** The contract offers no batch setter: `addStakingPeriod(period, apyPerPhase[], targetPerPhase[])` and `pushStakingPhase(apyPerPeriod[], targetPerPeriod[])` each configure one period or one phase, so 8 periods + 2 phases is 10 transactions either way. Pushing phase 0 early and passing per-phase arrays to each `addStakingPeriod` does not reduce the count, makes every period add write two extra cells, and gives up the "all periods exist before any phase is pushed" property the self-check relies on. The ordering is unchanged and the fix is in the gas accounting.
 
 #### Resuming a broadcast that died partway
 
-The deployment is **idempotent**. Every step in `_deployAndConfigure` is guarded by a read of the target contract, so re-running it against a half-configured deployment sends only the transactions that are still missing and ends in the same full self-check. Set the two addresses in `deploy/v040/<network>.env` and run the same command again:
+The deployment is **idempotent**. Every step in `_deployAndConfigure` is guarded by a read of the target contract, so re-running it against a half-configured deployment sends only the transactions that are still missing and ends in the same full self-check. Set the two addresses in `deploy/v050/<network>.env` and run the same command again:
 
 ```bash
 RESUME_STAKING=0x…      # the ERC20PeriodicalStaking the failed run deployed
 RESUME_CONTROLLER=0x…   # the LimitController, if it got that far (omit if it did not)
-./script/deploy-v040.sh amoy --broadcast
+./script/deploy-v050.sh amoy --broadcast
 ```
 
-Both addresses are printed by the failed run and are in `broadcast/DeployV040.s.sol/<chainid>/run-latest.json` as the `contractAddress` of the two `CREATE` entries. `RESUME_CONTROLLER` without `RESUME_STAKING` is rejected. Before doing anything the script checks that `RESUME_STAKING` has code, uses the same staking token as the source and is still owned by the deployer, that it does not have more phases than the source, and that `RESUME_CONTROLLER` was built for that staking contract and is still owned by the deployer.
+Both addresses are printed by the failed run and are in `broadcast/DeployV050.s.sol/<chainid>/run-latest.json` as the `contractAddress` of the two `CREATE` entries. `RESUME_CONTROLLER` without `RESUME_STAKING` is rejected. Before doing anything the script checks that `RESUME_STAKING` has code, uses the same staking token as the source and is still owned by the deployer, that it does not have more phases than the source, and that `RESUME_CONTROLLER` was built for that staking contract and is still owned by the deployer.
 
 What a resume skips: any setting that already holds the right value, any period that already exists, any phase already pushed, any controller default or wallet limit already correct, any admin already added, and `REWARD_TOP_UP` when the pool is already non-empty (so a resume can never fund twice). Missing periods are added first — with one array entry per phase that already exists, which is what `addStakingPeriod` requires once phases are present — and the remaining phases are pushed afterwards, so the two orders converge on the same configuration. Ownership transfer stays last and is skipped when it already happened.
 
@@ -174,55 +223,57 @@ Limits worth knowing: a resume must run **before** `NEW_OWNER` calls `acceptOwne
 
 #### Verifying an existing deployment
 
-`script/deploy-v040.sh` verifies automatically: it adds `--verify` to the broadcast whenever `ETHERSCAN_API_KEY` (or `POLYGONSCAN_API_KEY`) is set in the env file. **If that line is commented out, the deployment lands unverified** — which is what happened to the first Amoy v0.4.0 deployment. Set the key before broadcasting and there is no second step.
+`script/deploy-v050.sh` verifies automatically: it adds `--verify` to the broadcast whenever `ETHERSCAN_API_KEY` (or `POLYGONSCAN_API_KEY`) is set in the env file. **If that line is commented out, the deployment lands unverified** — which is what happened to the first Amoy v0.4.0 deployment. Set the key before broadcasting and there is no second step.
 
-For a deployment that is already on chain, `script/verify-v040.sh <polygon|amoy>` verifies the pair after the fact. It sends no transactions and uses the same env-file flow as the deploy wrapper: only `deploy/v040/<network>.env` is read, a root `.env` that could override it is refused, placeholders are rejected, and `cast chain-id` must match the network.
+For a deployment that is already on chain, `script/verify-v050.sh <polygon|amoy>` verifies the pair after the fact. It sends no transactions and uses the same env-file flow as the deploy wrapper: only `deploy/v050/<network>.env` is read, a root `.env` that could override it is refused, placeholders are rejected, and `cast chain-id` must match the network.
 
 ```bash
-# deploy/v040/amoy.env: uncomment ETHERSCAN_API_KEY= and put the key after the '='
-./script/verify-v040.sh amoy
+# deploy/v050/amoy.env: uncomment ETHERSCAN_API_KEY= and put the key after the '='
+./script/verify-v050.sh amoy
 ```
 
 Addresses are resolved in this order, and the one used is printed as `addresses from`:
 
 1. `VERIFY_STAKING` / `VERIFY_CONTROLLER` from the env file, when set;
-2. otherwise the two `CREATE` entries in `broadcast/DeployV040.s.sol/<chainid>/run-latest.json` (for Amoy that is `0x792eb1B14F9f4ea94D5893064E256012839eCBA9` and `0x1883729ca8ea466806dd1d9059612f89955ddF89`);
+2. otherwise the two `CREATE` entries in `broadcast/DeployV050.s.sol/<chainid>/run-latest.json` (the earlier v0.4.0 Amoy pair, `0x792eb1B14F9f4ea94D5893064E256012839eCBA9` and `0x1883729ca8ea466806dd1d9059612f89955ddF89`, sits under `broadcast/DeployV040.s.sol/` and is not what this reads);
 3. otherwise it stops and tells you which two variables to set.
 
 A run in which only the staking contract is known is accepted; the summary then says the LimitController was not verified and names the variable to set.
 
 **Constructor arguments are read from the chain, never guessed.** `ERC20PeriodicalStaking(address tokenAddress)` gets its argument from the deployed contract's own `STAKING_TOKEN()`, and `LimitController(address _stakingContract)` from its own `stakingContract()`; both are then ABI-encoded with `cast abi-encode`. Before verifying, the controller's `stakingContract()` must equal the staking address being verified — if it does not, the script stops rather than submit an argument that cannot match the creation code. Both addresses are also checked to actually hold code.
 
-Verification runs `forge verify-contract --chain <id> --verifier etherscan --watch` (the default verifier is Sourcify, so Etherscan is selected explicitly), with `--retries` / `--delay` from `VERIFY_RETRIES` / `VERIFY_DELAY` — the same variables and defaults (10 attempts, 15s) the deploy wrapper uses. A contract the explorer already reports as verified is reported as `already verified (skipped)` and does not fail the run. The key travels as `ETHERSCAN_API_KEY` in the environment and the RPC URL as `ETH_RPC_URL`, so neither appears in `ps`. A submission that was accepted but is still pending can be polled with `./script/verify-v040.sh <network> --guid <GUID>`, which wraps `forge verify-check`.
+Verification runs `forge verify-contract --chain <id> --verifier etherscan --watch` (the default verifier is Sourcify, so Etherscan is selected explicitly), with `--retries` / `--delay` from `VERIFY_RETRIES` / `VERIFY_DELAY` — the same variables and defaults (10 attempts, 15s) the deploy wrapper uses. A contract the explorer already reports as verified is reported as `already verified (skipped)` and does not fail the run. The key travels as `ETHERSCAN_API_KEY` in the environment and the RPC URL as `ETH_RPC_URL`, so neither appears in `ps`. A submission that was accepted but is still pending can be polled with `./script/verify-v050.sh <network> --guid <GUID>`, which wraps `forge verify-check`.
 
-`foundry.toml` lets Solidity read only `deploy/v040/` and `test/v040/fixtures/`, so keep the wallet-limits CSV in `deploy/v040/`.
+`foundry.toml` lets Solidity read only `deploy/v050/` and `test/v050/fixtures/`, so keep the wallet-limits CSV in `deploy/v050/`.
 
-`WALLET_LIMITS_FILE` is CSV, one `wallet,phase,period,limit` per line (limit in token wei; blank lines, `#` comments and a `wallet,...` header are ignored). Build it from the old controller's `WalletLimitSet(address indexed wallet, uint256 phase, uint256 period, uint256 limit)` events, keeping the latest value per wallet/phase/period (a free RPC tier may cap log ranges; use an explorer export or a paid RPC). The script checks every row against `walletPhasePeriodLimit` on the old controller and reverts on a mismatch. Rows with limit `0` are dropped: on the v0.2.4-era controller 0 means "use the default", while on v0.4.0 `setWalletLimit(…, 0)` means "blocked" (`hasWalletLimit`).
+`WALLET_LIMITS_FILE` is CSV, one `wallet,phase,period,limit` per line (limit in token wei; blank lines, `#` comments and a `wallet,...` header are ignored). Build it from the old controller's `WalletLimitSet(address indexed wallet, uint256 phase, uint256 period, uint256 limit)` events, keeping the latest value per wallet/phase/period (a free RPC tier may cap log ranges; use an explorer export or a paid RPC). The script checks every row against `walletPhasePeriodLimit` on the old controller and reverts on a mismatch. Rows with limit `0` are dropped: on the v0.2.4-era controller 0 means "use the default", while on the new controller `setWalletLimit(…, 0)` removes the wallet's BASE allowance (`hasWalletLimit`). That is not a block - a voucher bonus still stakes on top of it, and blocking outright is `setWalletBlocked` on the staking contract.
 
 The equivalent raw forge calls, if the wrapper cannot be used. Export the variables by hand first (`RPC_URL`, the settings, `ETHERSCAN_API_KEY` for `--verify`), and make sure no root `.env` defines any of them:
 
 ```bash
-forge script script/DeployV040.s.sol --rpc-url deploy-v040 --sender <DEPLOYER_ADDRESS>                 # simulate
-forge script script/DeployV040.s.sol --rpc-url deploy-v040 --account <KEYSTORE_ACCOUNT> --sender <DEPLOYER_ADDRESS> \
+forge script script/DeployV050.s.sol --rpc-url deploy-v050 --sender <DEPLOYER_ADDRESS>                 # simulate
+forge script script/DeployV050.s.sol --rpc-url deploy-v050 --account <KEYSTORE_ACCOUNT> --sender <DEPLOYER_ADDRESS> \
   --broadcast --verify                                                                                  # send
 ```
 
 What it logs: the source config and old controller (owner, target), the inputs, the list of what was not copied, a self-check table (`phase P period Nd: APY x% -> y bps | target a -> b`, default limit old -> new, minimum deposit, current phase, availability, admins, wallet-limit count), the deployed addresses and the remaining manual steps:
 
-1. That network's RequirementCheckerV2 owner: `setPeriodicalStakingContracts(<current list read live> + <v0.4.0 address>)`, then check the new count (on Polygon: `[0x29cE6711fA6A8196D2b9538C5cE6293941e98749, 0xa816fC819c2BD73c0AEdf60E0b06daF2Bff9691F, <v0.4.0 address>]`, count 3). A note is printed when the source itself is not on the list.
+1. That network's RequirementCheckerV2 owner: `setPeriodicalStakingContracts(<current list read live> + <new staking address>)`, then check the new count (on Polygon: `[0x29cE6711fA6A8196D2b9538C5cE6293941e98749, 0xa816fC819c2BD73c0AEdf60E0b06daF2Bff9691F, <v0.4.0 address>]`, count 3). A note is printed when the source itself is not on the list.
 2. Fund the reward pool with `provideReward` (unless `REWARD_TOP_UP` did).
-3. In the backend `pawnshop/networks/<chainid>.json` set `CONTRACTS.PERIODIC_STAKING_V040.ADDRESS = <staking>` and `DEPLOYMENT_BLOCK = <block>`. The script prints the block number from just before its first transaction, a safe lower bound. The exact block is the `blockNumber` of the receipt whose `contractAddress` is the staking contract in `broadcast/DeployV040.s.sol/<chainid>/run-latest.json`.
-4. Source owner: `changeActionAvailability(STAKING, false)` on the source.
-5. `NEW_OWNER`: `acceptOwnership()` on the staking contract.
-6. When ready: `changeActionAvailability(STAKING, true)` on the new contract.
+3. In the backend `pawnshop/networks/<chainid>.json` set `CONTRACTS.PERIODIC_STAKING_V050.ADDRESS = <staking>` and `DEPLOYMENT_BLOCK = <block>`. The script prints the block number from just before its first transaction, a safe lower bound. The exact block is the `blockNumber` of the receipt whose `contractAddress` is the staking contract in `broadcast/DeployV050.s.sol/<chainid>/run-latest.json`.
+   **Only a backend build that reads `PERIODIC_STAKING_V050` picks this up.** Older builds read `PERIODIC_STAKING_V040`, silently ignore a `V050` block and keep signing vouchers for the old contract, so every stake on the new one reverts `InvalidVoucherSignature`.
+4. Deploy the `StakingLens` for the new staking contract (`script/DeployLens.s.sol`, command in "Contract size and the StakingLens" above) and give its address to the frontend. The frontend reads `getProgramDataWithUserData`, `getDepositsInRangeBy` and `getBonusUsageBatch` from the lens; without it the staking page shows no data.
+5. Source owner: `changeActionAvailability(STAKING, false)` on the source.
+6. `NEW_OWNER`: `acceptOwnership()` on the staking contract.
+7. When ready: `changeActionAvailability(STAKING, true)` on the new contract.
 
-`test/v040/DeployV040Fork.t.sol` runs the same deployment against a fork of whichever network the RPC points at (opt-in: `FORK_RPC_URL`, falling back to `POLYGON_RPC_URL`; optionally `FORK_BLOCK` and `SOURCE_STAKING`; skipped otherwise). It checks the copy against that network's live source, that source stake shows up in `LimitController.getUsed` (a real staker on Polygon; on networks without a known staker it creates legacy stake on the fork), and a voucher stake end to end. `test/v040/DeployV040ForkWalletLimits.t.sol` (same opt-in) has the old controller's owner set wallet limits on the fork, loads them from `test/v040/fixtures/wallet-limits-crlf.csv` (CRLF line endings, a header, a `#` comment, a blank line and a limit-0 row; `.gitattributes` keeps the CRLF), deploys, and checks the new controller's `getAllowed` equals the old one's for every row, that the limit-0 wallet has no `hasWalletLimit`, and that `wallet-limits-mismatch.csv` reverts with the mismatch message.
+`test/v050/DeployV050Fork.t.sol` runs the same deployment against a fork of whichever network the RPC points at (opt-in: `FORK_RPC_URL`, falling back to `POLYGON_RPC_URL`; optionally `FORK_BLOCK` and `SOURCE_STAKING`; skipped otherwise). It checks the copy against that network's live source, that source stake shows up in `LimitController.getUsed` (a real staker on Polygon; on networks without a known staker it creates legacy stake on the fork), and a voucher stake end to end. `test/v050/DeployV050ForkWalletLimits.t.sol` (same opt-in) has the old controller's owner set wallet limits on the fork, loads them from `test/v050/fixtures/wallet-limits-crlf.csv` (CRLF line endings, a header, a `#` comment, a blank line and a limit-0 row; `.gitattributes` keeps the CRLF), deploys, and checks the new controller's `getAllowed` equals the old one's for every row, that the limit-0 wallet has no `hasWalletLimit`, and that `wallet-limits-mismatch.csv` reverts with the mismatch message.
 
 Unchanged from v0.3.0: reward-pool semantics (no pool check at stake time, reserved periodical rewards, `collectReward` bounds), `provideReward`, `rescueTokens`, two-step ownership, bounded `claimAll` / `claimRange`, flexible (period 0) staking, safe period/phase removal, compiler `0.8.20` with `via_ir`, OpenZeppelin v5.0.1, no proxy/upgradeability.
 
-Tests: `test/v040/` covers vouchers (`Voucher.t.sol`), basis-point APYs and caps (`ApyBps.t.sol`), the LimitController with a legacy contract including the real vendored v0.2.4 contract (`LimitControllerLegacy.t.sol`), freeze and seize (`FreezeSeize.t.sol`) and gas budgets (`GasBudget.t.sol`); the existing suites are migrated to voucher staking and the invariant handler freezes and seizes. `RequirementCheckerV2Integration.t.sol` now uses the vendored v0.2.4 contract as its checker consumer, since v0.4.0 has no hook. Full suite: 688 passed, 0 failed, 1 skipped (the opt-in `LegacyStakingInvariants`).
+Tests: `test/v050/` covers vouchers (`Voucher.t.sol`), basis-point APYs and caps (`ApyBps.t.sol`), the LimitController with a legacy contract including the real vendored v0.2.4 contract (`LimitControllerLegacy.t.sol`), freeze and seize (`FreezeSeize.t.sol`) and gas budgets (`GasBudget.t.sol`); the existing suites are migrated to voucher staking and the invariant handler freezes and seizes. `RequirementCheckerV2Integration.t.sol` now uses the vendored v0.2.4 contract as its checker consumer, since v0.4.0 has no hook. Full suite: 688 passed, 0 failed, 1 skipped (the opt-in `LegacyStakingInvariants`).
 
-**Gas snapshots.** `gas-snapshots/` holds one `forge snapshot` per released version from v0.2.3 through v0.4.0 (older versions cannot be rebuilt), each taken from that version's own code and tests; `gas-snapshots/README.md` lists the commits and the exact command.
+**Gas snapshots.** `gas-snapshots/` holds one `forge snapshot` per released version from v0.2.3 through v0.5.0 (older versions cannot be rebuilt), each taken from that version's own code and tests; `gas-snapshots/README.md` lists the commits and the exact command.
 
 ## Changes in v0.3.0
 
@@ -348,6 +399,27 @@ You can install the OpenZeppelin contracts by running:
 ```bash
 $ forge install --no-commit OpenZeppelin/openzeppelin-contracts@v5.0.1
 ```
+
+## Running the tests
+
+The contract itself builds in under a minute. The test suite is the slow part: compiling all 85 test files takes
+about 29 minutes (one `solc` process, `via_ir`) and the 32 invariant campaigns run for about 13 more. So there are
+two ways to run it:
+
+```bash
+# Day to day: one test file. Compiles only that file and its imports (1-2.5 min the first time, seconds after).
+$ forge test --match-path test/v050/Voucher.t.sol
+
+# Everything except the invariant campaigns (the first build is still long; later runs are incremental).
+$ forge test
+
+# The full run: every test file and all invariant campaigns at full depth. About 45 minutes from a clean tree.
+$ FOUNDRY_PROFILE=full forge test
+```
+
+A green `forge test` on the default profile does **not** include the invariant campaigns. The full run happens in CI
+(`.github/workflows/full-check.yml`) on every pull request to `main`. Compiler settings are the same in both
+profiles, so the deployed bytecode does not depend on which one you use.
 
 ## Known Issues
 

@@ -36,6 +36,29 @@ abstract contract WriteFunctions is ComplianceCheck {
         }
     }
 
+    /// @dev Return the voucher bonus a deposit consumed to the wallet's budget. Must be called from exactly the
+    ///      places where the principal actually leaves the staking counters (full withdrawal, READY_TO_CLAIM
+    ///      claim, seize) and nowhere else -- releasing while the position is still open is a double-spend of the
+    ///      budget. Always pass the DEPOSIT's own phase AND period, never the current ones: the cell meter is
+    ///      keyed on both, and a wrong phase there silently leaves base room suppressed in the cell the deposit
+    ///      really sat in, while freeing a cell it never touched.
+    /// @dev Saturating on both counters: a release can never strand budget, and the per-deposit entry is
+    ///      deleted so a second call is a no-op.
+    function _releaseBonus(address wallet, uint256 depositNumber, uint256 phase, uint256 period) internal {
+        uint256 b = depositBonusUsed[wallet][depositNumber];
+        if (b == 0) return;
+
+        uint256 t = walletBonusUsed[wallet];
+        walletBonusUsed[wallet] = t > b ? t - b : 0;
+
+        uint256 c = walletBonusUsedInCell[phase][period][wallet];
+        walletBonusUsedInCell[phase][period][wallet] = c > b ? c - b : 0;
+
+        delete depositBonusUsed[wallet][depositNumber];
+
+        emit BonusReleased(wallet, phase, period, depositNumber, b);
+    }
+
     /// @dev STAKING adds the principal to every staking counter. Any other action is a close: the principal
     ///      leaves the staking counters (freeing the controller limit) and is recorded as WITHDRAWAL, and the
     ///      reward is recorded as CLAIM.

@@ -48,6 +48,11 @@ abstract contract ClaimFunctions is ReadFunctions, WriteFunctions {
             targetDeposit.withdrawalDate = SafeCast.toUint40(block.timestamp);
             userDataList[Types.DataType.REWARD_EXPECTED][msg.sender] -= depositReward;
             totalDataList[Types.DataType.REWARD_EXPECTED] -= depositReward;
+
+            // Only here: this branch closes the deposit and returns the principal. The INDEFINITE branch below
+            // pays reward only and leaves the position open, so releasing there would free the budget while the
+            // principal is still staked -- a straight double-spend.
+            _releaseBonus(msg.sender, depositNumber, targetDeposit.stakingPhase, targetDeposit.stakingPeriod);
         } else {
             depositReward = _calculateIndefiniteDepositReward(targetDeposit);
             uint256 collectable = getCollectableReward();
