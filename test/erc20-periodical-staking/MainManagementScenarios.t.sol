@@ -236,9 +236,12 @@ contract MainManagementScenarios is AuxiliaryFunctions {
 
         stakingContract.setMaxExtraApyBps(250);
         assertEq(stakingContract.maxExtraApyBps(), 250);
-        stakingContract.setMaxExtraApyBps(type(uint32).max);
-        assertEq(stakingContract.maxExtraApyBps(), type(uint32).max);
-        vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 32, 1 << 32));
+        // Bounded at 1_000_000 bps since the v0.5.0 audit (#19).
+        stakingContract.setMaxExtraApyBps(1_000_000);
+        assertEq(stakingContract.maxExtraApyBps(), 1_000_000);
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, 1_000_001, 1_000_000));
+        stakingContract.setMaxExtraApyBps(1_000_001);
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, 1 << 32, 1_000_000));
         stakingContract.setMaxExtraApyBps(1 << 32);
 
         stakingContract.setMaxExtraLimitTotal(5e18);

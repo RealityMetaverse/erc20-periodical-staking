@@ -15,6 +15,21 @@ interface IRequirementCheckerV2 {
 /// @notice Applies negative periodical-staking offsets on RequirementCheckerV2 for every wallet
 ///         affected by the stuck-deposit incident (see README "Known Issues"). Offsets equal
 ///         the sum of the wallet's affected principal (not reward), scaled by 1e18.
+///
+/// @dev !! THIS SCRIPT HAS ALREADY BEEN BROADCAST ON POLYGON !!
+///      See broadcast/SetAffectedOffsets.s.sol/137/ for the run that landed. It is kept in the repo as the
+///      record of what was applied, NOT as something to run again.
+///
+///      DO NOT RE-RUN IT WITHOUT REBUILDING THE TABLE FIRST. setPeriodicalStakingOffsetBatch has SET
+///      semantics, not add semantics: it overwrites each wallet's stored offset with the value below. Any
+///      offset corrected since the original broadcast -- a wallet whose affected deposit was later resolved,
+///      a figure revised after review, an offset zeroed on purpose -- is silently reverted to the number
+///      hard-coded here, and the only evidence is the wallet's worth changing again.
+///      If a re-run is genuinely needed: re-derive the offsets from current chain state, replace the table,
+///      and simulate (no --broadcast) against a Polygon fork first.
+///
+///      The chainid guard below is a backstop only. It stops this landing on the wrong network; it cannot
+///      stop a stale table landing on the right one.
 contract SetAffectedOffsets is Script {
     address constant REQUIREMENT_CHECKER_V2 = 0x716ff1f64cC2B7c96ba9DDADfc08bB703F8bcA59;
     address constant PERIODICAL_STAKING     = 0xa816fC819c2BD73c0AEdf60E0b06daF2Bff9691F;
@@ -22,6 +37,13 @@ contract SetAffectedOffsets is Script {
     uint256 constant COUNT = 71;
 
     function run() external {
+        // REQUIREMENT_CHECKER_V2 and PERIODICAL_STAKING are Polygon mainnet addresses. On any other chain they
+        // are either empty or, worse, some unrelated contract, so refuse before a single offset is written.
+        require(
+            block.chainid == 137,
+            "SetAffectedOffsets: Polygon mainnet (137) only; the addresses and offsets in this script are Polygon's"
+        );
+
         address[] memory wallets = new address[](COUNT);
         address[] memory stakingContracts = new address[](COUNT);
         int256[] memory offsets = new int256[](COUNT);

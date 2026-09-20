@@ -13,6 +13,11 @@ contract OpenLimitController is ILimitController {
         staking = staking_;
     }
 
+    /// @dev setLimitController only accepts a controller whose stakingContract() is the staking contract.
+    function stakingContract() external view returns (IPeriodicalStakingContract) {
+        return IPeriodicalStakingContract(staking);
+    }
+
     function getAllowedAndUsed(address wallet, uint256 phase, uint256 period)
         external
         view

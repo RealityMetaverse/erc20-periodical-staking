@@ -214,18 +214,35 @@ contract RequirementCheckerV2Test is Test {
 
     function test_erc20Offset_extremeNegative_clampsWithoutRevert() public {
         _seedAliceBalances(); // alice has 500 ERC20
-        v2.setErc20Offset(alice, type(int256).min);
+        // offsets are bounded to +/- MAX_ABS_OFFSET (type(int128).max); the most negative accepted value clamps
+        v2.setErc20Offset(alice, -v2.MAX_ABS_OFFSET());
         (uint256 e,,,) = v2.worthBreakdown(alice);
         assertEq(e, 0);
     }
 
-    function test_erc20Offset_extremePositive_overflows() public {
-        // give bob a balance near 2^255 so int256 cast + positive offset overflows
-        uint256 huge = uint256(type(int256).max);
-        deal(address(token), bob, huge);
+    function test_erc20Offset_outOfBounds_reverts() public {
+        int256 maxAbs = v2.MAX_ABS_OFFSET();
+        assertEq(maxAbs, int256(type(int128).max));
+        vm.expectRevert(abi.encodeWithSignature("OffsetOutOfBounds(int256,int256)", type(int256).min, maxAbs));
+        v2.setErc20Offset(alice, type(int256).min);
+        vm.expectRevert(abi.encodeWithSignature("OffsetOutOfBounds(int256,int256)", type(int256).max, maxAbs));
         v2.setErc20Offset(bob, type(int256).max);
-        // int256(huge) + type(int256).max overflows; Solidity 0.8 reverts with Panic(0x11)
-        vm.expectRevert();
+    }
+
+    function test_erc20Offset_extremePositive_doesNotOverflow() public {
+        // the largest accepted offset on top of a balance far beyond any real supply still reads fine
+        uint256 huge = uint256(type(uint128).max);
+        deal(address(token), bob, huge);
+        v2.setErc20Offset(bob, v2.MAX_ABS_OFFSET());
+        (uint256 e,,,) = v2.worthBreakdown(bob);
+        assertEq(e, huge + uint256(v2.MAX_ABS_OFFSET()));
+    }
+
+    function test_erc20Balance_absurd_revertsWithSafeCast() public {
+        // a balance >= 2^255 cannot be represented as int256: typed revert instead of a silent wrap to 0
+        uint256 absurd = uint256(1) << 255;
+        deal(address(token), bob, absurd);
+        vm.expectRevert(abi.encodeWithSignature("SafeCastOverflowedUintToInt(uint256)", absurd));
         v2.worthBreakdown(bob);
     }
 
@@ -500,6 +517,9 @@ contract RequirementCheckerV2Test is Test {
         int128 periodicalAOff,
         int128 nftIdOneOff
     ) public {
+        // setters accept |offset| <= type(int128).max, so type(int128).min itself is out of bounds
+        vm.assume(erc20Off != type(int128).min && stakingAOff != type(int128).min);
+        vm.assume(periodicalAOff != type(int128).min && nftIdOneOff != type(int128).min);
         _seedAliceBalances();
         v2.setErc20Offset(alice, int256(erc20Off));
         v2.setPoolStakingOffset(alice, address(stakingA), int256(stakingAOff));
@@ -825,5 +845,68 @@ contract RequirementCheckerV2Test is Test {
         assertEq(v2.erc1155IdWorth(address(fresh), 20), 250);
         // New id is registered.
         assertEq(v2.erc1155IdWorth(address(fresh), 40), 400);
+    }
+
+    // ======================================
+    // =   Ownership (Ownable2Step, #40)    =
+    // ======================================
+    function test_ownership_transferIsTwoStep() public {
+        v2.transferOwnership(alice);
+        // nothing changes until the nominee accepts
+        assertEq(v2.owner(), owner);
+        assertEq(v2.pendingOwner(), alice);
+        v2.setDefaultRequiredWorth(1); // current owner still in control
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", alice));
+        v2.setDefaultRequiredWorth(2);
+
+        vm.prank(alice);
+        v2.acceptOwnership();
+        assertEq(v2.owner(), alice);
+        assertEq(v2.pendingOwner(), address(0));
+
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", owner));
+        v2.setDefaultRequiredWorth(3);
+        vm.prank(alice);
+        v2.setDefaultRequiredWorth(4);
+        assertEq(v2.defaultRequiredWorth(), 4);
+    }
+
+    function test_ownership_acceptByNonPending_reverts() public {
+        v2.transferOwnership(alice);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", bob));
+        v2.acceptOwnership();
+        assertEq(v2.owner(), owner);
+    }
+
+    function test_ownership_pendingTransferCanBeReplacedOrCancelled() public {
+        v2.transferOwnership(alice);
+        v2.transferOwnership(bob); // a typo'd nominee is simply overwritten
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", alice));
+        v2.acceptOwnership();
+
+        v2.transferOwnership(address(0)); // cancels the pending transfer
+        assertEq(v2.pendingOwner(), address(0));
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", bob));
+        v2.acceptOwnership();
+        assertEq(v2.owner(), owner);
+    }
+
+    function test_ownership_transfer_nonOwner_reverts() public {
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", alice));
+        v2.transferOwnership(alice);
+    }
+
+    function test_ownership_renounce_revertsForEveryone() public {
+        vm.expectRevert(abi.encodeWithSignature("RenounceOwnershipDisabled()"));
+        v2.renounceOwnership();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("RenounceOwnershipDisabled()"));
+        v2.renounceOwnership();
+        assertEq(v2.owner(), owner);
     }
 }

@@ -69,20 +69,22 @@ contract RewardMathTest is VoucherAttackBase {
     }
 
     /// @dev Hypothesis: an APY that does not fit the packed uint32 field is silently truncated into a tiny rate
-    ///      (or an extra APY pushes the effective rate over the edge). It must revert with SafeCast's error.
-    function test_apyBeyondPackedWidth_revertsNotTruncated() public {
+    ///      (or an extra APY pushes the effective rate over the edge).
+    ///      Since the v0.5.0 audit (#19) the admin side IS bounded: base APY and the extra-APY ceiling are each
+    ///      at most 1_000_000 bps, so the effective rate tops out at 2_000_000 and always fits.
+    function test_apyBeyondPackedWidth_rejectedAtConfiguration() public {
         uint256 big = uint256(type(uint32).max) + 1;
-        bytes memory castErr = abi.encodeWithSignature("SafeCastOverflowedUintDowncast(uint8,uint256)", uint8(32), big);
-
-        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, big); // admin side has no bound
-        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, big, castErr);
-
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, big, 1_000_000));
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, big);
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, type(uint32).max, 1_000_000));
         staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, type(uint32).max);
-        (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 1, 0);
-        vm.prank(alice);
-        vm.expectRevert(castErr);
-        staking.stakeWithVoucher(v, sig, 1_000 * ONE, 0);
-        assertEq(staking.checkDepositCountOfAddress(alice), 0);
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, big, 1_000_000));
+        staking.setMaxExtraApyBps(big);
+
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, 1_000_000);
+        staking.setMaxExtraApyBps(1_000_000);
+        uint256 d = _stakeVWith(staking, alice, 0, P30, 1_000 * ONE, 1_000_000, 0);
+        assertEq(_deposit(alice, d).APY, 2_000_000, "stored exactly, not truncated");
     }
 
     /// @dev Hypothesis: claiming right before / after a day rollover pays for a partial day.
@@ -157,9 +159,11 @@ contract RewardMathTest is VoucherAttackBase {
     ///      The stake is accepted (there is no stake-time pool check). The owner can no longer collect anything,
     ///      the matured claim reverts NotEnoughFundsInRewardPool until a top-up, then pays in full.
     function test_extremeAPY_periodical_acceptedButClaimWaitsForTopUp() public {
-        uint256 extreme = 4_000_000_000; // 40,000,000% — still fits the packed uint32
+        uint256 extreme = 1_000_000; // 10,000%: the largest APY the contract accepts (v0.5.0 audit, #19)
         staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, extreme);
         uint256 reward = staking.calculateReward(1_000 * ONE, extreme, P30);
+        // With the APY bounded, a realistic pool covers this reward; drain it so the pool is short.
+        staking.collectReward(staking.getCollectableReward() - ONE);
         uint256 pool = staking.rewardPool();
         assertGt(reward, pool);
         _stake(alice, 0, P30, 1_000 * ONE);
@@ -186,7 +190,8 @@ contract RewardMathTest is VoucherAttackBase {
     ///      but an indefinite depositor must always be able to recover principal through the opt-in partial
     ///      withdraw with a zero reward floor, regardless of reward pool state.
     function test_indefinite_principalRecoverable_whenPoolCannotPayReward() public {
-        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P0, 4_000_000_000);
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P0, 1_000_000); // the largest accepted APY
+        staking.collectReward(staking.getCollectableReward() - ONE); // leave the pool short
         uint256 d = _stake(alice, 0, P0, 10_000 * ONE);
         _warpDays(1);
         uint256 reward = _deposit(alice, d).rewardGenerated;

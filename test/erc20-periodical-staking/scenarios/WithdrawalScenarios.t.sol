@@ -156,7 +156,6 @@ contract WithdrawalScenarious is WithdrawalFunctions {
         stakingContract.withdrawDeposit(1);
         vm.stopPrank();
 
-        vm.prank(contractAdmin);
         stakingContract.unfreezeDeposits(wallets, numbers);
         _withdrawTokenWithTest(userOne, 0, false);
         _withdrawTokenWithTest(userOne, 1, false);

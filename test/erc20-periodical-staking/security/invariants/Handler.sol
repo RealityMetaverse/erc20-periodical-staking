@@ -708,7 +708,7 @@ contract Handler is VoucherHelper {
         }
     }
 
-    /// @notice Admin unfreezes a frozen deposit.
+    /// @notice Owner unfreezes a frozen deposit (owner-only since the v0.5.0 audit, finding #10).
     function unfreeze(uint256 userSeed, uint256 depositSeed) external {
         calls["unfreeze"]++;
         if (legacy) {
@@ -723,7 +723,7 @@ contract Handler is VoucherHelper {
         }
         uint256 idx = candidates[bound(depositSeed, 0, candidates.length - 1)];
 
-        vm.prank(admin);
+        vm.prank(owner);
         try staking.unfreezeDeposit(user, idx) {}
         catch (bytes memory reason) {
             _unexpected("unfreezeDeposit", reason);

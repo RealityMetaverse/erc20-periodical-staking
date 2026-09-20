@@ -208,7 +208,6 @@ contract ClaimScenarios is ClaimFunctions {
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositFrozen.selector, userOne, 1));
         stakingContract.claimDeposit(1);
 
-        vm.prank(contractAdmin);
         stakingContract.unfreezeDeposit(userOne, 0);
         assertFalse(stakingContract.isDepositFrozen(userOne, 0));
         _claimTokenWithTest(userOne, 0, false);
@@ -237,7 +236,6 @@ contract ClaimScenarios is ClaimFunctions {
         _assertFrozenDepositUntouched(userOne, 0);
         assertEq(stakingContract.getDeposit(userOne, 1).withdrawalDate, _now());
 
-        vm.prank(contractAdmin);
         stakingContract.unfreezeDeposit(userOne, 0);
         vm.prank(userOne);
         stakingContract.claimAll();

@@ -79,7 +79,8 @@ contract DeployV050ForkTest is VoucherHelper {
             rewardTopUp: 0,
             walletLimitsFile: "",
             resumeStaking: address(0),
-            resumeController: address(0)
+            resumeController: address(0),
+            allowSharedRoles: false
         });
         (DeployV050.OldConfig memory o, DeployV050.Deployment memory d) =
             script.deployFrom(p, new DeployV050.WalletLimitRow[](0));

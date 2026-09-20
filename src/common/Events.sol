@@ -7,8 +7,9 @@ import "./Types.sol";
 /// @title Events
 /// @notice Centralized event definitions for the staking system
 abstract contract Events {
-    /// @notice Emitted when ownership transfer completes (pending owner accepted).
-    event TransferOwnership(address from, address to);
+    /// @notice Emitted when ownership transfer completes (pending owner accepted), and once by the constructor
+    ///         with `from` = address(0).
+    event TransferOwnership(address indexed from, address indexed to);
     /// @notice Emitted when the owner proposes a new owner; transfer completes on acceptOwnership.
     event OwnershipTransferStarted(address indexed from, address indexed to);
 
@@ -42,7 +43,9 @@ abstract contract Events {
     );
 
     event UpdateMinimumDeposit(uint256 newMinimumDeposit);
-    event UpdateActionAvailability(Types.DataType action, bool isOpen);
+    /// @param action Indexed so an indexer can topic-filter one action (e.g. every STAKING close) without
+    ///        decoding every availability change.
+    event UpdateActionAvailability(Types.DataType indexed action, bool isOpen);
 
     event AddStakingPhase(uint256 indexed newStakingPhase);
     event RemoveStakingPhase(uint256 indexed stakingPhase);
@@ -59,6 +62,8 @@ abstract contract Events {
     event UpdateMaxExtraLimitPerCell(uint256 maxExtraLimitPerCell);
     /// @param validitySeconds Furthest ahead of now a voucher's validUntil may sit, in seconds.
     event UpdateMaxVoucherValidity(uint256 validitySeconds);
+    /// @notice Emitted when the owner bumps the voucher epoch; vouchers signed for an earlier epoch are void.
+    event UpdateVoucherEpoch(uint256 newEpoch);
     /// @notice Emitted when a wallet is barred from, or restored to, opening new stakes.
     event UpdateWalletBlocked(address indexed wallet, bool blocked);
 

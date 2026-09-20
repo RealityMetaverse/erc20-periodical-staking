@@ -430,7 +430,6 @@ contract AccountingConsistencyTest is VoucherAttackBase {
             } else {
                 if (n == 0 || !staking.isDepositFrozen(u, d)) continue;
                 if ((r >> 72) % 3 == 0) {
-                    vm.prank(admin);
                     staking.unfreezeDeposit(u, d);
                 } else {
                     uint256 tBefore = token.balanceOf(treasury);

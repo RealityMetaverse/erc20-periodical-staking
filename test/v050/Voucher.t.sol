@@ -20,13 +20,6 @@ contract ContractSigner is IERC1271 {
     }
 }
 
-/// @notice ERC-1271 signer that always answers with a wrong magic value.
-contract RejectingContractSigner is IERC1271 {
-    function isValidSignature(bytes32, bytes memory) external pure returns (bytes4) {
-        return 0xdeadbeef;
-    }
-}
-
 /// @notice Exhaustive tests of the stakeWithVoucher authorisation path.
 contract VoucherTest is V050Base {
     uint256 internal constant AMOUNT = 1_000 * ONE;
@@ -76,7 +69,11 @@ contract VoucherTest is V050Base {
             extraApyBps: extraApy,
             extraLimitTotal: extraLimitTotal,
             extraLimitPerCell: extraLimitPerCell,
+            // Issued one full VOUCHER_LIFETIME before `until`, so every caller's voucher has the widest
+            // lifetime the fixture's ceiling allows and `_far()` means "issued now". Keeps this helper pure.
+            issuedAt: until >= VOUCHER_LIFETIME ? until - VOUCHER_LIFETIME : 0,
             validUntil: until,
+            epoch: 0,
             nonce: nonce
         });
     }
@@ -89,7 +86,7 @@ contract VoucherTest is V050Base {
     {
         bytes32 typeHash = keccak256(
             bytes(
-                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)"
+                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 issuedAt,uint256 validUntil,uint256 epoch,uint256 nonce)"
             )
         );
         bytes32 domainTypeHash =
@@ -112,7 +109,9 @@ contract VoucherTest is V050Base {
                 v.extraApyBps,
                 v.extraLimitTotal,
                 v.extraLimitPerCell,
+                v.issuedAt,
                 v.validUntil,
+                v.epoch,
                 v.nonce
             )
         );
@@ -229,35 +228,37 @@ contract VoucherTest is V050Base {
         assertTrue(staking.isVoucherNonceUsed(alice, v.nonce));
     }
 
-    function test_erc1271ContractSigner_accepted() external {
+    /// @notice Finding #39: the voucher signer is always an EOA. A contract signer is NOT consulted (no ERC-1271
+    ///         call is made), so even a well-behaved one that would approve the signature cannot authorise a stake.
+    function test_fixed39_erc1271ContractSigner_rejected() external {
         address keyHolder = vm.addr(ROTATED_KEY);
         ContractSigner wallet = new ContractSigner(keyHolder);
         staking.setVoucherSigner(address(wallet));
 
         Types.StakeVoucher memory v = voucherFor(alice, P30, 10, 0);
         bytes memory sig = _signVoucher(address(staking), v, ROTATED_KEY);
-        uint256 n = _stakeRaw(alice, v, sig, AMOUNT, APY_P30 + 10);
-        assertEq(_deposit(alice, n).APY, APY_P30 + 10);
-        assertTrue(staking.isVoucherNonceUsed(alice, v.nonce));
-
-        // A signature the contract wallet rejects (the original EOA signer's key) fails.
-        Types.StakeVoucher memory v2 = voucherFor(alice, P30, 0, 0);
-        _expectStakeRevert(
-            alice,
-            v2,
-            signVoucher(v2),
-            AMOUNT,
-            0,
-            abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector)
+        assertEq(
+            wallet.isValidSignature(staking.getVoucherDigest(v), sig),
+            IERC1271.isValidSignature.selector,
+            "the contract wallet itself would have approved"
         );
+        _expectStakeRevert(
+            alice, v, sig, AMOUNT, APY_P30 + 10, abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector)
+        );
+        assertFalse(staking.isVoucherNonceUsed(alice, v.nonce), "nonce not burned");
+
+        // Recoverable: point the signer back at the EOA and the same voucher, signed by it, stakes.
+        staking.setVoucherSigner(_voucherSignerAddr());
+        _stakeRaw(alice, v, signVoucher(v), AMOUNT, APY_P30 + 10);
     }
 
-    function test_erc1271WrongMagic_reverts() external {
-        staking.setVoucherSigner(address(new RejectingContractSigner()));
+    /// @notice Malformed signatures (wrong length, empty) revert InvalidVoucherSignature, not an ECDSA library error.
+    function test_fixed39_malformedSignature_revertsInvalidVoucherSignature() external {
         Types.StakeVoucher memory v = voucherFor(alice, P30, 0, 0);
-        _expectStakeRevert(
-            alice, v, signVoucher(v), AMOUNT, 0, abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector)
-        );
+        bytes memory err = abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector);
+        _expectStakeRevert(alice, v, "", AMOUNT, 0, err);
+        _expectStakeRevert(alice, v, hex"1234", AMOUNT, 0, err);
+        _expectStakeRevert(alice, v, new bytes(65), AMOUNT, 0, err);
     }
 
     function test_signerRotation_invalidatesOldVouchers() external {
@@ -389,7 +390,7 @@ contract VoucherTest is V050Base {
     // =          Tampered fields           =
     // ======================================
     function testFuzz_tamperedField_reverts(uint8 field) external {
-        field = uint8(bound(field, 0, 7));
+        field = uint8(bound(field, 0, 9));
         Types.StakeVoucher memory v = _v(alice, 0, P30, 100, 1_000 * ONE, _far(), 11);
         bytes memory sig = signVoucher(v);
         address caller = alice;
@@ -409,6 +410,14 @@ contract VoucherTest is V050Base {
             v.extraLimitPerCell = 1_000 * ONE + 1;
         } else if (field == 6) {
             v.validUntil = _far() - 1;
+        } else if (field == 8) {
+            // Widen the ceiling first, so the earlier issuedAt fails on the SIGNATURE, not on the lifetime bound.
+            staking.setMaxVoucherValidity(VOUCHER_LIFETIME + 1);
+            v.issuedAt -= 1;
+        } else if (field == 9) {
+            // Bump first, so the tampered epoch passes the epoch check and fails on the SIGNATURE.
+            staking.bumpVoucherEpoch();
+            v.epoch = 1;
         } else {
             v.nonce = 12;
         }
@@ -755,7 +764,7 @@ contract VoucherTest is V050Base {
         assertEq(
             staking.VOUCHER_TYPEHASH(),
             keccak256(
-                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)"
+                "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 issuedAt,uint256 validUntil,uint256 epoch,uint256 nonce)"
             )
         );
     }
@@ -774,9 +783,13 @@ contract VoucherTest is V050Base {
         uint256 extraApy,
         uint256 extraLimit,
         uint256 until,
-        uint256 nonce
+        uint256 nonce,
+        uint256 issuedAt,
+        uint256 epoch
     ) external {
         Types.StakeVoucher memory v = _v(wallet, phase, period, extraApy, extraLimit, until, nonce);
+        v.issuedAt = issuedAt;
+        v.epoch = epoch;
         bytes32 expected = _offchainDigest(block.chainid, address(staking), v);
         assertEq(staking.getVoucherDigest(v), expected, "contract digest");
         assertEq(_voucherDigest(address(staking), v), expected, "helper digest");

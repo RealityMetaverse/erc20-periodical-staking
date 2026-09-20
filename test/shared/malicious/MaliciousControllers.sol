@@ -23,9 +23,17 @@ contract MaliciousLimitController is ILimitController {
     bytes public reenterData;
     bool public lastReenterSuccess;
     bytes public lastReenterReturn;
+    /// @dev What setLimitController checks. Deliberately NOT subject to `mode`: the hostile modes are about what
+    ///      the controller does once installed, and it has to get installed first. Call setStakingContract
+    ///      before staking.setLimitController(address(this)).
+    IPeriodicalStakingContract public stakingContract;
 
     function setMode(Mode m) external {
         mode = m;
+    }
+
+    function setStakingContract(address _staking) external {
+        stakingContract = IPeriodicalStakingContract(_staking);
     }
 
     function setReenter(address _staking, bytes calldata data) external {

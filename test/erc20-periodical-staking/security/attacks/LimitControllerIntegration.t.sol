@@ -4,12 +4,19 @@ pragma solidity 0.8.20;
 import "./VoucherAttackBase.sol";
 import {LimitController} from "../../../../src/contracts/LimitController.sol";
 import {ILimitController} from "../../../../src/interfaces/ILimitController.sol";
+import {IPeriodicalStakingContract} from "../../../../src/interfaces/IPeriodicalStakingContract.sol";
 import {MockLegacyStaking} from "../../../shared/mocks/MockLegacyStaking.sol";
 
 /// @notice Controller that returns fixed (possibly hostile) figures, to attack the stake-side headroom math.
 contract FixedLimitController is ILimitController {
     uint256 public allowed;
     uint256 public used;
+    /// @dev setLimitController only installs a controller whose stakingContract() is the staking contract.
+    IPeriodicalStakingContract public immutable stakingContract;
+
+    constructor(address staking_) {
+        stakingContract = IPeriodicalStakingContract(staking_);
+    }
 
     function set(uint256 allowed_, uint256 used_) external {
         allowed = allowed_;
@@ -258,19 +265,32 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
         staking.getUserPhasePeriodData(Types.DataType.WITHDRAWAL, alice, 0, P30);
     }
 
-    /// @dev Hypothesis: a controller pointed at the wrong staking contract lets a wallet exceed its limit,
-    ///      and re-pointing it must immediately account for what is already staked.
-    function test_controllerPointingAtWrongStaking_fixRestoresEnforcement() public {
+    /// @dev Hypothesis: a controller pointed at the wrong staking contract lets a wallet exceed its limit.
+    ///      Finding #16: that state is now unreachable for an INSTALLED controller -- stakingContract is
+    ///      immutable, so a mismatched controller can only be built, never made out of a matching one, and
+    ///      setLimitController refuses to install it. Swapping in a correctly-built replacement must
+    ///      immediately account for what is already staked.
+    function test_controllerPointingAtWrongStaking_cannotBeInstalledAndSwapKeepsEnforcement() public {
         ERC20PeriodicalStaking other = new ERC20PeriodicalStaking(address(token));
-        lc.setStakingContract(address(other));
+        LimitController wrong = new LimitController(address(other));
+
+        // A controller built for another staking contract cannot be installed at all.
+        vm.expectRevert(abi.encodeWithSelector(Errors.LimitControllerMismatch.selector, address(other)));
+        staking.setLimitController(address(wrong));
+        // ...and it can never become a matching one: there is no setter.
+        (bool ok,) =
+            address(wrong).call(abi.encodeWithSignature("setStakingContract(address)", address(staking)));
+        assertFalse(ok, "setStakingContract must no longer exist");
+        assertEq(address(wrong.stakingContract()), address(other));
+
+        // The installed controller keeps enforcing across a swap to a fresh, correctly-built one.
         _stake(alice, 0, P30, 10_000 * ONE);
-        // misconfigured controller believes alice has nothing staked
-        assertEq(lc.getRemaining(alice, 0, P30), 10_000 * ONE);
-        lc.setStakingContract(address(staking));
-        assertEq(lc.getRemaining(alice, 0, P30), 0, "after fix, existing stake must count");
+        LimitController replacement = new LimitController(address(staking));
+        replacement.setDefaultLimit(0, P30, 10_000 * ONE);
+        staking.setLimitController(address(replacement));
+        assertEq(replacement.getRemaining(alice, 0, P30), 0, "existing stake must count for the replacement");
         _expectStakeRevert(alice, 0, P30, 100, _apy(0, P30), _limitErr(alice, 0, P30, 100, 0));
-        vm.expectRevert(Errors.ZeroAddressProvided.selector);
-        lc.setStakingContract(address(0));
+
         vm.expectRevert(Errors.ZeroAddressProvided.selector);
         new LimitController(address(0));
     }
@@ -370,7 +390,7 @@ contract LimitControllerIntegrationTest is VoucherAttackBase {
     // above its controller limit arrived with part of its VIP perk silently spent -- on day one, for exactly the
     // users most likely to be VIPs. Do not restore the old `allowed + extra - used` assertions.
     function test_hostileControllerFigures_overflowSafe() public {
-        FixedLimitController f = new FixedLimitController();
+        FixedLimitController f = new FixedLimitController(address(staking));
         staking.setLimitController(address(f));
         uint256 apy = _apy(0, P0);
         uint256 bigExtra = type(uint128).max;

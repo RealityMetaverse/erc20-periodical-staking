@@ -128,7 +128,8 @@ contract DeployV050ForkWalletLimitsTest is Test {
             rewardTopUp: 0,
             walletLimitsFile: FIXTURE,
             resumeStaking: address(0),
-            resumeController: address(0)
+            resumeController: address(0),
+            allowSharedRoles: false
         });
     }
 

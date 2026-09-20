@@ -165,8 +165,8 @@ abstract contract V050Base is VoucherHelper, Events {
         freezeAs(admin, wallet, depositNumber);
     }
 
+    /// @notice Owner unfreeze (this contract is the owner). Unfreezing is owner-only since audit finding #10.
     function unfreeze(address wallet, uint256 depositNumber) internal {
-        vm.prank(admin);
         staking.unfreezeDeposit(wallet, depositNumber);
     }
 

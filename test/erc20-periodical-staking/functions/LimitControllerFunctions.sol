@@ -12,12 +12,7 @@ contract LimitControllerFunctions is AuxiliaryFunctions {
         limitController = new LimitController(stakingContractAddress);
     }
 
-    function _setStakingContract(address newStakingContract, bool ifRevertExpected) internal {
-        if (ifRevertExpected) {
-            vm.expectRevert();
-        }
-        limitController.setStakingContract(newStakingContract);
-    }
+    // No _setStakingContract helper: LimitController.stakingContract is immutable (finding #16).
 
     function _setWalletLimit(address wallet, uint256 phase, uint256 period, uint256 limit, bool ifRevertExpected)
         internal

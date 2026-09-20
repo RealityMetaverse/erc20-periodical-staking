@@ -85,11 +85,17 @@ contract ProgramManager is Errors {
     ///      upgrade, so there is no layout to preserve. maxVoucherValidity shares this slot; see its note below
     ///      for the running byte count.
     uint128 public maxExtraLimitPerCell;
-    /// @notice Furthest ahead of now a voucher's `validUntil` may sit, in seconds. Never 0: the constructor
-    ///         defaults it to 1800 and the setter rejects 0, so this protection cannot be switched off.
-    /// @dev Shares slot D with maxExtraLimitPerCell: 16 + 4 = 20 of 32 bytes used, 12 still free. uint32 of
-    ///      seconds is ~136 years, far beyond any sane voucher lifetime.
+    /// @notice Longest signed lifetime a voucher may have, i.e. the most `validUntil` may sit past `issuedAt`, in
+    ///         seconds. Never 0: the constructor defaults it to 1800 and the setter rejects 0, so this
+    ///         protection cannot be switched off.
+    /// @dev Shares slot D with maxExtraLimitPerCell: 16 + 4 = 20 of 32 bytes used. uint32 of seconds is ~136
+    ///      years, far beyond any sane voucher lifetime.
     uint32 public maxVoucherValidity;
+    /// @notice Epoch a voucher must carry to be accepted. Starts at 0; bumpVoucherEpoch increments it, which voids
+    ///         every voucher signed for an earlier epoch in one transaction.
+    /// @dev Shares slot D too (20 + 8 = 28 of 32 bytes used, 4 still free), so the stake path reads it with the
+    ///      slot it already loads for maxVoucherValidity. uint64 cannot be exhausted by owner-only +1 bumps.
+    uint64 public voucherEpoch;
 
     /// @notice Receiver of seized deposits.
     address public treasury;
@@ -113,9 +119,10 @@ contract ProgramManager is Errors {
     /// @notice Wallets barred from opening NEW stakes. Does not touch existing deposits.
     /// @dev A block stops staking ONLY. Withdraw, claim, and every other exit stay open to a blocked wallet --
     ///      a block must never trap funds. Do not "tighten" this into a lock.
-    ///      This exists because it is the only lever that still works when the voucher SIGNING KEY is
-    ///      compromised: the attacker signs their own vouchers, so the backend's issuance blocklist is useless,
-    ///      and the limit controller cannot tell the attacker's stake from a legitimate one.
+    ///      A block stops ONE KNOWN wallet, on-chain, even if the backend's issuance blocklist is bypassed. It
+    ///      is NOT a defence against a compromised voucher SIGNING KEY: the key holder simply signs for a fresh
+    ///      wallet. The levers for a leaked key are bumpVoucherEpoch (voids outstanding vouchers),
+    ///      setVoucherSigner (rotates the key) and closing staking (closeStaking, which any admin can call).
     mapping(address wallet => bool) public walletBlocked;
 
     // ======================================
@@ -138,6 +145,9 @@ contract ProgramManager is Errors {
     mapping(uint256 phase => mapping(uint256 period => mapping(address wallet => uint256))) internal
         walletBonusUsedInCell;
     /// @dev Bonus attributable to one deposit, so closing it releases exactly what it consumed.
+    ///      Fixed at stake time. Raising the wallet's controller limit later does NOT re-attribute bonus that
+    ///      was already charged: the deposit keeps holding it (so other cells see less bonus left, and this
+    ///      cell shows the difference as extra base room) until the deposit closes. No over-grant either way.
     mapping(address wallet => mapping(uint256 depositNumber => uint256)) internal depositBonusUsed;
 
     constructor(IERC20Metadata tokenAddress) {

@@ -2,7 +2,7 @@
 // Copyright 2024 Reality Metaverse
 pragma solidity 0.8.20;
 
-import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./ReadFunctions.sol";
 import "./WriteFunctions.sol";
 import "../../../common/Types.sol";
@@ -14,8 +14,12 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
     ///      part of this stake that goes above the wallet's controller limit is metered against them, so
     ///      re-presenting a voucher (or issuing a fresh one with the same numbers) never hands the bonus out
     ///      twice. One budget covers every phase, and it is concurrent -- closing the deposit frees it again,
-    ///      but advancing the phase does not refill it. The signature is checked with SignatureChecker, so a
-    ///      contract signer (ERC-1271) works too.
+    ///      but advancing the phase does not refill it. The signature is plain ECDSA: voucherSigner must be an
+    ///      EOA, a contract signer (ERC-1271) is NOT supported and every voucher would be rejected.
+    ///      The voucher must carry the current `voucherEpoch`, must not be post-dated (issuedAt <= now), and its
+    ///      signed lifetime validUntil - issuedAt must not exceed `maxVoucherValidity`.
+    ///      Bonus attribution is fixed at stake time: raising the wallet's controller limit afterwards does not
+    ///      move bonus already charged to a deposit back into base room. It frees when that deposit closes.
     ///      No reward-pool check is performed at stake time. Periodical deposits (period != 0) add their full
     ///      reward to `totalDataList[REWARD_EXPECTED]`, which `collectReward` can never take from the pool; if the
     ///      pool is short when the deposit matures, `claimDeposit` reverts `NotEnoughFundsInRewardPool` until the
@@ -42,15 +46,22 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
         if (controller == address(0)) revert LimitControllerNotSet();
         if (voucher.wallet != msg.sender) revert VoucherWalletMismatch(voucher.wallet, msg.sender);
         if (block.timestamp > voucher.validUntil) revert VoucherExpired(voucher.validUntil, block.timestamp);
-        // Bounds validUntil relative to NOW, not to issuance time (which the voucher does not carry). Stateless
-        // and self-enforcing: an old voucher with little time left still passes, a long-dated one never does,
-        // so a leaked signer key cannot mint vouchers good for years.
+        // The voucher's WHOLE signed lifetime [issuedAt, validUntil] is bounded by maxVoucherValidity, and it
+        // cannot start in the future. Both ends are signed, so a long-dated voucher is never usable -- not now
+        // and not in the last maxVoucherValidity seconds before validUntil either -- and post-dating issuedAt
+        // to get around the bound is rejected. This limits vouchers the backend signed honestly. It does NOT
+        // limit a leaked signer key: the key holder signs a fresh short-lived voucher whenever they like. The
+        // levers for that are bumpVoucherEpoch, setVoucherSigner and closeStaking.
         {
-            uint256 maxValidUntil = block.timestamp + maxVoucherValidity;
+            uint256 issuedAt = voucher.issuedAt;
+            if (issuedAt > block.timestamp) revert VoucherNotYetValid(issuedAt, block.timestamp);
+            // issuedAt <= now <= validUntil here, so the sum cannot overflow: maxVoucherValidity is a uint32.
+            uint256 maxValidUntil = issuedAt + maxVoucherValidity;
             if (voucher.validUntil > maxValidUntil) {
                 revert VoucherValidityTooLong(voucher.validUntil, maxValidUntil);
             }
         }
+        if (voucher.epoch != voucherEpoch) revert VoucherEpochMismatch(voucher.epoch, voucherEpoch);
 
         uint256 word = voucher.nonce >> 8;
         uint256 mask = 1 << (voucher.nonce & 0xff);
@@ -65,8 +76,12 @@ abstract contract StakingFunctions is ReadFunctions, WriteFunctions {
             revert VoucherExtraLimitPerCellTooHigh(voucher.extraLimitPerCell, maxExtraLimitPerCell);
         }
 
-        if (!SignatureChecker.isValidSignatureNow(signer, getVoucherDigest(voucher), signature)) {
-            revert InvalidVoucherSignature();
+        // ECDSA only: the signer is always an EOA. tryRecover, so a malformed signature reverts with the same
+        // InvalidVoucherSignature as a wrong one instead of an ECDSA library error. `signer` is non-zero
+        // (checked above), so the address(0) that a failed recovery returns can never match.
+        {
+            (address recovered,,) = ECDSA.tryRecover(getVoucherDigest(voucher), signature);
+            if (recovered != signer) revert InvalidVoucherSignature();
         }
 
         if (tokenAmount < minimumDeposit) revert InsufficientDeposit(tokenAmount, minimumDeposit);

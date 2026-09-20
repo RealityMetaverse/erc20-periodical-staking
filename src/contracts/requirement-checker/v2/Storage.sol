@@ -2,11 +2,20 @@
 // Copyright 2026 Reality Metaverse
 pragma solidity 0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "../../../common/Errors.sol";
 
-abstract contract Storage is Ownable, Errors {
+/// @dev Ownership is two-step (Ownable2Step): transferOwnership only nominates a pending owner, who must then
+///      call acceptOwnership. renounceOwnership is disabled (see AdministrativeFunctions).
+abstract contract Storage is Ownable2Step, Errors {
+    // DuplicateAddress, DuplicateId, OffsetOutOfBounds and RenounceOwnershipDisabled live in
+    // src/common/Errors.sol with every other error, so one ABI built from that file decodes them all.
+
+    /// @notice Largest magnitude accepted for any admin offset. Far above any real token amount or NFT count,
+    ///         yet small enough that `balance + offset` cannot overflow for any realistic balance.
+    int256 public constant MAX_ABS_OFFSET = int256(type(int128).max);
+
     event DefaultRequiredWorthUpdated(uint256 newDefaultRequiredWorth);
     event RequiredPhasePeriodWorthSet(uint256 indexed phase, uint256 indexed period, uint256 requiredWorth);
     event PoolStakingContractsUpdated(address[] newContracts);

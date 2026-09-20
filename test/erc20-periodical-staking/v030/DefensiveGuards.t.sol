@@ -192,7 +192,6 @@ contract DefensiveGuardsTest is V030Base {
         (uint256 s, uint256 p, uint256 i) = stakingContract.checkClaimableDataFor(userOne);
         assertEq(s + p + i, 0);
 
-        vm.prank(contractAdmin);
         stakingContract.unfreezeDeposits(ws, ns);
         vm.prank(userOne);
         stakingContract.claimAll();
@@ -223,9 +222,9 @@ contract DefensiveGuardsTest is V030Base {
         stakingContract.freezeDeposit(userOne, 0);
 
         vm.startPrank(userOne);
-        vm.expectRevert(notAdmin);
+        vm.expectRevert(notOwner); // unfreezing is owner-only since the v0.5.0 audit (#10)
         stakingContract.unfreezeDeposit(userOne, 0);
-        vm.expectRevert(notAdmin);
+        vm.expectRevert(notOwner);
         stakingContract.unfreezeDeposits(ws, ns);
         vm.expectRevert(notOwner);
         stakingContract.seizeDeposit(userOne, 0);

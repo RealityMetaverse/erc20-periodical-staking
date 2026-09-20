@@ -4,20 +4,19 @@ pragma solidity 0.8.20;
 import "./V050Base.sol";
 import {AccessControl} from "../../src/contracts/erc20-periodical-staking/AccessControl.sol";
 
-/// @notice `maxVoucherValidity`: an on-chain ceiling on how far ahead a voucher's `validUntil` may sit.
+/// @notice `maxVoucherValidity`: an on-chain ceiling on a voucher's SIGNED LIFETIME, validUntil - issuedAt.
 ///
-///         The point is blast radius. The voucher signer is a backend key; if it leaks, the attacker can mint
-///         vouchers, and without a ceiling those vouchers are good for as long as the signature says -- years,
-///         if the attacker chooses. Rotating `voucherSigner` stops NEW issuance but cannot recall paper that is
-///         already signed. This ceiling bounds the window in which a leaked key's output stays usable, so the
-///         damage ends at `maxVoucherValidity` after the leak rather than whenever the attacker decided.
-///
-///         It is enforced RELATIVE TO NOW, not to issuance time, which the voucher does not carry:
+///         Both ends are signed (audit finding #8 added `issuedAt`), so the bound is on the voucher itself, not
+///         on the moment it is presented:
+///             issuedAt   >  now                        -> VoucherNotYetValid   (post-dating is rejected)
 ///             validUntil <  now                        -> VoucherExpired
-///             now <= validUntil <= now + ceiling       -> accepted
-///             validUntil >  now + ceiling              -> VoucherValidityTooLong
-///         So the two errors bracket a sliding window. A voucher issued long ago with little time left still
-///         passes, which is what makes it safe to set the ceiling at the backend's own issuance window.
+///             validUntil >  issuedAt + ceiling         -> VoucherValidityTooLong
+///             otherwise                                -> accepted
+///         Before #8 the bound was relative to NOW, so a voucher signed "good for a year" reverted today but
+///         became usable in the last `ceiling` seconds before its validUntil. It is now never usable.
+///         This bounds vouchers the backend signed honestly. It does not contain a leaked signer key -- the key
+///         holder signs fresh short-lived vouchers -- which is what bumpVoucherEpoch / setVoucherSigner /
+///         closeStaking are for.
 ///
 /// @dev The contract's constructor default is 1800 seconds, matching the maximum the backend's
 ///      `validity_seconds` can be configured to, so the default can never reject a voucher the real signer is
@@ -35,9 +34,18 @@ contract VoucherValidityTest is V050Base {
     // ======================================
     // =              Helpers               =
     // ======================================
+    /// @dev Issued now.
     function _voucherUntil(address wallet, uint256 until, uint256 nonce)
         internal
         view
+        returns (Types.StakeVoucher memory)
+    {
+        return _voucherIssued(wallet, _now(), until, nonce);
+    }
+
+    function _voucherIssued(address wallet, uint256 issuedAt, uint256 until, uint256 nonce)
+        internal
+        pure
         returns (Types.StakeVoucher memory)
     {
         return Types.StakeVoucher({
@@ -47,7 +55,9 @@ contract VoucherValidityTest is V050Base {
             extraApyBps: 0,
             extraLimitTotal: 0,
             extraLimitPerCell: 0,
+            issuedAt: issuedAt,
             validUntil: until,
+            epoch: 0,
             nonce: nonce
         });
     }
@@ -105,13 +115,12 @@ contract VoucherValidityTest is V050Base {
         assertTrue(staking.isVoucherNonceUsed(alice, 7), "nonce burned only on the successful stake");
     }
 
-    /// @notice THE PROPERTY THAT MAKES THE CEILING SAFE: it is measured from NOW, not from issuance.
-    /// @dev A voucher issued at the full ceiling and presented much later, with seconds left on it, must still
-    ///      pass -- the contract cannot see issuance time and must not try to infer it. Kills an implementation
-    ///      that stores or reconstructs an issuance timestamp, or that compares the voucher's remaining life
-    ///      against the ceiling. Without this property the backend could not use its own window as the ceiling:
-    ///      every voucher would become unusable the moment it aged at all.
-    function test_ceilingIsRelativeToNow_notIssuance() external {
+    /// @notice The ceiling is measured from the SIGNED issuedAt, so ageing a voucher never changes the verdict.
+    /// @dev A voucher issued at the full ceiling and presented with one second left on it must still pass: its
+    ///      lifetime is exactly the ceiling whenever it is presented. Kills an implementation that compares the
+    ///      ceiling against `now` on top of issuedAt, which would make every voucher unusable as it aged and
+    ///      stop the backend using its own window as the ceiling.
+    function test_ceilingIsRelativeToIssuance_agedVoucherStillGood() external {
         uint256 until = _now() + CEILING;
         Types.StakeVoucher memory v = _voucherUntil(alice, until, 3);
         bytes memory sig = signVoucher(v);
@@ -126,6 +135,35 @@ contract VoucherValidityTest is V050Base {
         assertEq(_deposit(alice, n).amount, AMOUNT, "an aged voucher with time left is still good");
     }
 
+    /// @notice Finding #8 regression: a long-dated voucher is NEVER usable, not even at the end of its life.
+    /// @dev With the old now-relative bound this exact voucher reverted today and was accepted 365 days later,
+    ///      inside the last CEILING seconds before validUntil.
+    function test_longDatedVoucherNeverBecomesUsable() external {
+        uint256 t0 = _now();
+        Types.StakeVoucher memory v = _voucherIssued(alice, t0, t0 + 365 days, 40);
+        bytes memory err = abi.encodeWithSelector(Errors.VoucherValidityTooLong.selector, v.validUntil, t0 + CEILING);
+
+        _expectStakeRevert(v, err);
+        vm.warp(v.validUntil - CEILING);
+        _expectStakeRevert(v, err);
+        vm.warp(v.validUntil);
+        _expectStakeRevert(v, err);
+        assertFalse(staking.isVoucherNonceUsed(alice, 40));
+    }
+
+    /// @notice Post-dating issuedAt to slide the window forward is rejected, and the nonce survives.
+    /// @dev Without this check a signer could write issuedAt = validUntil - ceiling for any validUntil and get
+    ///      the old sliding-window behaviour straight back. Exactly `now` is accepted.
+    function test_postDatedVoucherReverts() external {
+        uint256 t = _now();
+        Types.StakeVoucher memory v = _voucherIssued(alice, t + 1, t + CEILING, 41);
+        _expectStakeRevert(v, abi.encodeWithSelector(Errors.VoucherNotYetValid.selector, t + 1, t));
+        assertFalse(staking.isVoucherNonceUsed(alice, 41));
+
+        vm.warp(t + 1);
+        _stake(v);
+    }
+
     /// @notice The two errors bracket the window and do not shadow each other at either boundary.
     /// @dev With a finite ceiling, VoucherExpired and VoucherValidityTooLong sit at opposite ends of the same
     ///      sliding window, and a test that used an unreachable validUntil could now pass for the wrong reason.
@@ -137,7 +175,8 @@ contract VoucherValidityTest is V050Base {
 
         // One second in the past: expired, NOT "too long".
         _expectStakeRevert(
-            _voucherUntil(alice, t - 1, 10), abi.encodeWithSelector(Errors.VoucherExpired.selector, t - 1, t)
+            _voucherIssued(alice, t - CEILING, t - 1, 10),
+            abi.encodeWithSelector(Errors.VoucherExpired.selector, t - 1, t)
         );
 
         // Exactly now: the last instant a voucher is still valid. Accepted (expiry is inclusive).

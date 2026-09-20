@@ -30,8 +30,9 @@ library Types {
     // =        Stake Voucher (EIP-712)     =
     // ======================================
     /// @notice Backend-signed authorisation for one stake.
-    /// @dev extraApyBps is added to the base APY (bps, 10_000 = 100%); validUntil is inclusive (unix seconds);
-    ///      nonce is single-use per wallet.
+    /// @dev extraApyBps is added to the base APY (bps, 10_000 = 100%); issuedAt and validUntil are unix seconds
+    ///      and validUntil is inclusive; epoch must match the contract's voucherEpoch; nonce is single-use per
+    ///      wallet.
     ///
     ///      The two extra-limit fields are a BUDGET, not a per-stake grant. The staking contract meters what the
     ///      wallet has actually spent above its controller limit and subtracts it, so re-presenting a voucher (or
@@ -59,7 +60,13 @@ library Types {
         ///      matching the controller's per-(phase, period) `used`, and the base over-grant comes straight
         ///      back.
         uint256 extraLimitPerCell;
+        /// @dev Unix seconds at which the backend signed the voucher. Must not be in the future, and
+        ///      validUntil - issuedAt must not exceed the contract's maxVoucherValidity.
+        uint256 issuedAt;
         uint256 validUntil;
+        /// @dev Must equal the contract's voucherEpoch. The owner bumps the epoch to void every outstanding
+        ///      voucher at once; the backend reads voucherEpoch() and signs the current value.
+        uint256 epoch;
         uint256 nonce;
     }
 }

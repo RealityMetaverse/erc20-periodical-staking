@@ -2,7 +2,7 @@
 // Copyright 2024 Reality Metaverse
 pragma solidity 0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "../interfaces/IPeriodicalStakingContract.sol";
 import "../interfaces/ILimitController.sol";
 import "../common/Errors.sol";
@@ -16,14 +16,25 @@ import "../common/Errors.sol";
 ///      use clearWalletLimit to fall back to the phase/period default again.
 ///      "Used" is the stake in the staking contract plus the stake in the legacy contract for the SAME phase
 ///      and period. There is no remapping: a phase/period that does not exist in a contract reads 0 there.
+///      Ownership is two-step (Ownable2Step): transferOwnership only nominates a pending owner, who must then
+///      call acceptOwnership. renounceOwnership is disabled.
+///      `stakingContract` is immutable: it is fixed by the constructor and there is no setter. One controller
+///      serves exactly one staking contract for its whole life; point a different staking contract at a new
+///      controller instead.
 /// @author Heydar Badirli
-contract LimitController is ILimitController, Ownable, Errors {
+contract LimitController is ILimitController, Ownable2Step, Errors {
     // ======================================
     // =          State Variables           =
     // ======================================
 
     /// @notice The staking contract to query for staked amounts
-    IPeriodicalStakingContract public stakingContract;
+    /// @dev SET ONCE, at construction, and immutable thereafter. ERC20PeriodicalStaking.setLimitController only
+    ///      accepts a controller whose stakingContract() is the staking contract itself; making this immutable
+    ///      turns that install-time check into a permanent invariant instead of a snapshot the controller owner
+    ///      could invalidate afterwards by repointing the controller at a different staking contract (which
+    ///      would have left staking reading `used` from the wrong contract). To point a controller at another
+    ///      staking contract, deploy a new controller.
+    IPeriodicalStakingContract public immutable stakingContract;
 
     /// @notice Optional legacy staking contract whose stake also counts as used (address(0) = none)
     /// @dev Queried with the same phase/period as the staking contract. Not wrapped in try/catch on purpose:
@@ -49,7 +60,9 @@ contract LimitController is ILimitController, Ownable, Errors {
     // =          Errors & Events           =
     // ======================================
     error SameStakingAndLegacyContract(address contractAddress);
+    // RenounceOwnershipDisabled is declared in src/common/Errors.sol, inherited here.
 
+    /// @notice Emitted once, by the constructor. `stakingContract` is immutable, so it never fires again.
     event StakingContractSet(address indexed stakingContract);
     event LegacyStakingContractSet(address indexed legacyStakingContract);
     event WalletLimitSet(address indexed wallet, uint256 phase, uint256 period, uint256 limit);
@@ -69,13 +82,9 @@ contract LimitController is ILimitController, Ownable, Errors {
     // ======================================
     // =       Administrative Functions     =
     // ======================================
-    /// @notice Set the staking contract address
-    /// @param _stakingContract The address of the ERC20PeriodicalStaking contract
-    function setStakingContract(address _stakingContract) external onlyOwner {
-        if (_stakingContract == address(0)) revert ZeroAddressProvided();
-        if (_stakingContract == address(legacyStakingContract)) revert SameStakingAndLegacyContract(_stakingContract);
-        stakingContract = IPeriodicalStakingContract(_stakingContract);
-        emit StakingContractSet(_stakingContract);
+    /// @notice Disabled: always reverts RenounceOwnershipDisabled
+    function renounceOwnership() public pure override {
+        revert RenounceOwnershipDisabled();
     }
 
     /// @notice Set (or clear with address(0)) the legacy staking contract whose stake also counts as used

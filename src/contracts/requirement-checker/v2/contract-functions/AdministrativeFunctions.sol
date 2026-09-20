@@ -6,15 +6,30 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "../Storage.sol";
 
 abstract contract AdministrativeFunctions is Storage {
+    /// @notice Disabled. Ownership can only move through the two-step transferOwnership / acceptOwnership flow.
+    /// @dev Always reverts with RenounceOwnershipDisabled, for every caller.
+    function renounceOwnership() public pure override {
+        revert RenounceOwnershipDisabled();
+    }
+
     function setDefaultRequiredWorth(uint256 newDefaultRequiredWorth) external onlyOwner {
         defaultRequiredWorth = newDefaultRequiredWorth;
         emit DefaultRequiredWorthUpdated(newDefaultRequiredWorth);
     }
 
     /// @notice Set required worth for a specific phase period
+    /// @dev 0 does NOT mean "no requirement": it clears the override, so the cell falls back to
+    ///      defaultRequiredWorth (see getRequiredWorth).
+    ///      THERE IS NO PER-CELL EXEMPTION while defaultRequiredWorth is non-zero. meetsRequirement short-
+    ///      circuits to true only when the RESOLVED requirement is 0, and a resolved 0 is unreachable for a
+    ///      single cell: storing 0 here just re-exposes the non-zero default. 1 is the smallest reachable
+    ///      threshold, and it is a real threshold, not an exemption -- `worth >= 1` still fails for a wallet
+    ///      with zero worth. The only way to exempt is to set defaultRequiredWorth to 0 (and leave, or clear,
+    ///      the cell's override), which exempts every cell that has no non-zero override.
     /// @param phase The staking phase
     /// @param period The staking period
-    /// @param newRequiredWorth The required worth amount (0 means no requirement for this phase/period)
+    /// @param newRequiredWorth The required worth amount (0 clears the override and falls back to
+    ///        defaultRequiredWorth; 1 is the lowest non-zero threshold, which a zero-worth wallet still fails)
     function setRequiredWorthPhasePeriod(uint256 phase, uint256 period, uint256 newRequiredWorth) external onlyOwner {
         _setRequiredWorthPhasePeriod(phase, period, newRequiredWorth);
     }
@@ -23,6 +38,9 @@ abstract contract AdministrativeFunctions is Storage {
     /// @param phases Array of staking phases
     /// @param periods Array of staking periods
     /// @param requiredWorths Array of required worth amounts corresponding to each phase/period combination
+    ///        (same semantics as setRequiredWorthPhasePeriod: 0 clears the override and falls back to
+    ///        defaultRequiredWorth; 1 is the lowest non-zero threshold, not an exemption -- a zero-worth
+    ///        wallet still fails it. Only defaultRequiredWorth == 0 exempts.)
     function setRequiredWorthPhasePeriodBatch(
         uint256[] calldata phases,
         uint256[] calldata periods,
@@ -62,16 +80,7 @@ abstract contract AdministrativeFunctions is Storage {
         }
         if (index == type(uint256).max) revert ERC1155ContractNotFound(token);
 
-        uint256[] memory trackedIds = erc1155TrackedIds[token];
-        for (uint256 i = 0; i < trackedIds.length; i++) {
-            delete erc1155IdWorth[token][trackedIds[i]];
-        }
-        delete erc1155TrackedIds[token];
-
-        erc1155Contracts[index] = erc1155Contracts[erc1155Contracts.length - 1];
-        erc1155Contracts.pop();
-
-        emit ERC1155ContractRemoved(token);
+        _removeERC1155ContractAt(index);
     }
 
     /// @notice Update the worthToken used for ERC20 balance measurements and worth denomination.
@@ -79,6 +88,10 @@ abstract contract AdministrativeFunctions is Storage {
     /// @param newToken The new ERC20 token address (must be non-zero).
     function setWorthToken(address newToken) external onlyOwner {
         if (newToken == address(0)) revert ZeroAddressProvided();
+        // A codeless address is rejected too: balanceOf would revert on every read, and because
+        // meetsRequirementBatch isolates each entry that failure surfaces as a successful all-false batch --
+        // indistinguishable to a caller from "nobody qualifies". Catch the misconfiguration at write time.
+        if (newToken.code.length == 0) revert NotAContract(newToken);
         worthToken = IERC20(newToken);
         emit WorthTokenUpdated(newToken);
     }
@@ -191,14 +204,26 @@ abstract contract AdministrativeFunctions is Storage {
     // ======================================
     // =         Internal Functions         =
     // ======================================
+    /// @dev Shared bound for every offset setter. With |offset| <= type(int128).max the signed ADDITIONS in
+    ///      ReadFunctions (`raw + offset`) cannot overflow for any realistic balance.
+    ///      It does NOT make the reads revert-proof: `erc1155IdWorth` is uncapped, so a bounded, accepted
+    ///      NFT count offset multiplied by a large owner-set id worth still panics 0x11 in totalERC1155Worth
+    ///      and getAppliedOffsetsWorth. Single-wallet reads propagate that revert; meetsRequirementBatch
+    ///      isolates the entry and reports `false`. Keep id worths in sane units.
+    function _checkOffset(int256 offset) private pure {
+        if (offset > MAX_ABS_OFFSET || offset < -MAX_ABS_OFFSET) revert OffsetOutOfBounds(offset, MAX_ABS_OFFSET);
+    }
+
     function _setErc20Offset(address wallet, int256 offset) private {
         if (wallet == address(0)) revert ZeroAddressProvided();
+        _checkOffset(offset);
         erc20Offset[wallet] = offset;
         emit ERC20OffsetSet(wallet, offset);
     }
 
     function _setPoolStakingOffset(address wallet, address poolStakingContract, int256 offset) private {
         if (wallet == address(0) || poolStakingContract == address(0)) revert ZeroAddressProvided();
+        _checkOffset(offset);
         poolStakingOffset[wallet][poolStakingContract] = offset;
         emit PoolStakingOffsetSet(wallet, poolStakingContract, offset);
     }
@@ -207,12 +232,14 @@ abstract contract AdministrativeFunctions is Storage {
         address wallet, address periodicalStakingContract, int256 offset
     ) private {
         if (wallet == address(0) || periodicalStakingContract == address(0)) revert ZeroAddressProvided();
+        _checkOffset(offset);
         periodicalStakingOffset[wallet][periodicalStakingContract] = offset;
         emit PeriodicalStakingOffsetSet(wallet, periodicalStakingContract, offset);
     }
 
     function _setNftCountOffset(address wallet, address token, uint256 id, int256 offset) private {
         if (wallet == address(0) || token == address(0)) revert ZeroAddressProvided();
+        _checkOffset(offset);
         nftCountOffset[wallet][token][id] = offset;
         emit NFTCountOffsetSet(wallet, token, id, offset);
     }
@@ -231,32 +258,46 @@ abstract contract AdministrativeFunctions is Storage {
         emit RequiredPhasePeriodWorthSet(phase, period, requiredWorth);
     }
 
-    /// @dev Internal helper to validate and set pool staking contracts array
+    /// @dev Internal helper to validate (non-zero, no duplicates) and set pool staking contracts array
     function _setPoolStakingContracts(address[] memory newContracts) internal {
-        for (uint256 i = 0; i < newContracts.length; i++) {
-            if (newContracts[i] == address(0)) revert ZeroAddressProvided();
-        }
+        _validateContractList(newContracts);
         poolStakingContracts = newContracts;
         emit PoolStakingContractsUpdated(newContracts);
     }
 
-    /// @dev Internal helper to validate and set periodical staking contracts array
+    /// @dev Internal helper to validate (non-zero, no duplicates) and set periodical staking contracts array
     function _setPeriodicalStakingContracts(address[] memory newContracts) internal {
-        for (uint256 i = 0; i < newContracts.length; i++) {
-            if (newContracts[i] == address(0)) revert ZeroAddressProvided();
-        }
+        _validateContractList(newContracts);
         periodicalStakingContracts = newContracts;
         emit PeriodicalStakingContractsUpdated(newContracts);
+    }
+
+    /// @dev Reverts on a zero address or on an address listed twice (a duplicate would be summed once per
+    ///      occurrence by the worth reads). O(n^2) pairwise scan; these lists are small and owner-controlled.
+    function _validateContractList(address[] memory list) private pure {
+        for (uint256 i = 0; i < list.length; i++) {
+            if (list[i] == address(0)) revert ZeroAddressProvided();
+            for (uint256 j = 0; j < i; j++) {
+                if (list[j] == list[i]) revert DuplicateAddress(list[i]);
+            }
+        }
     }
 
     /// @dev Shared write path for ERC1155 config. Validates inputs, clears stale worth entries
     ///      from the previous tracked-ids list so ids dropped by this call do not leave orphaned
     ///      non-zero slots, adds the token to erc1155Contracts on first registration, stores the
-    ///      new ids and worths, and emits ERC1155ConfigUpdated.
+    ///      new ids and worths, and emits ERC1155ConfigUpdated. Rejects an id listed twice: it would be
+    ///      double counted at read time, with the last worth winning for both entries (O(n^2) scan; id lists
+    ///      are small and owner-controlled).
     function _setERC1155Configs(address token, uint256[] memory ids, uint256[] memory worths) internal {
         if (token == address(0)) revert ZeroAddressProvided();
         if (ids.length == 0) revert EmptyIdsArray();
         if (ids.length != worths.length) revert LengthMismatch(ids.length, worths.length);
+        for (uint256 i = 1; i < ids.length; i++) {
+            for (uint256 j = 0; j < i; j++) {
+                if (ids[j] == ids[i]) revert DuplicateId(ids[i]);
+            }
+        }
 
         uint256[] memory previousIds = erc1155TrackedIds[token];
         for (uint256 j = 0; j < previousIds.length; j++) {
@@ -271,6 +312,31 @@ abstract contract AdministrativeFunctions is Storage {
             erc1155IdWorth[token][ids[i]] = worths[i];
         }
         emit ERC1155ConfigUpdated(token, ids, worths);
+    }
+
+    /// @dev Drops the ERC1155 contract at `index`: clears every tracked id's worth, the tracked-ids list, and
+    ///      swap-with-last + pops it out of erc1155Contracts. Emits ERC1155ContractRemoved.
+    function _removeERC1155ContractAt(uint256 index) private {
+        address token = erc1155Contracts[index];
+
+        uint256[] memory trackedIds = erc1155TrackedIds[token];
+        for (uint256 i = 0; i < trackedIds.length; i++) {
+            delete erc1155IdWorth[token][trackedIds[i]];
+        }
+        delete erc1155TrackedIds[token];
+
+        erc1155Contracts[index] = erc1155Contracts[erc1155Contracts.length - 1];
+        erc1155Contracts.pop();
+
+        emit ERC1155ContractRemoved(token);
+    }
+
+    /// @dev Removes every registered ERC1155 contract (same per-contract cleanup and event as
+    ///      removeERC1155Contract). Used by cloneConfigFrom so the clone mirrors its source exactly.
+    function _clearERC1155Configs() internal {
+        for (uint256 i = erc1155Contracts.length; i > 0; i--) {
+            _removeERC1155ContractAt(i - 1);
+        }
     }
 
     /// @dev Swap-with-last + pop to drop a (phase, period) pair from the enumerable index.

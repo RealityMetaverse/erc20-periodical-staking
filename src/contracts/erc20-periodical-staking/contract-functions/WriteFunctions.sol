@@ -6,28 +6,64 @@ import "../ComplianceCheck.sol";
 import "../../../common/Types.sol";
 
 abstract contract WriteFunctions is ComplianceCheck {
-    /// @dev Advance the user's active-deposit cursor past every closed (WITHDRAWN/CLAIMED/SEIZED) deposit.
-    ///      When every deposit is closed the cursor equals the deposit count, so later loops are empty.
-    function _updateActiveDepositStartIndex(address userAddress) internal {
-        PackedDeposit[] storage deposits = stakerDepositList[userAddress];
-        uint256 userDepositCount = deposits.length;
+    /// @dev Most deposits one cursor update may walk. Bounds the gas a close can be charged for the scan
+    ///      (each step is a cold deposit read) no matter how many closed deposits sit behind the one closing.
+    uint256 internal constant MAX_CURSOR_SCAN = 256;
 
-        if (userDepositCount == 0) return;
+    /// @dev Most deposits one permissionless `advanceCursor` call may walk. Higher than MAX_CURSOR_SCAN because
+    ///      the caller chooses to pay for it and is not piggybacking on someone's claim or withdrawal.
+    uint256 internal constant MAX_CURSOR_ADVANCE = 1024;
+
+    /// @notice Pay down a lagging active-deposit cursor for any wallet. Permissionless.
+    /// @dev Maintenance only: it moves the cursor past deposits that are already closed and can never move it
+    ///      past an open one, so it changes no balance, no counter and no deposit. It exists because the close
+    ///      paths only run the scan as a side effect of a claim / withdrawal / seize: once every deposit of a
+    ///      wallet is closed, nothing triggers the scan again and a cursor left behind by the MAX_CURSOR_SCAN
+    ///      cap would stay there forever, making every later `claimAll` and `checkClaimableDataFor` re-walk the
+    ///      closed tail. Anyone (an ops bot, the wallet itself, an indexer) can call this to bring it forward.
+    ///      Idempotent: a call that finds nothing to skip writes nothing.
+    /// @param wallet The wallet whose cursor to advance
+    /// @param maxSteps Deposits to walk at most; 0 or a value above MAX_CURSOR_ADVANCE means MAX_CURSOR_ADVANCE
+    /// @return newStartIndex The wallet's cursor after this call
+    function advanceCursor(address wallet, uint256 maxSteps) external returns (uint256 newStartIndex) {
+        if (maxSteps == 0 || maxSteps > MAX_CURSOR_ADVANCE) maxSteps = MAX_CURSOR_ADVANCE;
+        _advanceCursor(wallet, maxSteps);
+        return stakerActiveDepositStartIndex[wallet];
+    }
+
+    /// @dev Advance the user's active-deposit cursor past closed (WITHDRAWN/CLAIMED/SEIZED) deposits, at most
+    ///      MAX_CURSOR_SCAN of them per call; the progress made is stored and the next close carries on from
+    ///      there. The cursor is therefore a LOWER-BOUND HINT: everything before it is closed, but deposits at
+    ///      or after it may be closed too, and it may sit below the deposit count when every deposit is closed.
+    ///      Every reader (claimAll, checkClaimableDataFor) checks each deposit's status itself, so a lagging
+    ///      cursor costs them gas, never correctness. Do not write code that assumes the cursor is exact.
+    ///      `advanceCursor` can always pay a lagging cursor down without closing anything.
+    function _updateActiveDepositStartIndex(address userAddress) internal {
+        _advanceCursor(userAddress, MAX_CURSOR_SCAN);
+    }
+
+    /// @dev Shared bounded scan behind both the close paths and `advanceCursor`. Stops at the first deposit
+    ///      that is still open (TIME_LEFT / READY_TO_CLAIM / INDEFINITE), at `maxSteps` steps, or at the end of
+    ///      the deposit list, whichever comes first, and only writes when it actually moved.
+    function _advanceCursor(address userAddress, uint256 maxSteps) private {
+        PackedDeposit[] storage deposits = stakerDepositList[userAddress];
 
         uint256 currentIndex = stakerActiveDepositStartIndex[userAddress];
-        uint256 newStartIndex = userDepositCount;
+        uint256 scanEnd = currentIndex + maxSteps;
+        {
+            uint256 userDepositCount = deposits.length;
+            if (scanEnd > userDepositCount) scanEnd = userDepositCount;
+        }
 
-        for (uint256 i = currentIndex; i < userDepositCount;) {
-            DepositStatus status = _status(deposits[i]);
+        uint256 newStartIndex = currentIndex;
+        while (newStartIndex < scanEnd) {
+            DepositStatus status = _status(deposits[newStartIndex]);
             if (
                 status == DepositStatus.TIME_LEFT || status == DepositStatus.READY_TO_CLAIM
                     || status == DepositStatus.INDEFINITE
-            ) {
-                newStartIndex = i;
-                break;
-            }
+            ) break;
             unchecked {
-                ++i;
+                ++newStartIndex;
             }
         }
 

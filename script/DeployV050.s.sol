@@ -77,6 +77,15 @@ contract DeployV050 is Script {
     uint256 private constant PCT_TO_BPS = 100;
     /// @dev forge's default script sender, i.e. no --sender was given.
     address private constant FORGE_DEFAULT_SENDER = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38;
+    /// @dev Mirrors of the staking contract's config-time bounds (AdministrativeFunctions MAX_APY_BPS and
+    ///      MAX_PERIOD_DAYS, both internal there). Above them the contract reverts ValueTooHigh mid-deployment.
+    uint256 private constant MAX_APY_BPS = 1_000_000;
+    uint256 private constant MAX_PERIOD_DAYS = 36_500;
+    /// @dev Hand-off stages a two-step contract can legitimately be in (see `_checkOwnership`). Both the staking
+    ///      contract and the LimitController must be at the SAME one: a mixed state means one acceptOwnership()
+    ///      was forgotten.
+    uint8 private constant STAGE_NOMINATED = 0;
+    uint8 private constant STAGE_ACCEPTED = 1;
 
     struct Params {
         address sourceStaking;
@@ -94,6 +103,7 @@ contract DeployV050 is Script {
         string walletLimitsFile; // "" = no per-wallet limits
         address resumeStaking; // address(0) = deploy a new staking contract
         address resumeController; // address(0) = deploy a new LimitController
+        bool allowSharedRoles; // false = one address holding two roles fails the preflight (see _preflightRoles)
     }
 
     struct OldConfig {
@@ -158,6 +168,15 @@ contract DeployV050 is Script {
         Params memory p = paramsFromEnv();
         OldConfig memory o = readOldConfig(p.sourceStaking);
         WalletLimitRow[] memory rows = loadWalletLimits(p.walletLimitsFile, o);
+        // VERIFY_ONLY=true: no deployment and no broadcast, only the self-check against what is on chain.
+        if (envSet("VERIFY_ONLY") && vm.envBool("VERIFY_ONLY")) {
+            _requireEnv("VERIFY_STAKING");
+            _requireEnv("VERIFY_CONTROLLER");
+            _requireEnv("DEPLOYER_ADDRESS");
+            return verifyOnly(
+                o, p, rows, vm.envAddress("VERIFY_STAKING"), vm.envAddress("VERIFY_CONTROLLER"), vm.envAddress("DEPLOYER_ADDRESS")
+            );
+        }
         // PRIVATE_KEY is the discouraged fallback signer. It is read from the environment so the wrapper never has
         // to put it on forge's command line. Keystore runs leave it empty and sign with --account/--sender.
         uint256 key = _envUintOr("PRIVATE_KEY", 0);
@@ -197,6 +216,35 @@ contract DeployV050 is Script {
         verifyDeployment(o, p, rows, d, address(this));
     }
 
+    /// @notice Verify-only mode (VERIFY_ONLY=true): runs the self-check against contracts ALREADY ON CHAIN. Sends
+    ///         nothing. The mandatory step after a broadcast: run()'s own self-check reads the simulation's state,
+    ///         not what the network actually mined.
+    /// @dev `p` must be the parameters the deployment was broadcast with. Ownership may already have been
+    ///      accepted by NEW_OWNER, so both hand-off stages pass (see `_checkOwnership`). The role check runs
+    ///      again; the balance and resume preflights do not apply to a finished deployment.
+    function verifyOnly(
+        OldConfig memory o,
+        Params memory p,
+        WalletLimitRow[] memory rows,
+        address stakingAddr,
+        address controllerAddr,
+        address deployer
+    ) public view returns (Deployment memory d) {
+        require(stakingAddr.code.length > 0, "DeployV050: VERIFY_STAKING has no code on this chain");
+        require(controllerAddr.code.length > 0, "DeployV050: VERIFY_CONTROLLER has no code on this chain");
+        require(deployer != address(0), "DeployV050: DEPLOYER_ADDRESS must be non-zero");
+        d.staking = ERC20PeriodicalStaking(stakingAddr);
+        d.controller = LimitController(controllerAddr);
+
+        _logOld(o, p, deployer);
+        console2.log("");
+        console2.log("=== VERIFY-ONLY: no transaction is sent, the checks below read the chain ===");
+        console2.log("staking               ", stakingAddr);
+        console2.log("limit controller      ", controllerAddr);
+        _preflightRoles(o, p, deployer);
+        _verify(o, p, rows, d, deployer, true);
+    }
+
     // ======================================
     // =               Inputs               =
     // ======================================
@@ -204,7 +252,8 @@ contract DeployV050 is Script {
     /// @notice Reads and validates the environment. Required: VOUCHER_SIGNER, TREASURY, MAX_EXTRA_APY_BPS,
     ///         MAX_EXTRA_LIMIT_TOTAL, MAX_EXTRA_LIMIT_PER_CELL, MAX_VOUCHER_VALIDITY. Optional: SOURCE_STAKING, REQUIREMENT_CHECKER_V2,
     ///         NEW_OWNER, ADMINS, OPEN_STAKING,
-    ///         REWARD_TOP_UP, WALLET_LIMITS_FILE. run() also reads PRIVATE_KEY.
+    ///         REWARD_TOP_UP, WALLET_LIMITS_FILE, RESUME_STAKING, RESUME_CONTROLLER, ALLOW_SHARED_ROLES. run() also
+    ///         reads PRIVATE_KEY, and VERIFY_ONLY with VERIFY_STAKING, VERIFY_CONTROLLER and DEPLOYER_ADDRESS.
     /// @dev An empty value means "unset, use the default" for every variable (see `envSet`), so the wrapper can
     ///      export all of them explicitly and a root .env cannot fill the gaps.
     function paramsFromEnv() public view returns (Params memory p) {
@@ -230,6 +279,7 @@ contract DeployV050 is Script {
         p.walletLimitsFile = VMX.envOr("WALLET_LIMITS_FILE", "");
         p.resumeStaking = _envAddressOr("RESUME_STAKING", address(0));
         p.resumeController = _envAddressOr("RESUME_CONTROLLER", address(0));
+        p.allowSharedRoles = envSet("ALLOW_SHARED_ROLES") ? vm.envBool("ALLOW_SHARED_ROLES") : false;
         require(
             p.resumeController == address(0) || p.resumeStaking != address(0),
             "DeployV050: RESUME_CONTROLLER without RESUME_STAKING"
@@ -377,6 +427,10 @@ contract DeployV050 is Script {
         require(p.voucherSigner != address(0), "DeployV050: VOUCHER_SIGNER must be non-zero");
         require(p.treasury != address(0), "DeployV050: TREASURY must be non-zero");
         require(p.maxExtraApyBps <= type(uint32).max, "DeployV050: MAX_EXTRA_APY_BPS exceeds uint32");
+        // setMaxExtraApyBps reverts ValueTooHigh above this; say so before anything is deployed.
+        require(
+            p.maxExtraApyBps <= MAX_APY_BPS, "DeployV050: MAX_EXTRA_APY_BPS exceeds 1000000 bps (v0.5.0 rejects it)"
+        );
         require(p.maxExtraLimitTotal <= type(uint128).max, "DeployV050: MAX_EXTRA_LIMIT_TOTAL exceeds uint128");
         require(
             p.maxExtraLimitPerCell <= type(uint128).max, "DeployV050: MAX_EXTRA_LIMIT_PER_CELL exceeds uint128"
@@ -395,14 +449,26 @@ contract DeployV050 is Script {
         require(o.token != address(0), "DeployV050: source contract returned no token");
         require(o.phaseCount > 0 && o.periods.length > 0, "DeployV050: source contract has no program configured");
         require(o.minimumDeposit > 0 && o.minimumDeposit <= type(uint128).max, "DeployV050: minimum deposit out of range");
+        // addStakingPeriod reverts ValueTooHigh for a longer period; v0.2.4 had no such bound.
+        for (uint256 i = 0; i < o.periods.length; ++i) {
+            require(
+                o.periods[i] <= MAX_PERIOD_DAYS, "DeployV050: source period exceeds 36500 days (v0.5.0 rejects it)"
+            );
+        }
         for (uint256 ph = 0; ph < o.phaseCount; ++ph) {
             for (uint256 i = 0; i < o.periods.length; ++i) {
                 uint256 pct = o.apyPct[ph][i];
                 require(pct != 0, "DeployV050: source APY cell is 0 (v0.5.0 rejects 0)");
-                // A deposit stores base + extra APY in a uint32: fail here, not at the first stake.
+                // A deposit stores base + extra APY in a uint32: fail here, not at the first stake. The
+                // tighter config-time bound below makes this the message for absurd source values only.
                 require(
                     pct <= (type(uint32).max - p.maxExtraApyBps) / PCT_TO_BPS,
                     "DeployV050: APY pct * 100 + MAX_EXTRA_APY_BPS overflows uint32"
+                );
+                // pushStakingPhase / addStakingPeriod revert ValueTooHigh above this.
+                require(
+                    pct <= MAX_APY_BPS / PCT_TO_BPS,
+                    "DeployV050: source APY pct * 100 exceeds 1000000 bps (v0.5.0 rejects it)"
                 );
             }
         }
@@ -411,7 +477,51 @@ contract DeployV050 is Script {
                 IERC20(o.token).balanceOf(deployer) >= p.rewardTopUp, "DeployV050: deployer balance below REWARD_TOP_UP"
             );
         }
+        _preflightRoles(o, p, deployer);
         _preflightResume(o, p, deployer);
+    }
+
+    /// @dev One key per role. A voucher signer that is also the deployer, the owner, the treasury or an admin turns
+    ///      a leaked backend signing key into an ownership or funds problem; a treasury that is the token or a
+    ///      staking contract strands every seized deposit. ALLOW_SHARED_ROLES=true downgrades each clash to a
+    ///      warning (testnets). The NEW contracts' addresses are checked in verifyDeployment.
+    function _preflightRoles(OldConfig memory o, Params memory p, address deployer) internal view {
+        _roleClash(p, p.voucherSigner == deployer, "VOUCHER_SIGNER equals the deployer");
+        _roleClash(p, p.voucherSigner == p.newOwner, "VOUCHER_SIGNER equals NEW_OWNER");
+        _roleClash(p, p.voucherSigner == p.treasury, "VOUCHER_SIGNER equals TREASURY");
+        for (uint256 i = 0; i < p.admins.length; ++i) {
+            _roleClash(p, p.voucherSigner == p.admins[i], "VOUCHER_SIGNER equals an address in ADMINS");
+        }
+        _roleClash(p, p.treasury == o.token, "TREASURY equals the staking token");
+        _roleClash(p, p.treasury == o.staking, "TREASURY equals the source staking contract");
+        _roleClash(
+            p, p.resumeStaking != address(0) && p.treasury == p.resumeStaking, "TREASURY equals RESUME_STAKING"
+        );
+        // A contract admin can freeze and seize deposits; the treasury is where seized funds land. One key that
+        // holds both roles can take the funds AND receive them, with no second party in the way.
+        for (uint256 i = 0; i < p.admins.length; ++i) {
+            _roleClash(p, p.treasury == p.admins[i], "TREASURY equals an address in ADMINS");
+        }
+        // The owner can already move everything; making it the seizure destination removes the last separation.
+        _roleClash(p, p.newOwner != address(0) && p.treasury == p.newOwner, "TREASURY equals NEW_OWNER");
+        // Duplicates are harmless on chain (addContractAdmin is idempotent) but always mean the operator's list
+        // is not what they think it is, so say so out loud. Never fatal, so ALLOW_SHARED_ROLES is not consulted.
+        for (uint256 i = 0; i < p.admins.length; ++i) {
+            for (uint256 j = i + 1; j < p.admins.length; ++j) {
+                if (p.admins[i] == p.admins[j]) {
+                    console2.log("!!!!!!!! WARNING: ADMINS lists the same address more than once:", p.admins[i]);
+                }
+            }
+        }
+    }
+
+    function _roleClash(Params memory p, bool clash, string memory what) private view {
+        if (!clash) return;
+        require(
+            p.allowSharedRoles,
+            string.concat("DeployV050: ", what, " (one address per role; ALLOW_SHARED_ROLES=true overrides)")
+        );
+        console2.log("!!!!!!!! WARNING: shared role accepted because ALLOW_SHARED_ROLES=true:", what);
     }
 
     /// @dev A resume must attach to contracts this deployer still owns and that belong to this source, otherwise
@@ -504,10 +614,11 @@ contract DeployV050 is Script {
             }
         }
 
-        // 5. Ownership last. Staking: two-step (NEW_OWNER must acceptOwnership). LimitController: OZ Ownable, immediate.
+        // 5. Ownership last. Both contracts are two-step: this only nominates NEW_OWNER, who must acceptOwnership()
+        //    on the staking contract AND on the LimitController. The deployer stays owner of both until then.
         if (p.newOwner != address(0)) {
             if (d.staking.pendingOwner() != p.newOwner) d.staking.transferOwnership(p.newOwner);
-            if (d.controller.owner() != p.newOwner) d.controller.transferOwnership(p.newOwner);
+            if (d.controller.pendingOwner() != p.newOwner) d.controller.transferOwnership(p.newOwner);
         }
     }
 
@@ -613,6 +724,19 @@ contract DeployV050 is Script {
         Deployment memory d,
         address deployer
     ) public view {
+        _verify(o, p, rows, d, deployer, false);
+    }
+
+    /// @dev `live` = verify-only mode, reading a finished deployment from the chain: NEW_OWNER may have accepted
+    ///      already, and the reward pool is judged against REWARD_TOP_UP.
+    function _verify(
+        OldConfig memory o,
+        Params memory p,
+        WalletLimitRow[] memory rows,
+        Deployment memory d,
+        address deployer,
+        bool live
+    ) internal view {
         ERC20PeriodicalStaking s = d.staking;
         LimitController c = d.controller;
         uint256 unit = 10 ** uint256(IERC20Metadata(o.token).decimals());
@@ -632,12 +756,49 @@ contract DeployV050 is Script {
         require(s.stakingPhaseCount() == o.phaseCount, "check: stakingPhaseCount");
         require(s.currentStakingPhase() == o.currentPhase, "check: currentStakingPhase");
         require(s.minimumDeposit() == o.minimumDeposit, "check: minimumDeposit");
-        require(s.checkActionAvailability(Types.DataType.STAKING) == p.openStaking, "check: STAKING availability");
-        require(s.checkActionAvailability(Types.DataType.WITHDRAWAL), "check: WITHDRAWAL availability");
-        require(s.checkActionAvailability(Types.DataType.CLAIM), "check: CLAIM availability");
-        require(s.contractOwner() == deployer, "check: contractOwner is the deployer");
-        require(s.pendingOwner() == p.newOwner, "check: pendingOwner");
-        require(c.owner() == (p.newOwner == address(0) ? deployer : p.newOwner), "check: controller owner");
+        // Action availability is the one group of settings ops is EXPECTED to change after the deploy: the
+        // documented hand-off ends with changeActionAvailability(STAKING, true). Comparing it against the env
+        // file is right at deploy time (nothing has touched the contract yet) and wrong for ever afterwards - a
+        // hard failure there would make verify-only useless on every healthy deployment. So: strict in the
+        // post-deploy self-check, informational in verify-only.
+        _checkAvailability(
+            s.checkActionAvailability(Types.DataType.STAKING), p.openStaking, live, "STAKING", "OPEN_STAKING"
+        );
+        _checkAvailability(s.checkActionAvailability(Types.DataType.WITHDRAWAL), true, live, "WITHDRAWAL", "true");
+        _checkAvailability(s.checkActionAvailability(Types.DataType.CLAIM), true, live, "CLAIM", "true");
+        // setTreasury rejects the staking contract itself; the controller's address only exists after deployment.
+        require(p.treasury != address(s), "check: treasury is the new staking contract");
+        require(p.treasury != address(c), "check: treasury is the new LimitController");
+        uint8 stakingStage =
+            _checkOwnership(s.contractOwner(), s.pendingOwner(), p.newOwner, deployer, live, "check: staking ownership");
+        uint8 controllerStage =
+            _checkOwnership(c.owner(), c.pendingOwner(), p.newOwner, deployer, live, "check: controller ownership");
+        // Both contracts are two-step, so the hand-off is only finished when BOTH have been accepted. Judging
+        // them one at a time lets a deployment where NEW_OWNER accepted the staking contract and forgot the
+        // controller pass verification - which is precisely the mistake the two-step change makes possible.
+        if (stakingStage != controllerStage) {
+            console2.log("staking contract  ", address(s), stakingStage == STAGE_ACCEPTED ? "ACCEPTED by NEW_OWNER" : "still PENDING");
+            console2.log("LimitController   ", address(c), controllerStage == STAGE_ACCEPTED ? "ACCEPTED by NEW_OWNER" : "still PENDING");
+            console2.log("NEW_OWNER         ", p.newOwner);
+            revert(
+                "check: half-finished hand-off - NEW_OWNER accepted ONE contract, not both. Call acceptOwnership() on the other (see the two lines above) and re-run --verify-only"
+            );
+        }
+        // The pool must actually cover what the env file says was funded. `!= 0` let 1 wei stand in for any
+        // REWARD_TOP_UP. On a live deployment whose rewards have since been paid out, set REWARD_TOP_UP=0 in the
+        // env file for verify-only runs: in that mode it is an expectation about the chain, not an instruction.
+        if (p.rewardTopUp > 0) {
+            require(s.rewardPool() != 0, "check: REWARD_TOP_UP requested but the reward pool is 0");
+            if (s.rewardPool() < p.rewardTopUp) {
+                console2.log("reward pool (wei)     ", s.rewardPool());
+                console2.log("REWARD_TOP_UP (wei)   ", p.rewardTopUp);
+                console2.log("shortfall (wei)       ", p.rewardTopUp - s.rewardPool());
+            }
+            require(
+                s.rewardPool() >= p.rewardTopUp,
+                "check: reward pool is BELOW REWARD_TOP_UP (see the shortfall above). Fund it, or set REWARD_TOP_UP=0 for verify-only once rewards have been paid out"
+            );
+        }
 
         uint256[] memory newPeriods = s.getStakingPeriods();
         require(newPeriods.length == o.periods.length, "check: period count");
@@ -691,7 +852,54 @@ contract DeployV050 is Script {
             );
         }
         console2.log("reward pool           ", _tok(o.rewardPool, unit), "(source) ->", _tok(s.rewardPool(), unit));
-        console2.log("Self-check passed.");
+        console2.log("  REWARD_TOP_UP       ", _tok(p.rewardTopUp, unit));
+        if (live && s.rewardPool() < p.rewardTopUp) {
+            console2.log("  WARNING: the pool is below REWARD_TOP_UP (rewards already paid out, or a resume skipped funding)");
+        }
+        console2.log(live ? "Verify-only passed: the chain state matches." : "Self-check passed.");
+    }
+
+    /// @dev Right after the deployment: the deployer owns, NEW_OWNER (or nobody) is pending. In verify-only mode
+    ///      the completed hand-off passes too: NEW_OWNER owns and nothing is pending. Returns WHICH of the two
+    ///      stages this contract is at, so the caller can require both contracts to be at the same one.
+    function _checkOwnership(
+        address currentOwner,
+        address pending,
+        address newOwner,
+        address deployer,
+        bool live,
+        string memory what
+    ) private pure returns (uint8 stage) {
+        bool nominated = currentOwner == deployer && pending == newOwner;
+        bool accepted = live && newOwner != address(0) && currentOwner == newOwner && pending == address(0);
+        require(nominated || accepted, what);
+        return accepted ? STAGE_ACCEPTED : STAGE_NOMINATED;
+    }
+
+    /// @dev Strict at deploy time (nothing has touched the contract yet), informational in verify-only: see the
+    ///      call site. `expectedSource` names the setting the expectation came from, for the log line.
+    function _checkAvailability(
+        bool actual,
+        bool expected,
+        bool live,
+        string memory action,
+        string memory expectedSource
+    ) private view {
+        if (actual == expected) return;
+        if (!live) revert(string.concat("check: ", action, " availability"));
+        console2.log(
+            string.concat(
+                "  NOTE: ",
+                action,
+                " availability is ",
+                actual ? "true" : "false",
+                " on chain, the env file expects ",
+                expected ? "true" : "false",
+                " (",
+                expectedSource,
+                "). Admin-mutable and expected to change after the hand-off, so this is informational only."
+            )
+        );
     }
 
     // ======================================
@@ -796,7 +1004,15 @@ contract DeployV050 is Script {
         console2.log("5. Source owner", o.owner);
         console2.log("   changeActionAvailability(0 /*STAKING*/, false) on", o.staking);
         if (p.newOwner != address(0)) {
-            console2.log("6. NEW_OWNER must call acceptOwnership() on the staking contract:", p.newOwner);
+            console2.log("");
+            console2.log("6. !!! TWO acceptOwnership() CALLS ARE REQUIRED - BOTH CONTRACTS ARE TWO-STEP !!!");
+            console2.log("   Until BOTH land, the deployer still owns whichever one was missed, and NEW_OWNER cannot");
+            console2.log("   change its settings. NEW_OWNER is", p.newOwner);
+            console2.log("   6a. acceptOwnership() on the staking contract ", address(d.staking));
+            console2.log("   6b. acceptOwnership() on the LimitController  ", address(d.controller));
+            console2.log("   Then re-run ./script/deploy-v050.sh <network> --verify-only: it FAILS on a");
+            console2.log("   half-finished hand-off, so it is the check that 6a and 6b both landed.");
+            console2.log("");
         }
         if (!p.openStaking) {
             console2.log("7. When ready: changeActionAvailability(0 /*STAKING*/, true) on the new staking contract");
