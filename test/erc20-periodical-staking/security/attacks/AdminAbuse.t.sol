@@ -380,9 +380,8 @@ contract AdminAbuseTest is VoucherAttackBase {
         staking.seizeDeposits(_one(alice), _oneU(d));
 
         vm.expectEmit(true, true, true, true, address(staking));
-        emit UnfreezeDeposit(alice, d, admin);
-        vm.prank(admin);
-        staking.unfreezeDeposit(alice, d);
+        emit UnfreezeDeposit(alice, d, owner);
+        staking.unfreezeDeposit(alice, d); // owner-only since the v0.5.0 audit (#10)
         vm.prank(admin);
         staking.freezeDeposit(alice, d);
 
@@ -496,9 +495,7 @@ contract AdminAbuseTest is VoucherAttackBase {
         assertEq(uint256(_status(alice, d0)), uint256(ProgramManager.DepositStatus.READY_TO_CLAIM));
         _assertAccounting();
 
-        vm.prank(admin);
         staking.unfreezeDeposit(alice, d0);
-        vm.prank(admin);
         staking.unfreezeDeposit(alice, d2);
         uint256 accrued = _deposit(alice, d2).rewardGenerated;
         before = token.balanceOf(alice);
@@ -596,7 +593,10 @@ contract AdminAbuseTest is VoucherAttackBase {
         staking.seizeDeposits(ww, nn);
         assertTrue(staking.isDepositFrozen(alice, a));
 
+        // Empty batches revert since the v0.5.0 audit (#37): they are always an ops mistake.
+        vm.expectRevert(Errors.EmptyBatch.selector);
         staking.seizeDeposits(new address[](0), new uint256[](0));
+        vm.expectRevert(Errors.EmptyBatch.selector);
         staking.freezeDeposits(new address[](0), new uint256[](0));
         assertEq(token.balanceOf(treasury), 0);
         _assertAccounting();
@@ -621,15 +621,24 @@ contract AdminAbuseTest is VoucherAttackBase {
     // ---------------------------------------------------------------------
 
     /// @dev Hypothesis: pointing limitController at an EOA bricks the contract.
-    ///      It may only block new stakes and controller-dependent views; owner must be able to recover.
+    ///      Audit finding #16: it cannot be installed any more. setLimitController asks the candidate for
+    ///      stakingContract(), so an EOA (no code), a contract without that function (the token) and a real
+    ///      controller deployed for ANOTHER staking contract are all refused and the old controller stays.
     ///      Unsetting the controller does NOT fall back to "no limit": staking stays closed with a typed error.
     function test_limitController_setToEOA_recoverable() public {
         uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
-        staking.setLimitController(rando);
+        address installed = staking.limitController();
 
-        _expectStakeRevert(alice, 0, P30, 1_000 * ONE, _apy(0, P30), "");
-        _lens(staking);
         vm.expectRevert();
+        staking.setLimitController(rando);
+        vm.expectRevert();
+        staking.setLimitController(address(token));
+        OpenLimitController foreign = new OpenLimitController(address(token));
+        vm.expectRevert(abi.encodeWithSelector(Errors.LimitControllerMismatch.selector, address(token)));
+        staking.setLimitController(address(foreign));
+
+        assertEq(staking.limitController(), installed, "refused: the working controller is still installed");
+        _stake(alice, 0, P30, 1_000 * ONE);
         _lens(staking).getProgramDataWithUserData(alice);
         staking.getProgramData(); // does not consult the controller
 
@@ -650,8 +659,8 @@ contract AdminAbuseTest is VoucherAttackBase {
         _assertAccounting();
     }
 
-    /// @dev Hypothesis: pointing voucherSigner at a contract that does not implement ERC-1271 (here: the token)
-    ///      bricks something besides new stakes. Claims, withdrawals and every view must keep working.
+    /// @dev Hypothesis: pointing voucherSigner at a contract (here: the token) bricks something besides new
+    ///      stakes. Since audit finding #39 no contract can be a signer (ECDSA only), so none is ever called. Claims, withdrawals and every view must keep working.
     function test_voucherSigner_setToNon1271Contract_recoverable() public {
         uint256 d = _stake(alice, 0, P30, 1_000 * ONE);
         uint256 e = _stake(bob, 0, P0, 1_000 * ONE);

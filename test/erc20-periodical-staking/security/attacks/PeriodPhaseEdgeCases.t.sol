@@ -258,34 +258,22 @@ contract PeriodPhaseEdgeCasesTest is VoucherAttackBase {
         assertEq(staking.getStakingPeriods().length, 3);
     }
 
-    /// @dev Hypothesis: a huge period value makes `stakingPeriod * 1 days` wrap, producing a deposit with a past end date.
-    function test_hugePeriod_stakeRevertsInsteadOfWrapping() public {
-        uint256 huge = type(uint256).max / 1 days + 1;
-        _addPeriod(huge, 1, TARGET);
-        uint256 bal = token.balanceOf(alice);
-        _expectStakeRevert(alice, 0, huge, 1_000 * ONE, 1, "");
-        assertEq(token.balanceOf(alice), bal);
-        assertEq(staking.checkDepositCountOfAddress(alice), 0);
-        // the period can still be removed
-        staking.removeStakingPeriod(huge);
-    }
-
-    /// @dev Hypothesis: the largest period that fits `stakingPeriod * 1 days` still overflows the end date silently.
-    function test_maxFittingPeriod_behaviour() public {
-        uint256 maxP = type(uint256).max / 1 days;
-        _addPeriod(maxP, 1, TARGET);
-        // end date = now + maxP days overflows uint256 for any _now() > 0 -> must revert, never wrap
-        _expectStakeRevert(alice, 0, maxP, 1_000 * ONE, 1, "");
-        assertEq(staking.checkDepositCountOfAddress(alice), 0);
-    }
-
-    /// @dev Hypothesis: a period whose end date fits uint256 but not the packed uint40 / uint32 storage is
-    ///      truncated. It must revert with SafeCast's typed error instead.
-    function test_periodBeyondPackedWidth_revertsNotTruncated() public {
-        uint256 p = uint256(type(uint32).max) + 1;
-        _addPeriod(p, 1, TARGET);
-        _expectStakeRevert(alice, 0, p, 1_000 * ONE, 1, "");
-        assertEq(staking.checkDepositCountOfAddress(alice), 0);
+    /// @dev Hypothesis: a huge period value makes `stakingPeriod * 1 days` wrap, producing a deposit with a past
+    ///      end date; the largest period that still fits the multiplication overflows the end date; one that fits
+    ///      uint256 but not the packed uint40 / uint32 storage is truncated.
+    ///      Since the v0.5.0 audit (#19) none of them can be configured: periods are bounded at 36_500 days, so
+    ///      the stake path never sees them. (Before, they were accepted and every stake on them reverted.)
+    function test_hugePeriods_rejectedAtConfiguration() public {
+        uint256[3] memory periods =
+            [type(uint256).max / 1 days + 1, type(uint256).max / 1 days, uint256(type(uint32).max) + 1];
+        for (uint256 i = 0; i < periods.length; i++) {
+            vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, periods[i], 36_500));
+            staking.addStakingPeriod(periods[i], _fill(2, 1), _fill(2, TARGET));
+            assertFalse(staking.checkIfStakingPeriodExists(periods[i]));
+        }
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, 36_501, 36_500));
+        staking.addStakingPeriod(36_501, _fill(2, 1), _fill(2, TARGET));
+        assertEq(staking.getStakingPeriods().length, 3);
     }
 
     /// @dev Hypothesis: a very long but sane period (100 years) works end to end.

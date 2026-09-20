@@ -15,6 +15,9 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     // =               Freeze               =
     // ======================================
     /// @notice Freeze an open deposit. Admins and the owner.
+    /// @dev Send freezes through a PRIVATE relay / private mempool. A freeze seen in the public mempool can be
+    ///      front-run by its target with withdrawDeposit or claimDeposit, and the freeze then reverts
+    ///      DepositNotOpen. The same applies to the batch form.
     function freezeDeposit(address wallet, uint256 depositNumber) external onlyAdmins {
         _freeze(wallet, depositNumber);
     }
@@ -29,12 +32,19 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
         }
     }
 
-    /// @notice Unfreeze a frozen deposit. Admins and the owner.
-    function unfreezeDeposit(address wallet, uint256 depositNumber) external onlyAdmins {
+    /// @notice Unfreeze a frozen deposit. Owner only.
+    /// @dev Freezing is onlyAdmins, unfreezing is not: an unfreeze hands the funds back to the wallet, and one
+    ///      landed by any single admin just before the owner's seize would make the seize revert
+    ///      DepositNotFrozen while the target withdraws. Releasing a hold is the owner's decision, like seize.
+    function unfreezeDeposit(address wallet, uint256 depositNumber) external onlyContractOwner {
         _unfreeze(wallet, depositNumber);
     }
 
-    function unfreezeDeposits(address[] calldata wallets, uint256[] calldata depositNumbers) external onlyAdmins {
+    /// @notice Batch form of unfreezeDeposit. Owner only.
+    function unfreezeDeposits(address[] calldata wallets, uint256[] calldata depositNumbers)
+        external
+        onlyContractOwner
+    {
         uint256 len = _checkBatchLengths(wallets, depositNumbers);
         for (uint256 i = 0; i < len;) {
             _unfreeze(wallets[i], depositNumbers[i]);
@@ -61,17 +71,20 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     ///      onlyAdmins, matching freeze rather than seize: a block is reversible and takes nobody's money, and
     ///      it is a security response where waiting on the owner key may be too slow. Seize moves funds, so it
     ///      stays owner-only.
-    ///      This is the last lever standing if the voucher SIGNING KEY leaks: the attacker mints their own
-    ///      vouchers, so the backend's issuance blocklist never sees them, and the limit controller cannot tell
-    ///      their stake from anyone else's. Blocking the wallet on-chain is what stops it.
+    ///      A block stops ONE KNOWN wallet, and holds even when a voucher for it was issued outside the
+    ///      backend's blocklist. It does NOT contain a leaked voucher SIGNING KEY: the key holder signs for a
+    ///      fresh wallet nobody has blocked yet. The levers for a key compromise are closeStaking (any admin),
+    ///      then bumpVoucherEpoch and setVoucherSigner (owner).
     function setWalletBlocked(address wallet, bool blocked) external onlyAdmins {
         _setWalletBlocked(wallet, blocked);
     }
 
     /// @notice Block or unblock many wallets in one transaction. Admins and the owner.
-    /// @dev All wallets get the same `blocked` value. Unbounded loop: the caller chooses the batch size.
+    /// @dev All wallets get the same `blocked` value. Unbounded loop: the caller chooses the batch size. An
+    ///      empty batch reverts EmptyBatch.
     function setWalletsBlocked(address[] calldata wallets, bool blocked) external onlyAdmins {
         uint256 len = wallets.length;
+        if (len == 0) revert EmptyBatch();
         for (uint256 i = 0; i < len;) {
             _setWalletBlocked(wallets[i], blocked);
             unchecked {
@@ -93,6 +106,10 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     /// @notice Seize a frozen deposit to the treasury. Owner only.
     /// @dev Only the principal goes to the treasury. A periodical deposit's reserved reward is released back to
     ///      the pool; an indefinite deposit's unpaid accrued reward stays in the pool.
+    ///      A seize is booked like a principal-only withdrawal, so it raises the wallet's and the total
+    ///      WITHDRAWAL counters although the wallet received nothing: indexers must tell a seize from a
+    ///      withdrawal by the SeizeDeposit event / DepositStatus.SEIZED, never by those counters.
+    ///      If the token refuses to pay the treasury (blacklist), the seize reverts until setTreasury changes it.
     function seizeDeposit(address wallet, uint256 depositNumber) external nonReentrant onlyContractOwner {
         address to = treasury;
         if (to == address(0)) revert TreasuryNotSet();
@@ -104,9 +121,9 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
         nonReentrant
         onlyContractOwner
     {
+        uint256 len = _checkBatchLengths(wallets, depositNumbers);
         address to = treasury;
         if (to == address(0)) revert TreasuryNotSet();
-        uint256 len = _checkBatchLengths(wallets, depositNumbers);
         uint256 total = 0;
         for (uint256 i = 0; i < len;) {
             total += _seize(wallets[i], depositNumbers[i], to);
@@ -120,6 +137,10 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     // ======================================
     // =              Internal              =
     // ======================================
+    /// @dev Shared by the freeze / unfreeze / seize batches. Mismatched lengths are reported first, so a caller
+    ///      that passed no wallets but some deposit numbers is told the real problem; a genuinely empty batch
+    ///      then reverts EmptyBatch rather than succeeding without a trace, since it is always an ops mistake
+    ///      (a filter that matched nothing).
     function _checkBatchLengths(address[] calldata wallets, uint256[] calldata depositNumbers)
         private
         pure
@@ -127,6 +148,7 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     {
         len = wallets.length;
         if (len != depositNumbers.length) revert LengthMismatch(len, depositNumbers.length);
+        if (len == 0) revert EmptyBatch();
     }
 
     function _freeze(address wallet, uint256 depositNumber) private {
@@ -156,6 +178,9 @@ abstract contract EnforcementFunctions is ReadFunctions, WriteFunctions {
     /// @dev Closes a frozen deposit like a principal-only withdrawal (STAKING cells, REWARD_EXPECTED, WITHDRAWAL
     ///      totals, cursor) and returns the principal. Frozen implies open, because
     ///      claim and withdraw are blocked while frozen and seizing replaces the flags with FLAG_SEIZED.
+    ///      ACCOUNTING: the principal is booked under the wallet's and the total WITHDRAWAL counters, the same
+    ///      ones a real withdrawal uses, although the treasury -- not the wallet -- received it. Indexers and
+    ///      reports must key on the SeizeDeposit event / FLAG_SEIZED (DepositStatus.SEIZED), not on WITHDRAWAL.
     function _seize(address wallet, uint256 depositNumber, address to) private returns (uint256) {
         _checkDepositExistenceFor(wallet, depositNumber);
         PackedDeposit storage d = stakerDepositList[wallet][depositNumber];

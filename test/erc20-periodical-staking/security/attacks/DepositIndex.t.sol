@@ -142,7 +142,6 @@ contract DepositIndexTest is VoucherAttackBase {
         assertEq(_idx(alice), 0, "cursor must not pass the frozen #0");
         _assertCursorSound(alice);
 
-        vm.prank(admin);
         staking.unfreezeDeposit(alice, d0);
         _claimAll(alice);
         assertEq(token.balanceOf(alice) - before, 2 * (1_000 * ONE + r));

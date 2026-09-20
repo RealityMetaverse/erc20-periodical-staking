@@ -13,6 +13,8 @@ abstract contract Errors {
     error ZeroAddressProvided();
     error ZeroAmountProvided();
     error LengthMismatch(uint256 expectedLength, uint256 actualLength);
+    /// @notice A freeze / unfreeze / seize / wallet-block batch was empty.
+    error EmptyBatch();
     /// @notice The token balance delta observed on transfer-in differs from the requested amount
     ///         (fee-on-transfer / rebasing tokens are unsupported).
     error UnexpectedTokenAmount(uint256 expectedAmount, uint256 receivedAmount);
@@ -59,6 +61,8 @@ abstract contract Errors {
     // =        Validation Errors           =
     // ======================================
     error InvalidAPY(uint256 providedValue, uint256 minValue);
+    /// @notice An APY (bps), extra-APY ceiling (bps) or staking period (days) is above its hard upper bound.
+    error ValueTooHigh(uint256 providedValue, uint256 maxValue);
     error InvalidMinimumDeposit(uint256 providedValue, uint256 minValue);
     error InvalidDataType();
     error ApyBelowExpected(uint256 stakingPhase, uint256 stakingPeriod, uint256 effectiveApyBps, uint256 expectedApyBps);
@@ -68,7 +72,11 @@ abstract contract Errors {
     // ======================================
     error VoucherSignerNotSet();
     error LimitControllerNotSet();
+    /// @notice The controller's stakingContract() is not this staking contract.
+    error LimitControllerMismatch(address controllerStakingContract);
     error TreasuryNotSet();
+    /// @notice The treasury cannot be the staking contract itself.
+    error InvalidTreasury();
     error InvalidVoucherSignature();
     error VoucherWalletMismatch(address voucherWallet, address caller);
     error VoucherExpired(uint256 validUntil, uint256 currentTime);
@@ -79,9 +87,13 @@ abstract contract Errors {
     error VoucherExtraLimitTotalTooHigh(uint256 extraLimitTotal, uint256 maxExtraLimitTotal);
     /// @notice The voucher's per-cell bonus allowance exceeds `maxExtraLimitPerCell`.
     error VoucherExtraLimitPerCellTooHigh(uint256 extraLimitPerCell, uint256 maxExtraLimitPerCell);
-    /// @notice The voucher is valid for longer than `maxVoucherValidity` allows, measured from now.
-    /// @dev Bounds the blast radius of a leaked signer key: a stolen key cannot mint vouchers good for years.
+    /// @notice The voucher's signed lifetime (validUntil - issuedAt) is longer than `maxVoucherValidity` allows.
+    /// @param maxValidUntil issuedAt + maxVoucherValidity
     error VoucherValidityTooLong(uint256 validUntil, uint256 maxValidUntil);
+    /// @notice The voucher's issuedAt is in the future.
+    error VoucherNotYetValid(uint256 issuedAt, uint256 currentTime);
+    /// @notice The voucher was signed for another epoch (the owner called bumpVoucherEpoch since).
+    error VoucherEpochMismatch(uint256 voucherEpoch, uint256 currentEpoch);
     /// @notice The wallet is barred from opening new stakes. Its existing deposits are unaffected and it can
     ///         still withdraw and claim -- a block never traps funds.
     error WalletBlocked(address wallet);
@@ -91,6 +103,24 @@ abstract contract Errors {
     // ======================================
     error NotOpen(Types.DataType action);
     error NotPendingOwner(address caller, address pendingOwner);
+    /// @notice renounceOwnership is disabled on the Ownable2Step-based satellite contracts (LimitController,
+    ///         RequirementCheckerV2): an ownerless controller/checker could never be reconfigured again.
+    error RenounceOwnershipDisabled();
+
+    // ======================================
+    // =   Requirement Checker v2 Errors    =
+    // ======================================
+    /// @notice The same address appears more than once in a pool / periodical staking contract list
+    ///         (it would be counted once per occurrence by the worth reads).
+    error DuplicateAddress(address entry);
+    /// @notice The same ERC1155 id appears more than once in an ids array (it would be double counted).
+    error DuplicateId(uint256 id);
+    /// @notice An admin offset is outside [-MAX_ABS_OFFSET, MAX_ABS_OFFSET].
+    error OffsetOutOfBounds(int256 offset, int256 maxAbsOffset);
+    /// @notice A non-zero address with no code was supplied where a contract is required. Worth reads call it on
+    ///         every wallet, and because meetsRequirementBatch isolates each entry, the failure would surface as a
+    ///         SUCCESSFUL all-false batch -- indistinguishable from "nobody qualifies".
+    error NotAContract(address supplied);
 
     // ======================================
     // =        ERC1155 Errors              =

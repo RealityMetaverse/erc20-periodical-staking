@@ -7,6 +7,7 @@ import {ReentrantERC20} from "../../../shared/malicious/MaliciousTokens.sol";
 import {MaliciousLimitController, ReentrancyAttacker} from "../../../shared/malicious/MaliciousControllers.sol";
 
 /// @notice ERC-1271 voucher signer that can be switched into hostile modes.
+/// @dev Since audit finding #39 the staking contract never calls a contract signer (ECDSA only). Kept to prove that.
 contract MaliciousVoucherSigner is IERC1271 {
     enum Mode {
         VALID, // approves every hash
@@ -333,6 +334,7 @@ contract ReentrancyTest is VoucherAttackBase {
 
     function _useMLC(MaliciousLimitController.Mode m) internal {
         mlc.setMode(m);
+        mlc.setStakingContract(address(staking)); // setLimitController checks stakingContract() (finding #16)
         staking.setLimitController(address(mlc));
     }
 
@@ -453,71 +455,36 @@ contract ReentrancyTest is VoucherAttackBase {
         staking.setVoucherSigner(address(msig));
     }
 
-    /// @dev A smart-contract signer is supported: its approval authorizes the stake without any ECDSA signature.
-    function test_contractSigner_valid_authorizesStake() public {
-        _useSigner(MaliciousVoucherSigner.Mode.VALID);
-        Types.StakeVoucher memory v = _makeVoucher(alice, 0, P30, 0, 0);
-        uint256 apy = _apy(0, P30);
-        vm.prank(alice);
-        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
-        assertEq(staking.checkDepositCountOfAddress(alice), 1);
-        // but the wallet binding and the nonce still apply
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherNonceUsed.selector, alice, v.nonce));
-        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherWalletMismatch.selector, alice, bob));
-        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
-    }
-
-    /// @dev Hypothesis: a contract signer that refuses (wrong magic or revert) lets the stake through, or its
-    ///      revert bubbles up as something other than a typed error. An ECDSA signature by the old EOA key is not
-    ///      accepted once the signer is a contract.
-    function test_contractSigner_refusesOrReverts_invalidSignature() public {
-        uint256 apy = _apy(0, P30);
-        MaliciousVoucherSigner.Mode[2] memory modes = [MaliciousVoucherSigner.Mode.INVALID, MaliciousVoucherSigner.Mode.REVERT];
-        for (uint256 i = 0; i < modes.length; i++) {
-            _useSigner(modes[i]);
-            (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 0);
-            vm.prank(alice);
-            vm.expectRevert(Errors.InvalidVoucherSignature.selector);
-            staking.stakeWithVoucher(v, sig, 1_000 * ONE, apy);
-            assertFalse(staking.isVoucherNonceUsed(alice, v.nonce));
-        }
-        assertEq(staking.checkDepositCountOfAddress(alice), 0);
-    }
-
-    /// @dev Hypothesis: a contract signer re-enters the staking contract while being asked to validate. The check
-    ///      is a STATICCALL under the guard: the signer only approves if its re-entry hit the reentrancy guard,
-    ///      so a successful outer stake proves the inner withdraw was blocked, and nothing else moved.
-    function test_contractSigner_reenter_blockedByGuard() public {
+    /// @dev Audit finding #39: the voucher signer is always an EOA, the signature is checked with plain ECDSA
+    ///      recovery, and a contract signer is never CALLED. So this whole external-call surface is gone: whatever
+    ///      the contract at `voucherSigner` would do (approve, refuse, revert, re-enter, burn gas), the stake
+    ///      reverts InvalidVoucherSignature cheaply, with or without an ECDSA signature, and nothing moves.
+    function test_fixed39_contractSigner_neverConsulted_everyModeRejected() public {
         uint256 d = _stake(alice, 0, P0, 1_000 * ONE);
         msig.setReenter(address(staking), abi.encodeCall(staking.withdrawDeposit, (d)));
-        _useSigner(MaliciousVoucherSigner.Mode.REENTER);
-
-        Types.StakeVoucher memory v = _makeVoucher(alice, 0, P0, 0, 0);
-        uint256 apy = _apy(0, P0);
-        vm.prank(alice);
-        staking.stakeWithVoucher(v, "", 1_000 * ONE, apy);
-
-        assertEq(staking.checkDepositCountOfAddress(alice), 2);
-        assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.INDEFINITE), "not withdrawn");
-        assertEq(_total(Types.DataType.STAKING), 2_000 * ONE);
-        _assertAccounting();
-    }
-
-    /// @dev Hypothesis: a gas-burning contract signer leaves state half-written.
-    function test_contractSigner_gasBurn_revertsCleanly() public {
-        _useSigner(MaliciousVoucherSigner.Mode.GAS_BURN);
-        Types.StakeVoucher memory v = _makeVoucher(alice, 0, P30, 0, 0);
-        bytes memory data = abi.encodeCall(staking.stakeWithVoucher, (v, "", 1_000 * ONE, _apy(0, P30)));
+        uint256 apy = _apy(0, P30);
         uint256 bal = token.balanceOf(alice);
-        vm.prank(alice);
-        (bool ok,) = address(staking).call{gas: 3_000_000}(data);
-        assertFalse(ok);
+
+        for (uint256 m = 0; m <= uint256(MaliciousVoucherSigner.Mode.GAS_BURN); m++) {
+            _useSigner(MaliciousVoucherSigner.Mode(m));
+            (Types.StakeVoucher memory v, bytes memory sig) = _prepareVoucherStake(staking, alice, 0, P30, 0, 0);
+
+            // No signature at all (what an ERC-1271 "approve everything" signer used to accept).
+            vm.prank(alice);
+            vm.expectRevert(Errors.InvalidVoucherSignature.selector);
+            staking.stakeWithVoucher{gas: 300_000}(v, "", 1_000 * ONE, apy);
+
+            // A real ECDSA signature by the usual EOA key: the signer is now the contract, so it does not match.
+            vm.prank(alice);
+            vm.expectRevert(Errors.InvalidVoucherSignature.selector);
+            staking.stakeWithVoucher{gas: 300_000}(v, sig, 1_000 * ONE, apy);
+
+            assertFalse(staking.isVoucherNonceUsed(alice, v.nonce));
+        }
+
+        assertEq(staking.checkDepositCountOfAddress(alice), 1);
+        assertEq(uint256(_status(alice, d)), uint256(ProgramManager.DepositStatus.INDEFINITE), "not withdrawn");
         assertEq(token.balanceOf(alice), bal);
-        assertEq(staking.checkDepositCountOfAddress(alice), 0);
-        assertFalse(staking.isVoucherNonceUsed(alice, v.nonce));
         _assertAccounting();
     }
 

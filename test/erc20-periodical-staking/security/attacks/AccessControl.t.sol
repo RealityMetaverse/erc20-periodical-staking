@@ -10,7 +10,7 @@ import "./VoucherAttackBase.sol";
 ///         binding, signer, domain, nonce, expiry, owner caps) are attacked here as well.
 contract AccessControlTest is VoucherAttackBase {
     function _ownerOnlyCalls() internal view returns (bytes[] memory calls) {
-        calls = new bytes[](20);
+        calls = new bytes[](23);
         uint256[] memory three = _fill(3, 1);
         uint256[] memory two = _fill(2, 1);
         calls[0] = abi.encodeCall(staking.transferOwnership, (rando));
@@ -33,15 +33,19 @@ contract AccessControlTest is VoucherAttackBase {
         calls[17] = abi.encodeCall(staking.setTreasury, (rando));
         calls[18] = abi.encodeCall(staking.collectReward, (1));
         calls[19] = abi.encodeCall(staking.rescueTokens, (address(token), 1));
+        // Owner-only since the v0.5.0 audit: unfreezing (#10) and the voucher epoch (#8).
+        calls[20] = abi.encodeCall(staking.unfreezeDeposit, (alice, 2));
+        calls[21] = abi.encodeCall(staking.unfreezeDeposits, (_one(alice), _oneU(3)));
+        calls[22] = abi.encodeCall(staking.bumpVoucherEpoch, ());
     }
 
     function _adminCalls() internal view returns (bytes[] memory calls) {
-        calls = new bytes[](5);
+        // Unfreezing is NOT here: it became owner-only in the v0.5.0 audit (#10). closeStaking is (#9).
+        calls = new bytes[](4);
         calls[0] = abi.encodeCall(staking.freezeDeposit, (alice, 0));
-        calls[1] = abi.encodeCall(staking.unfreezeDeposit, (alice, 0));
-        calls[2] = abi.encodeCall(staking.freezeDeposits, (_one(alice), _oneU(0)));
-        calls[3] = abi.encodeCall(staking.unfreezeDeposits, (_one(alice), _oneU(0)));
-        calls[4] = abi.encodeCall(staking.provideReward, (1));
+        calls[1] = abi.encodeCall(staking.freezeDeposits, (_one(alice), _oneU(1)));
+        calls[2] = abi.encodeCall(staking.closeStaking, ());
+        calls[3] = abi.encodeCall(staking.provideReward, (1));
     }
 
     function _assertAllRevert(bytes[] memory calls, address caller, AccessControl.AccessTier tier) internal {
@@ -85,11 +89,11 @@ contract AccessControlTest is VoucherAttackBase {
 
     /// @dev Hypothesis: the owner is refused by some function it should be allowed to call.
     function test_matrix_owner_canCallEverything() public {
-        // seize needs two frozen deposits
-        _stake(alice, 0, P0, 1_000 * ONE);
-        _stake(alice, 0, P0, 1_000 * ONE);
-        _freeze(alice, 0);
-        _freeze(alice, 1);
+        // seize needs two frozen deposits, and so does unfreeze
+        for (uint256 d = 0; d < 4; d++) {
+            _stake(alice, 0, P0, 1_000 * ONE);
+            _freeze(alice, d);
+        }
         bytes[] memory calls = _ownerOnlyCalls();
         token.transfer(address(staking), 1); // so rescue(1) has excess
         for (uint256 i = 0; i < calls.length; i++) {
@@ -99,21 +103,30 @@ contract AccessControlTest is VoucherAttackBase {
         }
         assertEq(uint256(_status(alice, 0)), uint256(ProgramManager.DepositStatus.SEIZED));
         assertEq(uint256(_status(alice, 1)), uint256(ProgramManager.DepositStatus.SEIZED));
+        assertFalse(staking.isDepositFrozen(alice, 2));
+        assertFalse(staking.isDepositFrozen(alice, 3));
+        assertEq(uint256(staking.voucherEpoch()), 1);
     }
 
     /// @dev The owner counts as an admin: every admin-tier function works for the owner and for admins.
     function test_matrix_ownerAndAdmin_canCallAdminFunctions() public {
+        _stake(alice, 0, P0, 1_000 * ONE);
         _stake(alice, 0, P0, 1_000 * ONE);
         bytes[] memory calls = _adminCalls();
         for (uint256 i = 0; i < calls.length; i++) {
             (bool ok, bytes memory ret) = address(staking).call(calls[i]);
             assertTrue(ok, string.concat("owner refused on admin call #", vm.toString(i), " ", vm.toString(ret)));
         }
+        // Only the owner can undo a freeze; do it so the admin's freezes below have something to freeze.
+        staking.unfreezeDeposit(alice, 0);
+        staking.unfreezeDeposit(alice, 1);
+        assertFalse(staking.checkActionAvailability(Types.DataType.STAKING), "closeStaking closed it");
         for (uint256 i = 0; i < calls.length; i++) {
             (bool ok, bytes memory ret) = _call(admin, address(staking), calls[i]);
             assertTrue(ok, string.concat("admin refused on admin call #", vm.toString(i), " ", vm.toString(ret)));
         }
-        assertFalse(staking.isDepositFrozen(alice, 0), "freeze/unfreeze pairs leave the deposit unfrozen");
+        assertTrue(staking.isDepositFrozen(alice, 0), "frozen by the admin");
+        assertTrue(staking.isDepositFrozen(alice, 1), "frozen by the admin (batch)");
         assertEq(_user(Types.DataType.REWARD_PROVIDED, admin), 1);
         _assertAccounting();
     }
@@ -366,7 +379,8 @@ contract AccessControlTest is VoucherAttackBase {
 
     /// @dev validUntil is inclusive: usable at exactly validUntil, rejected one second later.
     function test_voucher_expiry_inclusiveBoundary() public {
-        uint256 t = _now() + 1 hours;
+        // The signed lifetime (validUntil - issuedAt) is capped by maxVoucherValidity, so use the helper's own.
+        uint256 t = _now() + VOUCHER_LIFETIME;
         Types.StakeVoucher memory v = _makeVoucher(alice, 0, P30, 0, 0);
         v.validUntil = t;
         bytes memory sig = _signVoucher(address(staking), v, VOUCHER_SIGNER_KEY);

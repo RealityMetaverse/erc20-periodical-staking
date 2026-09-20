@@ -83,9 +83,12 @@ contract FreezeSeizeTest is V050Base {
         assertTrue(staking.isDepositFrozen(alice, n0));
         assertTrue(staking.isDepositFrozen(alice, n1));
 
+        // Unfreezing is owner-only (audit finding #10): an admin is refused, the owner releases both.
         vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(UNAUTHORIZED, TIER_OWNER));
         staking.unfreezeDeposit(alice, n0);
-        staking.unfreezeDeposit(alice, n1); // owner
+        staking.unfreezeDeposit(alice, n0);
+        staking.unfreezeDeposit(alice, n1);
         assertFalse(staking.isDepositFrozen(alice, n0));
         assertFalse(staking.isDepositFrozen(alice, n1));
     }
@@ -108,10 +111,18 @@ contract FreezeSeizeTest is V050Base {
         staking.freezeDeposit(alice, n);
 
         freeze(alice, n);
+        bytes memory ownerErr = abi.encodeWithSelector(UNAUTHORIZED, TIER_OWNER);
         vm.startPrank(alice);
-        vm.expectRevert(err);
+        vm.expectRevert(ownerErr);
         staking.unfreezeDeposit(alice, n);
-        vm.expectRevert(err);
+        vm.expectRevert(ownerErr);
+        staking.unfreezeDeposits(ws, ns);
+        vm.stopPrank();
+        // ...and neither can an admin: unfreezing is owner-only (audit finding #10).
+        vm.startPrank(admin);
+        vm.expectRevert(ownerErr);
+        staking.unfreezeDeposit(alice, n);
+        vm.expectRevert(ownerErr);
         staking.unfreezeDeposits(ws, ns);
         vm.stopPrank();
         assertTrue(staking.isDepositFrozen(alice, n));
@@ -148,7 +159,6 @@ contract FreezeSeizeTest is V050Base {
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositDoesNotExist.selector, 5));
         staking.isDepositFrozen(alice, 5);
 
-        vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, n));
         staking.unfreezeDeposit(alice, n);
 
@@ -540,7 +550,6 @@ contract FreezeSeizeTest is V050Base {
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotOpen.selector, alice, n));
         staking.freezeDeposit(alice, n);
 
-        vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, n));
         staking.unfreezeDeposit(alice, n);
 
@@ -700,9 +709,9 @@ contract FreezeSeizeTest is V050Base {
         vm.startPrank(admin);
         vm.expectRevert(err);
         staking.freezeDeposits(ws, ns);
-        vm.expectRevert(err);
-        staking.unfreezeDeposits(ws, ns);
         vm.stopPrank();
+        vm.expectRevert(err);
+        staking.unfreezeDeposits(ws, ns); // owner-only
         vm.expectRevert(err);
         staking.seizeDeposits(ws, ns);
     }
@@ -737,7 +746,6 @@ contract FreezeSeizeTest is V050Base {
         assertFalse(staking.isDepositFrozen(alice, a), "first entry rolled back");
 
         // Atomic unfreeze: alice not frozen -> bob stays frozen.
-        vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, a));
         staking.unfreezeDeposits(ws, ns);
         assertTrue(staking.isDepositFrozen(bob, b), "second entry untouched");

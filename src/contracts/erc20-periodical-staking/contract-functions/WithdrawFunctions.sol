@@ -15,7 +15,9 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
     ///        cannot cover the whole accrued reward the payout is reduced to what is available, but only if
     ///        that reduced reward is at least `minReward`; otherwise the call reverts
     ///        `NotEnoughFundsInRewardPool(accrued, available)` and the deposit stays open and keeps accruing.
-    ///        The unpaid remainder is never forfeited silently.
+    ///        When the reduced payout is accepted the unpaid remainder is forfeited by the caller (the deposit
+    ///        closes); `minReward` is what makes that an explicit choice rather than a silent one. `minReward`
+    ///        is only consulted in this shortfall branch.
     function _withdrawDeposit(uint256 depositNumber, uint256 minReward) private {
         PackedDeposit storage targetDeposit = stakerDepositList[msg.sender][depositNumber];
         if ((targetDeposit.flags & FLAG_FROZEN) != 0) revert DepositFrozen(msg.sender, depositNumber);
@@ -92,10 +94,15 @@ abstract contract WithdrawFunctions is ReadFunctions, WriteFunctions {
     ///      `getCollectableReward()` is closed with `min(accrued, collectable)` reward instead of reverting,
     ///      provided that reduced reward is at least `minReward`; otherwise the call reverts
     ///      `NotEnoughFundsInRewardPool(accrued, collectable)` and nothing changes. `minReward = 0` always
-    ///      succeeds (principal is never locked behind an unpayable reward). The unpaid remainder stays in the
-    ///      pool. For TIME_LEFT deposits `minReward` is ignored (they never pay a reward).
+    ///      succeeds (principal is never locked behind an unpayable reward). The unpaid remainder is FORFEITED
+    ///      by the caller: the deposit closes, so it can never be claimed later. `minReward` is NOT a general
+    ///      minimum payout: when the free pool covers the accrued reward the deposit closes with exactly that
+    ///      reward, even if it is below `minReward`. For TIME_LEFT deposits `minReward` is ignored (they never
+    ///      pay a reward).
     /// @param depositNumber Index of the deposit in the caller's deposit list
-    /// @param minReward Lowest reward the caller is willing to close the deposit for
+    /// @param minReward Floor for a REDUCED payout only: consulted when the free pool cannot cover the accrued
+    ///        reward, in which case the call reverts unless the reduced reward is at least this much. Not
+    ///        consulted when the pool covers the accrued reward in full.
     function withdrawDepositPartial(uint256 depositNumber, uint256 minReward)
         external
         nonReentrant

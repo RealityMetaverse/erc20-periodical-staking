@@ -116,16 +116,23 @@ contract LimitControllerLegacyTest is V050Base {
         controller.setLegacyStakingContract(address(staking));
     }
 
-    function test_setStakingContract_rejectsLegacyAddress() public {
-        vm.expectRevert(abi.encodeWithSelector(LimitController.SameStakingAndLegacyContract.selector, address(legacy)));
-        controller.setStakingContract(address(legacy));
+    /// @dev Finding #16: stakingContract is set once, by the constructor, and there is no setter. The
+    ///      staking contract's install-time stakingContract() check is therefore a permanent invariant.
+    function test_stakingContract_isImmutableAndSetOnlyByConstructor() public {
+        assertEq(address(controller.stakingContract()), address(staking));
 
-        // Once legacy is cleared, the same address is a valid staking contract again.
-        controller.setLegacyStakingContract(address(0));
-        vm.expectEmit(true, true, true, true, address(controller));
+        // The setter is gone from the ABI entirely: a raw call with the old selector hits no function.
+        (bool ok,) = address(controller).call(
+            abi.encodeWithSignature("setStakingContract(address)", address(legacy))
+        );
+        assertFalse(ok, "setStakingContract must no longer exist");
+        assertEq(address(controller.stakingContract()), address(staking), "still pinned to its staking contract");
+
+        // Constructing a controller for another target is the only way to change the pairing.
+        vm.expectEmit(true, true, true, true);
         emit StakingContractSet(address(legacy));
-        controller.setStakingContract(address(legacy));
-        assertEq(address(controller.stakingContract()), address(legacy));
+        LimitController other = new LimitController(address(legacy));
+        assertEq(address(other.stakingContract()), address(legacy));
     }
 
     function testFuzz_setLegacy_onlyOwner(address caller) public {

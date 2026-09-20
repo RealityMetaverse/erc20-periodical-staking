@@ -78,6 +78,14 @@ contract StakingLens is Errors {
     ///      target). Voucher extra APY is not included. Stakes are never blocked by pool state; this is an ops
     ///      view so the pool can be funded before deposits mature (a matured periodical claim reverts
     ///      `NotEnoughFundsInRewardPool` while the pool is short).
+    ///      SATURATING, never reverting: an "unlimited" target (type(uint256).max) is what an operator types,
+    ///      and this view always answers instead of taking itself down. It does NOT follow that such a cell
+    ///      reads as type(uint256).max. calculateReward only overflows when apyBps * days > 3_650_000, so at
+    ///      production APYs an unlimited target yields a finite but absurd number (~6.7e75 for 500 bps over
+    ///      30 days) and the sum saturates only if the running total overflows. type(uint256).max is
+    ///      returned only when some cell's own reward computation overflows -- i.e. an unlimited or huge
+    ///      target combined with a high APY and a long period. Either way, read "wildly above any fundable
+    ///      amount" as "this cell cannot be funded"; do not test for equality with type(uint256).max.
     function getRewardRequiredForTargets() public view returns (uint256 required) {
         (, uint256[] memory periods, uint256[][] memory targets, uint256[][] memory apysBps, uint256[][] memory staked) =
             STAKING.getProgramData();
@@ -89,7 +97,14 @@ contract StakingLens is Errors {
                 uint256 target = targets[phase][periodIndex];
                 uint256 filled = staked[phase][periodIndex];
                 if (target > filled) {
-                    required += STAKING.calculateReward(target - filled, apysBps[phase][periodIndex], period);
+                    // calculateReward reverts when the result does not fit a uint256 (mulDiv overflow).
+                    try STAKING.calculateReward(target - filled, apysBps[phase][periodIndex], period) returns (
+                        uint256 cellReward
+                    ) {
+                        required = _saturatingAdd(required, cellReward);
+                    } catch {
+                        return type(uint256).max;
+                    }
                 }
             }
         }
@@ -99,6 +114,8 @@ contract StakingLens is Errors {
     ///         open target, once filled, can be paid at maturity.
     /// @dev `deficit = max(0, totalDataList[REWARD_EXPECTED] - rewardPool)` is what already-open deposits are
     ///      missing today; `required` is what the remaining target capacity would add.
+    ///      Saturating like getRewardRequiredForTargets: type(uint256).max targets read as a huge shortfall
+    ///      rather than a revert.
     /// @return shortfall `max(0, getRewardRequiredForTargets() + deficit - getCollectableReward())`
     function getRewardPoolShortfall() external view returns (uint256 shortfall) {
         uint256 required = getRewardRequiredForTargets();
@@ -106,7 +123,7 @@ contract StakingLens is Errors {
         uint256 pool = STAKING.rewardPool();
         uint256 deficit = reserved > pool ? reserved - pool : 0;
         uint256 collectable = pool > reserved ? pool - reserved : 0;
-        uint256 needed = required + deficit;
+        uint256 needed = _saturatingAdd(required, deficit);
         return needed > collectable ? needed - collectable : 0;
     }
 
@@ -151,6 +168,13 @@ contract StakingLens is Errors {
     // ======================================
     // =              Internal              =
     // ======================================
+    function _saturatingAdd(uint256 a, uint256 b) private pure returns (uint256) {
+        unchecked {
+            uint256 c = a + b;
+            return c < a ? type(uint256).max : c;
+        }
+    }
+
     function _phasePeriodUserData(address userAddress, uint256 phaseCount, uint256[] memory periods)
         private
         view

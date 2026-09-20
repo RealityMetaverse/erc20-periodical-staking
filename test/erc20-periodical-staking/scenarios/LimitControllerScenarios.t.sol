@@ -2,6 +2,7 @@
 pragma solidity 0.8.20;
 
 import "../functions/LimitControllerFunctions.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import "../../../src/common/Errors.sol";
 import "../../../src/common/Types.sol";
 import {MockLegacyStaking} from "../../shared/mocks/MockLegacyStaking.sol";
@@ -25,33 +26,136 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
     }
 
     // ======================================
-    // =   setStakingContract Tests         =
+    // =   Ownership (Ownable2Step) Tests   =
+    // ======================================
+    // The controller was plain Ownable until the v0.5.0 audit: transferOwnership handed control over in one
+    // transaction, so a typo in the new owner's address permanently bricked every limit on the contract, and
+    // renounceOwnership could leave it ownerless with the same effect. It is Ownable2Step now, and renouncing
+    // is disabled outright.
+
+    function test_LimitController_TransferOwnership_TwoStep() external {
+        _deployLimitController(address(stakingContract));
+        address currentOwner = limitController.owner();
+        assertEq(currentOwner, address(this), "deployer owns");
+
+        // Step 1: nominate. Nothing has changed hands yet.
+        limitController.transferOwnership(userOne);
+        assertEq(limitController.owner(), currentOwner, "owner must NOT change on transferOwnership");
+        assertEq(limitController.pendingOwner(), userOne, "pendingOwner is nominated");
+
+        // The old owner still governs while the transfer is pending.
+        limitController.setDefaultLimit(0, 0, 1e18);
+        assertEq(limitController.defaultPhasePeriodLimit(0, 0), 1e18);
+
+        // ...and the nominee does not, until acceptance.
+        vm.prank(userOne);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, userOne));
+        limitController.setDefaultLimit(0, 0, 2e18);
+
+        // Step 2: accept.
+        vm.prank(userOne);
+        limitController.acceptOwnership();
+        assertEq(limitController.owner(), userOne, "owner changed on acceptOwnership");
+        assertEq(limitController.pendingOwner(), address(0), "pendingOwner cleared");
+
+        // The roles are now swapped.
+        vm.prank(userOne);
+        limitController.setDefaultLimit(0, 0, 3e18);
+        assertEq(limitController.defaultPhasePeriodLimit(0, 0), 3e18);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        limitController.setDefaultLimit(0, 0, 4e18);
+    }
+
+    function test_LimitController_AcceptOwnership_NotPendingOwnerReverts() external {
+        _deployLimitController(address(stakingContract));
+        limitController.transferOwnership(userOne);
+
+        // A stranger cannot accept.
+        vm.prank(userTwo);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, userTwo));
+        limitController.acceptOwnership();
+
+        // Neither can the CURRENT owner: it is not the pending owner.
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        limitController.acceptOwnership();
+
+        // Nothing moved.
+        assertEq(limitController.owner(), address(this));
+        assertEq(limitController.pendingOwner(), userOne);
+    }
+
+    function testFuzz_LimitController_AcceptOwnership_OnlyPendingOwner(address caller) external {
+        vm.assume(caller != userOne);
+        _deployLimitController(address(stakingContract));
+        limitController.transferOwnership(userOne);
+
+        vm.prank(caller);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));
+        limitController.acceptOwnership();
+        assertEq(limitController.owner(), address(this));
+        assertEq(limitController.pendingOwner(), userOne);
+    }
+
+    function test_LimitController_RenounceOwnership_Reverts() external {
+        _deployLimitController(address(stakingContract));
+
+        // Disabled for the owner...
+        vm.expectRevert(Errors.RenounceOwnershipDisabled.selector);
+        limitController.renounceOwnership();
+
+        // ...and for everyone else (it reverts before any access-control check, which is fine: the point is
+        // that no caller can ever leave this contract without an owner).
+        vm.prank(userOne);
+        vm.expectRevert(Errors.RenounceOwnershipDisabled.selector);
+        limitController.renounceOwnership();
+
+        assertEq(limitController.owner(), address(this), "still owned");
+    }
+
+    /// @dev A pending transfer can be re-pointed or cancelled by the still-current owner. This is the recovery
+    ///      path for the typo the two-step design exists to survive.
+    function test_LimitController_PendingTransfer_CanBeRepointedAndCancelled() external {
+        _deployLimitController(address(stakingContract));
+        limitController.transferOwnership(userOne);
+
+        // Re-point to somebody else: the first nominee can no longer accept.
+        limitController.transferOwnership(userTwo);
+        assertEq(limitController.pendingOwner(), userTwo);
+        vm.prank(userOne);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, userOne));
+        limitController.acceptOwnership();
+
+        // Cancel entirely.
+        limitController.transferOwnership(address(0));
+        assertEq(limitController.pendingOwner(), address(0));
+        vm.prank(userTwo);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, userTwo));
+        limitController.acceptOwnership();
+
+        assertEq(limitController.owner(), address(this));
+    }
+
+    // ======================================
+    // =   stakingContract (set-once) Tests =
     // ======================================
 
-    function test_LimitController_SetStakingContract_ValidAddress() external {
+    /// @dev Finding #16: the constructor is the only writer, and nobody -- owner included -- can repoint it.
+    function test_LimitController_StakingContract_SetOnceByConstructor() external {
         _deployLimitController(address(stakingContract));
+        assertEq(address(limitController.stakingContract()), address(stakingContract));
 
-        address newStakingContract = address(0x1234);
-        vm.prank(limitController.owner());
-        _setStakingContract(newStakingContract, false);
-
-        assertEq(address(limitController.stakingContract()), newStakingContract);
-    }
-
-    function test_LimitController_SetStakingContract_ZeroAddress() external {
-        _deployLimitController(address(stakingContract));
+        bytes memory callData = abi.encodeWithSignature("setStakingContract(address)", address(0x1234));
 
         vm.prank(limitController.owner());
-        vm.expectRevert(ZeroAddressProvided.selector);
-        limitController.setStakingContract(address(0));
-    }
-
-    function test_LimitController_SetStakingContract_NotOwner() external {
-        _deployLimitController(address(stakingContract));
+        (bool okOwner,) = address(limitController).call(callData);
+        assertFalse(okOwner, "the owner must not be able to repoint it either");
 
         vm.prank(userOne);
-        vm.expectRevert();
-        limitController.setStakingContract(address(0x1234));
+        (bool okOther,) = address(limitController).call(callData);
+        assertFalse(okOther);
+
+        assertEq(address(limitController.stakingContract()), address(stakingContract), "unchanged");
     }
 
     // ======================================
@@ -604,9 +708,6 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
 
         limitController.setLegacyStakingContract(address(legacy));
         assertEq(address(limitController.legacyStakingContract()), address(legacy));
-
-        vm.expectRevert(abi.encodeWithSelector(LimitController.SameStakingAndLegacyContract.selector, address(legacy)));
-        limitController.setStakingContract(address(legacy));
 
         limitController.setLegacyStakingContract(address(0));
         assertEq(address(limitController.legacyStakingContract()), address(0));

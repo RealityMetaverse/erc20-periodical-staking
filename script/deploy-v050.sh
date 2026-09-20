@@ -14,7 +14,12 @@ die() { echo "deploy-v050: error: $*" >&2; exit 1; }
 warn() { echo "deploy-v050: WARNING: $*" >&2; }
 
 usage() {
-  echo "usage: $0 <polygon|amoy> [--broadcast]" >&2
+  echo "usage: $0 <polygon|amoy> [--broadcast | --verify-only]" >&2
+  echo "  --broadcast    send the transactions (default: simulate only)" >&2
+  echo "  --verify-only  send nothing; re-run the self-check against VERIFY_STAKING / VERIFY_CONTROLLER" >&2
+  echo "                 as they are ON CHAIN (needs VERIFY_STAKING, VERIFY_CONTROLLER, DEPLOYER_ADDRESS" >&2
+  echo "                 in the env file). This is the mandatory step after a broadcast: the self-check" >&2
+  echo "                 inside a broadcast run reads the simulation's state, not what was mined." >&2
   exit 2
 }
 
@@ -24,13 +29,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NETWORK="$1"
 shift
 BROADCAST=false
+VERIFY_ONLY_MODE=false
 for arg in "$@"; do
   case "$arg" in
     --broadcast) BROADCAST=true ;;
+    --verify-only) VERIFY_ONLY_MODE=true ;;
     -h | --help) usage ;;
-    *) die "unknown argument '$arg' (only --broadcast is accepted; put extra forge flags in FORGE_ARGS)" ;;
+    *) die "unknown argument '$arg' (only --broadcast and --verify-only are accepted; put extra forge flags in FORGE_ARGS)" ;;
   esac
 done
+if $BROADCAST && $VERIFY_ONLY_MODE; then
+  die "--verify-only and --broadcast are mutually exclusive: verify-only only reads the chain, it never sends"
+fi
 
 case "$NETWORK" in
   polygon) EXPECTED_CHAIN_ID=137 ;;
@@ -46,7 +56,8 @@ ENV_FILE="$ROOT/deploy/v050/$NETWORK.env"
 # (the script treats an empty value as unset).
 SCRIPT_VARS=(SOURCE_STAKING REQUIREMENT_CHECKER_V2 VOUCHER_SIGNER TREASURY MAX_EXTRA_APY_BPS MAX_EXTRA_LIMIT_TOTAL
   MAX_EXTRA_LIMIT_PER_CELL MAX_VOUCHER_VALIDITY
-  NEW_OWNER ADMINS OPEN_STAKING REWARD_TOP_UP WALLET_LIMITS_FILE RESUME_STAKING RESUME_CONTROLLER PRIVATE_KEY)
+  NEW_OWNER ADMINS OPEN_STAKING REWARD_TOP_UP WALLET_LIMITS_FILE RESUME_STAKING RESUME_CONTROLLER PRIVATE_KEY
+  ALLOW_SHARED_ROLES VERIFY_ONLY VERIFY_STAKING VERIFY_CONTROLLER)
 # Variables forge itself reads for this run (the rpc alias in foundry.toml, --verify).
 FORGE_VARS=(RPC_URL ETHERSCAN_API_KEY)
 # Wrapper-only settings.
@@ -182,6 +193,125 @@ if [ -n "${REWARD_TOP_UP:-}" ]; then need_uint REWARD_TOP_UP; fi
 if [ -n "${OPEN_STAKING:-}" ] && [ "$OPEN_STAKING" != true ] && [ "$OPEN_STAKING" != false ]; then
   die "OPEN_STAKING must be true or false"
 fi
+if [ -n "${ALLOW_SHARED_ROLES:-}" ] && [ "$ALLOW_SHARED_ROLES" != true ] && [ "$ALLOW_SHARED_ROLES" != false ]; then
+  die "ALLOW_SHARED_ROLES must be true or false"
+fi
+
+# ---------------------------------------------------------------------------
+# FORGE_ARGS: word-split, never glob-expanded, and never a way around this wrapper
+# ---------------------------------------------------------------------------
+# The split is deliberate (FORGE_ARGS="--out /tmp/out --cache-path /tmp/cache" must become two flags and two
+# values), but GLOB expansion is not: `set -f` stops a value such as "--out /tmp/*/out" from becoming whatever
+# happens to match on disk, and an unmatched pattern from silently travelling through verbatim.
+set -f
+# shellcheck disable=SC2206
+EXTRA_ARGS=(${FORGE_ARGS:-})
+set +f
+
+# FORGE_ARGS must not be able to silently send transactions or override the wrapper's signer/network guards.
+# This is an ALLOWLIST, deliberately: a denylist of "dangerous" flags is a losing game against a CLI that keeps
+# adding them. Flags that were missed by the previous denylist and that this allowlist now rejects, as examples
+# of what the list has to keep out:
+#   --resume            re-submits the transactions of a cached broadcast. It SENDS while this wrapper's banner
+#                       still says "simulation (no transactions)" - the worst possible failure mode.
+#   --skip-simulation   sends without simulating, defeating the whole point of the default mode.
+#   --private-keys / --accounts / --interactives / -i
+#                       signer flags (plural / count forms) that replace the keystore or key the env file chose,
+#                       so the transactions would be signed by an account this wrapper never validated and never
+#                       printed in its banner.
+# Also kept out, as before: --broadcast / --verify (turn a simulation into a real, irreversible deployment),
+# --rpc-url / --fork-url (point forge at a chain the `cast chain-id` check below never saw - exactly the network
+# mix-up that check exists to prevent), --sender / --account / --ledger / --trezor / --mnemonic* / --keystore*.
+#
+# Everything below is either output-only or a knob on the robustness defaults the README documents as
+# overridable through FORGE_ARGS. Checked here, before the size gate and the first RPC read, so a bad value
+# fails in a second rather than after a full build.
+#
+# Boolean flags: no value of their own.
+# --silent and --json are deliberately NOT here: both suppress the resolved-settings printout that the
+# pre-broadcast banner tells the operator to compare against their env file. Allowing them would turn that
+# mandatory cross-check into a silent no-op.
+ALLOWED_BOOL_ARGS=(--slow --isolate --legacy --force --no-cache)
+# Value flags: "--flag value" or "--flag=value". The value is accepted as-is (it is never a flag itself).
+ALLOWED_VALUE_ARGS=(--gas-estimate-multiplier --gas-price --priority-gas-price --gas-limit --rpc-timeout
+  --timeout --retries --delay --out --cache-path --optimizer-runs --evm-version)
+
+in_list() {
+  local needle="$1" x
+  shift
+  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
+  return 1
+}
+
+reject_forge_arg() {
+  die "FORGE_ARGS in $ENV_FILE contains '$1', which is NOT on this wrapper's allowlist. $2
+  FORGE_ARGS is an allowlist, not a denylist: only these may appear.
+    boolean:  -v/-vv/-vvv/-vvvv/-vvvvv ${ALLOWED_BOOL_ARGS[*]}
+    with a value (--flag value or --flag=value):
+              ${ALLOWED_VALUE_ARGS[*]}
+  To deploy, pass the --broadcast argument to this script. To choose the signer set DEPLOYER_ACCOUNT
+  (+ DEPLOYER_ADDRESS) or PRIVATE_KEY, to choose the network set RPC_URL, and to turn verification on set
+  ETHERSCAN_API_KEY - all in $ENV_FILE, never in FORGE_ARGS."
+}
+
+ARG_COUNT=${#EXTRA_ARGS[@]}
+ai=0
+while [ "$ai" -lt "$ARG_COUNT" ]; do
+  a="${EXTRA_ARGS[$ai]}"
+  case "$a" in
+    --)
+      reject_forge_arg "$a" "Everything after '--' is passed through to the script unchecked."
+      ;;
+    -v | -vv | -vvv | -vvvv | -vvvvv)
+      ai=$((ai + 1))
+      continue
+      ;;
+    -*) ;;
+    *)
+      reject_forge_arg "$a" "FORGE_ARGS takes flags only; a bare word would become a forge positional argument
+  (a script path or a function signature), replacing the script this wrapper runs."
+      ;;
+  esac
+  # --flag=value / --flag value
+  name="${a%%=*}"
+  if [ "$name" = "$a" ]; then has_value=false; else has_value=true; fi
+  if in_list "$name" ${ALLOWED_BOOL_ARGS[@]+"${ALLOWED_BOOL_ARGS[@]}"}; then
+    $has_value && die "FORGE_ARGS in $ENV_FILE contains '$a', but $name takes no value."
+    ai=$((ai + 1))
+  elif in_list "$name" ${ALLOWED_VALUE_ARGS[@]+"${ALLOWED_VALUE_ARGS[@]}"}; then
+    if $has_value; then
+      ai=$((ai + 1))
+    else
+      [ $((ai + 1)) -lt "$ARG_COUNT" ] || die "FORGE_ARGS in $ENV_FILE ends with '$a', which needs a value."
+      # The value must not look like another flag: "--out --slow" would silently eat the next flag.
+      case "${EXTRA_ARGS[$((ai + 1))]}" in
+        -*) die "FORGE_ARGS in $ENV_FILE has '$a' followed by '${EXTRA_ARGS[$((ai + 1))]}', which is a flag, not a value." ;;
+      esac
+      ai=$((ai + 2))
+    fi
+  else
+    reject_forge_arg "$a" "It is not one of the flags this wrapper accepts."
+  fi
+done
+unset ARG_COUNT ai name has_value
+
+# --verify-only: the mode is chosen on the command line, never by the env file, so a stray VERIFY_ONLY=true in
+# deploy/v050/<network>.env can neither turn a deployment into a no-op nor the other way round.
+if $VERIFY_ONLY_MODE; then
+  for v in VERIFY_STAKING VERIFY_CONTROLLER DEPLOYER_ADDRESS; do
+    is_addr "${!v:-}" || die "--verify-only needs $v in $ENV_FILE to be a 0x address (got '${!v:-<unset>}').
+  VERIFY_STAKING and VERIFY_CONTROLLER are the two deployed contracts to check (see
+  broadcast/DeployV050.s.sol/$EXPECTED_CHAIN_ID/run-latest.json), DEPLOYER_ADDRESS the account that broadcast
+  them: the ownership check accepts either the deployer still owning with NEW_OWNER pending, or NEW_OWNER
+  having already called acceptOwnership() on both contracts - but BOTH must be at the same stage, so a
+  half-finished hand-off (one accepted, one forgotten) fails and names the contract still pending."
+  done
+  VERIFY_ONLY=true
+else
+  VERIFY_ONLY=""
+  VERIFY_STAKING=""
+  VERIFY_CONTROLLER=""
+fi
 if [ -n "${ADMINS:-}" ]; then
   IFS=',' read -r -a ADMIN_LIST <<<"$ADMINS"
   for a in "${ADMIN_LIST[@]}"; do
@@ -228,7 +358,7 @@ cd "$ROOT"
 # contract is otherwise found out on chain, as a failed deployment. v0.5.0 was 957 bytes over for a while with
 # every test green.
 echo "=== contract size check (EIP-170 limit: 24576 bytes) ==="
-forge build --sizes --skip "test/**" --skip "script/**" >/dev/null 2>&1 \
+"$FORGE" build --sizes --skip "test/**" --skip "script/**" >/dev/null 2>&1 \
   || die "a contract is over the 24,576-byte runtime limit (or src does not compile) and cannot be deployed. See: forge build --sizes --skip 'test/**' --skip 'script/**'"
 
 # The RPC must be the network the env file is for. ETH_RPC_URL keeps the URL out of cast's argv.
@@ -284,15 +414,14 @@ unset POLYGONSCAN_API_KEY VERIFY_KEY
 for v in "${SCRIPT_VARS[@]}" "${FORGE_VARS[@]}"; do
   export "$v=${!v:-}"
 done
-
-# shellcheck disable=SC2206
-EXTRA_ARGS=(${FORGE_ARGS:-})
+# DEPLOYER_ADDRESS is wrapper-only in every other mode; verify-only is the one where the Solidity script reads it.
+if $VERIFY_ONLY_MODE; then export DEPLOYER_ADDRESS; fi
 
 # FORGE_ARGS wins: a flag named there is not added again (forge would see it twice).
 forge_args_has() {
   local a
   for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
-    [ "$a" = "$1" ] && return 0
+    [ "${a%%=*}" = "$1" ] && return 0
   done
   return 1
 }
@@ -321,7 +450,13 @@ echo "=== deploy-v050: $NETWORK ==="
 show "env file" "${ENV_FILE#"$ROOT"/}"
 show "chain id" "$CHAIN_ID"
 show "rpc" "$RPC_HOST/... (alias deploy-v050)"
-show "mode" "$($BROADCAST && echo 'BROADCAST' || echo 'simulation (no transactions)')"
+if $VERIFY_ONLY_MODE; then
+  show "mode" "VERIFY-ONLY (no transactions; checks the contracts below as they are on chain)"
+  show "VERIFY_STAKING" "$VERIFY_STAKING"
+  show "VERIFY_CONTROLLER" "$VERIFY_CONTROLLER"
+else
+  show "mode" "$($BROADCAST && echo 'BROADCAST' || echo 'simulation (no transactions)')"
+fi
 show "SOURCE_STAKING" "${SOURCE_STAKING:-<empty: per-chain table in DeployV050.s.sol>}"
 show "REQUIREMENT_CHECKER_V2" "${REQUIREMENT_CHECKER_V2:-<empty: per-chain table in DeployV050.s.sol>}"
 show "VOUCHER_SIGNER" "$VOUCHER_SIGNER"
@@ -338,6 +473,7 @@ show "REWARD_TOP_UP" "${REWARD_TOP_UP:-0 (empty: default, no funding)}"
 show "WALLET_LIMITS_FILE" "${WALLET_LIMITS_FILE:-<empty: none>}"
 show "RESUME_STAKING" "${RESUME_STAKING:-<empty: deploy a new staking contract>}"
 show "RESUME_CONTROLLER" "${RESUME_CONTROLLER:-<empty: deploy a new LimitController>}"
+show "ALLOW_SHARED_ROLES" "${ALLOW_SHARED_ROLES:-false (empty: default, a shared role FAILS the preflight)}"
 show "DEPLOYER_ADDRESS" "${DEPLOYER_ADDRESS:-<empty>}"
 show "signer" "$SIGNER_DESC"
 show "verify" "$([ ${#VERIFY_ARGS[@]} -gt 0 ] && echo yes || echo no)"

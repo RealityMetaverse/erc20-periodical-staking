@@ -63,9 +63,18 @@ contract RequirementChecker is Ownable, Errors {
     }
 
     /// @notice Set required worth for a specific phase period
+    /// @dev 0 does NOT mean "no requirement": it clears the override, so the cell falls back to
+    ///      defaultRequiredWorth (see getRequiredWorth).
+    ///      THERE IS NO PER-CELL EXEMPTION while defaultRequiredWorth is non-zero. meetsRequirement short-
+    ///      circuits to true only when the RESOLVED requirement is 0, and a resolved 0 is unreachable for a
+    ///      single cell: storing 0 here just re-exposes the non-zero default. 1 is the smallest reachable
+    ///      threshold, and it is a real threshold, not an exemption -- `worth >= 1` still fails for a wallet
+    ///      with zero worth. The only way to exempt is to set defaultRequiredWorth to 0 (and leave, or clear,
+    ///      the cell's override), which exempts every cell that has no non-zero override.
     /// @param phase The staking phase
     /// @param period The staking period
-    /// @param newRequiredWorth The required worth amount (0 means no requirement for this phase/period)
+    /// @param newRequiredWorth The required worth amount (0 clears the override and falls back to
+    ///        defaultRequiredWorth; 1 is the lowest non-zero threshold, which a zero-worth wallet still fails)
     function setRequiredWorthPhasePeriod(uint256 phase, uint256 period, uint256 newRequiredWorth) external onlyOwner {
         _setRequiredWorthPhasePeriod(phase, period, newRequiredWorth);
     }

@@ -48,6 +48,9 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit RemoveContractAdmin(userAddress);
     }
 
+    /// @notice Set the smallest amount a single stake may be. 0 is rejected.
+    /// @dev The name is misspelled ("Miniumum") ON PURPOSE: it is the selector v0.2.4 shipped with and the ops
+    ///      tooling calls. Kept for ABI compatibility -- do not "fix" it, a correctly spelled setter does not exist.
     function setMiniumumDeposit(uint256 newMinimumDeposit) external onlyContractOwner {
         if (newMinimumDeposit == 0) revert InvalidMinimumDeposit(newMinimumDeposit, 1);
         minimumDeposit = SafeCast.toUint128(newMinimumDeposit);
@@ -65,10 +68,38 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit UpdateActionAvailability(action, changeTo);
     }
 
+    /// @notice Close staking. Admins and the owner. Emits the same UpdateActionAvailability(STAKING, false) as
+    ///         the owner path.
+    /// @dev One-way on purpose: an admin can only CLOSE, and only STAKING. Reopening stays owner-only
+    ///      (changeActionAvailability), and withdrawals and claims are not reachable from here, so this can
+    ///      never trap funds. It is the fast response to a leaked voucher signing key, where waiting on the
+    ///      owner key may be too slow. Idempotent: closing twice writes and emits again.
+    function closeStaking() external onlyAdmins {
+        stakingOpen = false;
+
+        emit UpdateActionAvailability(Types.DataType.STAKING, false);
+    }
+
     // ======================================
     // =       Phase Period Management      =
     // ======================================
-    /// @param apyForEachStakingPeriod Base APY per period, in bps (10_000 = 100%); 0 is rejected
+    /// @dev Hard upper bounds on what may enter the configuration. Without them a typo is accepted silently and
+    ///      only shows up later as a SafeCast revert on every stake in the cell: base + extra APY must fit the
+    ///      deposit's uint32 apyBps (1_000_000 + 1_000_000 does), and now + period must fit its uint40 end date.
+    uint256 internal constant MAX_APY_BPS = 1_000_000; // 10_000%
+    uint256 internal constant MAX_PERIOD_DAYS = 36_500; // ~100 years
+
+    /// @dev Shared validator for every place a base APY or a staking period enters the configuration
+    ///      (pushStakingPhase, addStakingPeriod, setPhasePeriodData). APY 0 is rejected because APY != 0 is how
+    ///      stakeWithVoucher recognises a configured cell.
+    function _checkApyAndPeriod(uint256 apyBps, uint256 stakingPeriod) private pure {
+        if (apyBps == 0) revert InvalidAPY(0, 1);
+        if (apyBps > MAX_APY_BPS) revert ValueTooHigh(apyBps, MAX_APY_BPS);
+        if (stakingPeriod > MAX_PERIOD_DAYS) revert ValueTooHigh(stakingPeriod, MAX_PERIOD_DAYS);
+    }
+
+    /// @param apyForEachStakingPeriod Base APY per period, in bps (10_000 = 100%); 0 and anything above
+    ///        1_000_000 are rejected
     function pushStakingPhase(uint256[] memory apyForEachStakingPeriod, uint256[] memory targetForEachStakingPeriod)
         external
         onlyContractOwner
@@ -88,7 +119,8 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
 
         uint256 newStakingPhaseIndex = stakingPhaseCount;
         for (uint256 i = 0; i < stakingPeriodCount;) {
-            if (apyForEachStakingPeriod[i] == 0) revert InvalidAPY(0, 1);
+            // Periods already in stakingPeriodList were bounded when they were added.
+            _checkApyAndPeriod(apyForEachStakingPeriod[i], 0);
             phasePeriodDataList[Types.PhasePeriodDataType.APY][newStakingPhaseIndex][stakingPeriodList[i]] =
                 apyForEachStakingPeriod[i];
             phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][newStakingPhaseIndex][stakingPeriodList[i]] =
@@ -106,6 +138,10 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     /// @notice Remove the last staking phase's configuration (APY and target for every period).
     /// @dev Accounting (STAKED, user/total data, rewardPool) is never touched: deposits opened on the
     ///      removed phase stay claimable and withdrawable. Gas is O(periods), independent of staker count.
+    ///      WARNING: popping the phase that is CURRENT rolls currentStakingPhase back by one, which RE-OPENS the
+    ///      previous phase for new stakes at its own APYs and targets (ChangeStakingPhase is emitted for it). If
+    ///      that is not intended, close staking first or push the replacement phase and switch to it before
+    ///      popping.
     function popStakingPhase() external onlyContractOwner {
         uint256 phaseCount = stakingPhaseCount;
         if (phaseCount == 0) revert NoStakingPhasesAddedYet();
@@ -120,19 +156,30 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         }
 
         stakingPhaseCount = uint32(lastStakingPhase);
-        uint256 currentPhase = currentStakingPhase;
-        if (currentPhase != 0 && currentPhase == lastStakingPhase) currentStakingPhase = uint32(currentPhase - 1);
 
         emit RemoveStakingPhase(lastStakingPhase);
+
+        uint256 currentPhase = currentStakingPhase;
+        if (currentPhase != 0 && currentPhase == lastStakingPhase) {
+            unchecked {
+                --currentPhase;
+            }
+            currentStakingPhase = uint32(currentPhase);
+            emit ChangeStakingPhase(currentPhase);
+        }
     }
 
-    /// @param apyForEachStakingPhase Base APY per phase, in bps (10_000 = 100%); 0 is rejected
+    /// @param newStakingPeriod Period in days (0 = indefinite); anything above 36_500 is rejected
+    /// @param apyForEachStakingPhase Base APY per phase, in bps (10_000 = 100%); 0 and anything above
+    ///        1_000_000 are rejected
     function addStakingPeriod(
         uint256 newStakingPeriod,
         uint256[] memory apyForEachStakingPhase,
         uint256[] memory targetForEachStakingPhase
     ) external onlyContractOwner {
         if (checkIfStakingPeriodExists(newStakingPeriod)) revert StakingPeriodExists(newStakingPeriod);
+        // Up front, not only in the loop below: with no phases pushed yet the loop never runs.
+        _checkApyAndPeriod(1, newStakingPeriod);
 
         uint256 phaseCount = stakingPhaseCount;
         if (apyForEachStakingPhase.length != phaseCount || targetForEachStakingPhase.length != phaseCount) {
@@ -147,7 +194,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         stakingPeriodList.sortStorage();
 
         for (uint256 phase = 0; phase < phaseCount;) {
-            if (apyForEachStakingPhase[phase] == 0) revert InvalidAPY(0, 1);
+            _checkApyAndPeriod(apyForEachStakingPhase[phase], 0);
             phasePeriodDataList[Types.PhasePeriodDataType.APY][phase][newStakingPeriod] = apyForEachStakingPhase[phase];
             phasePeriodDataList[Types.PhasePeriodDataType.STAKING_TARGET][phase][newStakingPeriod] =
                 targetForEachStakingPhase[phase];
@@ -181,7 +228,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit RemoveStakingPeriod(stakingPeriod);
     }
 
-    /// @dev APY values are bps (10_000 = 100%); APY 0 is rejected.
+    /// @dev APY values are bps (10_000 = 100%); APY 0 and anything above 1_000_000 are rejected.
     function setPhasePeriodData(
         Types.PhasePeriodDataType dataType,
         uint256 stakingPhase,
@@ -189,7 +236,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         uint256 newValue
     ) external onlyContractOwner {
         if (dataType == Types.PhasePeriodDataType.STAKED) revert InvalidDataType();
-        if (dataType == Types.PhasePeriodDataType.APY && newValue == 0) revert InvalidAPY(newValue, 1);
+        if (dataType == Types.PhasePeriodDataType.APY) _checkApyAndPeriod(newValue, 0);
         _checkIfStakingPhasePeriodExists(stakingPhase, stakingPeriod);
         phasePeriodDataList[dataType][stakingPhase][stakingPeriod] = newValue;
 
@@ -216,14 +263,28 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     // =      Voucher, Limit & Treasury     =
     // ======================================
     /// @notice Set the voucher signer; address(0) disables staking (stakeWithVoucher reverts VoucherSignerNotSet).
+    /// @dev Must be an EOA: signatures are checked with plain ECDSA recovery, so a contract signer (ERC-1271)
+    ///      can never produce a valid voucher. Recoverable -- set an EOA again.
     function setVoucherSigner(address signer) external onlyContractOwner {
         voucherSigner = signer;
         emit UpdateVoucherSigner(signer);
     }
 
-    /// @notice Highest extra APY (bps) a voucher may carry.
+    /// @notice Void every outstanding voucher: increments voucherEpoch, and a voucher is only accepted while
+    ///         its signed `epoch` equals voucherEpoch.
+    /// @dev The response to vouchers that must not be honoured any more (bad batch, suspected leak). It does
+    ///      not stop a leaked key on its own -- the key holder can sign for the new epoch -- so pair it with
+    ///      setVoucherSigner. The backend must read voucherEpoch() and sign the new value afterwards.
+    function bumpVoucherEpoch() external onlyContractOwner {
+        uint64 newEpoch = voucherEpoch + 1;
+        voucherEpoch = newEpoch;
+        emit UpdateVoucherEpoch(newEpoch);
+    }
+
+    /// @notice Highest extra APY (bps) a voucher may carry. At most 1_000_000, the same bound as a base APY.
     function setMaxExtraApyBps(uint256 value) external onlyContractOwner {
-        maxExtraApyBps = SafeCast.toUint32(value);
+        if (value > MAX_APY_BPS) revert ValueTooHigh(value, MAX_APY_BPS);
+        maxExtraApyBps = uint32(value);
         emit UpdateMaxExtraApyBps(value);
     }
 
@@ -244,7 +305,7 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit UpdateMaxExtraLimitPerCell(value);
     }
 
-    /// @notice Furthest ahead of now a voucher's validUntil may sit, in seconds.
+    /// @notice Longest signed lifetime a voucher may have (validUntil - issuedAt), in seconds.
     /// @dev Rejects 0: it would revert every stake, and it reads like "disabled" when it is the opposite. This
     ///      protection has no off switch -- lower it instead.
     function setMaxVoucherValidity(uint256 validitySeconds) external onlyContractOwner {
@@ -253,9 +314,14 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
         emit UpdateMaxVoucherValidity(validitySeconds);
     }
 
-    /// @notice Set the receiver of seized deposits.
+    /// @notice Set the receiver of seized deposits. address(0) and this contract are rejected.
+    /// @dev This contract is rejected (InvalidTreasury) because principal "seized" to it would never leave, would
+    ///      stop being reserved, and could then be taken out through rescueTokens.
+    ///      A treasury the token refuses to pay (a blacklisted address, say) makes every seize revert until the
+    ///      treasury is changed; nothing is lost, the deposits stay frozen meanwhile.
     function setTreasury(address newTreasury) external onlyContractOwner {
         if (newTreasury == address(0)) revert ZeroAddressProvided();
+        if (newTreasury == address(this)) revert InvalidTreasury();
         treasury = newTreasury;
         emit UpdateTreasury(newTreasury);
     }
@@ -265,9 +331,20 @@ abstract contract AdministrativeFunctions is ComplianceCheck {
     /// @dev The bonus accounting trusts this contract's `getAllowedAndUsed`: `used` MUST include this staking
     ///      contract's own open stake. A controller that excludes it makes the bonus meter exceed `used`, so the
     ///      saturation in stakeWithVoucher stops being defensive and base room is handed back that the wallet
-    ///      has already spent. Point this only at a controller whose stakingContract() is this address.
-    /// @param controllerAddress The address of the LimitController contract
+    ///      has already spent. Enforced as far as it can be on-chain: a non-zero controller must answer
+    ///      stakingContract() with this address, otherwise the call reverts LimitControllerMismatch (or without
+    ///      data, if the address does not implement stakingContract() at all). In LimitController that value is
+    ///      immutable, so for that implementation the check is a permanent invariant, not a snapshot; for any
+    ///      other ILimitController implementation it only proves the pairing at install time. Either way it
+    ///      cannot prove the controller's `used` is honest.
+    ///      Swapping controllers while wallets hold bonus open is safe: the meters live here, not in the
+    ///      controller, and release saturates.
+    /// @param controllerAddress The address of the LimitController contract, or address(0) to unset
     function setLimitController(address controllerAddress) external onlyContractOwner {
+        if (controllerAddress != address(0)) {
+            address target = address(ILimitController(controllerAddress).stakingContract());
+            if (target != address(this)) revert LimitControllerMismatch(target);
+        }
         limitController = controllerAddress;
         emit UpdateLimitController(controllerAddress);
     }

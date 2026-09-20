@@ -169,15 +169,17 @@ contract ApyBpsTest is V050Base {
 
     function test_realisticMaxValues_stakeAndClaimWithoutOverflow() external {
         uint256 amount = 1e33; // far beyond any real supply, still < 2^128
-        uint256 baseApyBps = type(uint32).max - MAX_EXTRA_APY_BPS;
+        // The largest base APY the contract accepts since the v0.5.0 audit (#19) is 1_000_000 bps.
+        uint256 baseApyBps = 1_000_000;
+        uint256 maxEffective = baseApyBps + MAX_EXTRA_APY_BPS;
         _openCell(P90, baseApyBps);
         deal(address(token), alice, amount);
-        uint256 expectedReward = _ref(amount, type(uint32).max, P90);
+        uint256 expectedReward = _ref(amount, maxEffective, P90);
         _fundPool(expectedReward);
 
         uint256 n = stakeWith(alice, P90, amount, MAX_EXTRA_APY_BPS, 0);
         ProgramManager.TokenDeposit memory d = _deposit(alice, n);
-        assertEq(d.APY, type(uint32).max, "apy at uint32 max");
+        assertEq(d.APY, maxEffective, "apy at the largest configurable value");
         assertEq(d.amount, amount);
         assertEq(d.rewardGenerated, expectedReward);
 
@@ -197,15 +199,17 @@ contract ApyBpsTest is V050Base {
         assertEq(_deposit(alice, n).rewardGenerated, _ref(amount, 100_000, 36_500), "accrued over 100 years");
     }
 
-    function test_effectiveApyAboveUint32_revertsSafeCast() external {
-        _openCell(P30, type(uint32).max);
-        Types.StakeVoucher memory v = voucherFor(alice, P30, 1, 0);
-        bytes memory sig = signVoucher(v);
-        vm.prank(alice);
-        vm.expectRevert(
-            abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 32, uint256(type(uint32).max) + 1)
-        );
-        staking.stakeWithVoucher(v, sig, ONE, 0);
+    /// @dev Was test_effectiveApyAboveUint32_revertsSafeCast: a base APY of uint32.max used to be accepted and only
+    ///      failed at the deposit push. Since the v0.5.0 audit (#19) it cannot be configured at all, so base + extra
+    ///      (each <= 1_000_000) can never reach the uint32 the deposit stores.
+    function test_effectiveApyAboveUint32_unreachable_apyBounded() external {
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, type(uint32).max, 1_000_000));
+        staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, type(uint32).max);
+
+        _openCell(P30, 1_000_000);
+        staking.setMaxExtraApyBps(1_000_000);
+        uint256 n = stakeWith(alice, P30, ONE, 1_000_000, 0);
+        assertEq(_deposit(alice, n).APY, 2_000_000);
     }
 
     function test_amountAboveUint128_revertsSafeCast() external {
@@ -307,8 +311,12 @@ contract ApyBpsTest is V050Base {
         staking.setMaxExtraApyBps(125);
         assertEq(staking.maxExtraApyBps(), 125);
 
-        uint256 tooBig = uint256(type(uint32).max) + 1;
-        vm.expectRevert(abi.encodeWithSelector(SafeCast.SafeCastOverflowedUintDowncast.selector, 32, tooBig));
+        // Bounded at 1_000_000 bps since the v0.5.0 audit (#19), well inside the uint32 it is stored in.
+        uint256 tooBig = 1_000_001;
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBig, 1_000_000));
+        staking.setMaxExtraApyBps(tooBig);
+        tooBig = uint256(type(uint32).max) + 1;
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBig, 1_000_000));
         staking.setMaxExtraApyBps(tooBig);
 
         vm.prank(admin);

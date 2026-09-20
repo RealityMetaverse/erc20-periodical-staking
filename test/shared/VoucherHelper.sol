@@ -15,7 +15,7 @@ import {OpenLimitController} from "./mocks/OpenLimitController.sol";
 abstract contract VoucherHelper is Test {
     uint256 internal constant VOUCHER_SIGNER_KEY = 0xB0B5;
     bytes32 internal constant VOUCHER_TYPEHASH = keccak256(
-        "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 validUntil,uint256 nonce)"
+        "StakeVoucher(address wallet,uint256 phase,uint256 period,uint256 extraApyBps,uint256 extraLimitTotal,uint256 extraLimitPerCell,uint256 issuedAt,uint256 validUntil,uint256 epoch,uint256 nonce)"
     );
     bytes32 internal constant EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
@@ -33,6 +33,9 @@ abstract contract VoucherHelper is Test {
     Clock internal _voucherClock = new Clock();
 
     mapping(address => uint256) internal _nextVoucherNonce;
+    /// @dev Epoch every helper-built voucher is signed for. 0 matches a fresh contract; a test that calls
+    ///      bumpVoucherEpoch sets this to the new value itself, so the dependency is visible in its body.
+    uint256 internal _voucherEpoch;
     mapping(address => StakingLens) private _lensOf;
     address internal treasury = makeAddr("treasury");
 
@@ -66,7 +69,9 @@ abstract contract VoucherHelper is Test {
                 v.extraApyBps,
                 v.extraLimitTotal,
                 v.extraLimitPerCell,
+                v.issuedAt,
                 v.validUntil,
+                v.epoch,
                 v.nonce
             )
         );
@@ -82,8 +87,8 @@ abstract contract VoucherHelper is Test {
         return abi.encodePacked(r, s, v8);
     }
 
-    /// @dev validUntil is read through Clock rather than `block.timestamp`: with via_ir the Yul optimizer
-    ///      may CSE two timestamp reads in one test body, so a voucher built after a warp would carry the
+    /// @dev issuedAt is the live time and validUntil = issuedAt + VOUCHER_LIFETIME. The time is read through
+    ///      Clock rather than `block.timestamp`: with via_ir the Yul optimizer may CSE two timestamp reads in one test body, so a voucher built after a warp would carry the
     ///      pre-warp time. The external call is an optimization barrier. The nonce is fresh per wallet.
     ///      Single-`extraLimit` form: the wallet's total budget and the per-cell allowance are both that value,
     ///      which is the v0.3.0-shaped grant ("this much bonus, usable anywhere"). Use _makeVoucherBudget to split.
@@ -104,6 +109,7 @@ abstract contract VoucherHelper is Test {
         uint256 extraLimitTotal,
         uint256 extraLimitPerCell
     ) internal returns (Types.StakeVoucher memory) {
+        uint256 issuedAt = _voucherClock.now();
         return Types.StakeVoucher({
             wallet: wallet,
             phase: phase,
@@ -111,7 +117,9 @@ abstract contract VoucherHelper is Test {
             extraApyBps: extraApyBps,
             extraLimitTotal: extraLimitTotal,
             extraLimitPerCell: extraLimitPerCell,
-            validUntil: _voucherClock.now() + VOUCHER_LIFETIME,
+            issuedAt: issuedAt,
+            validUntil: issuedAt + VOUCHER_LIFETIME,
+            epoch: _voucherEpoch,
             nonce: _nextVoucherNonce[wallet]++
         });
     }
