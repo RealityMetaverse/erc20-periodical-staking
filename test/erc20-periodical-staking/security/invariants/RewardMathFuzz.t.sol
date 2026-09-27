@@ -39,8 +39,10 @@ contract RewardMathFuzz is VoucherHelper {
 
     function setUp() external {
         token = new TestToken(18);
-        vm.prank(owner);
+        // startPrank/stopPrank: forge 1.7.1 with dynamic_test_linking does not consume a plain prank on `new`.
+        vm.startPrank(owner);
         staking = new ERC20PeriodicalStaking(address(token));
+        vm.stopPrank();
 
         // Program: period 0 (indefinite) in phase 0 at 20% APY, big target.
         uint256[] memory empty = new uint256[](0);

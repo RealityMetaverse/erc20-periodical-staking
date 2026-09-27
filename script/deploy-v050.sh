@@ -96,6 +96,9 @@ FORGE="${FORGE:-$(command -v forge || echo "$HOME/.foundry/bin/forge")}"
 CAST="${CAST:-$(command -v cast || echo "$HOME/.foundry/bin/cast")}"
 [ -x "$FORGE" ] || die "forge not found (install Foundry or set FORGE)"
 [ -x "$CAST" ] || die "cast not found (install Foundry or set CAST)"
+# foundry.toml turns on dynamic_test_linking for test speed; it also rewrites `new` in script/ to deployCode from a
+# separately compiled artifact. Deployments keep the inlined creation code they have always used.
+export FOUNDRY_DYNAMIC_TEST_LINKING=false
 
 is_addr() { [[ "${1:-}" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }

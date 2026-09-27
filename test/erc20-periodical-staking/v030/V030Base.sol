@@ -4,13 +4,13 @@ pragma solidity 0.8.20;
 import "../functions/ClaimFunctions.sol";
 import "../functions/WithdrawalFunctions.sol";
 import "../../../src/common/Errors.sol";
-import "../../../src/common/Events.sol";
+import {StakingEvents} from "../../shared/StakingEvents.sol";
 import "../../../src/contracts/erc20-periodical-staking/AccessControl.sol";
 
 /// @dev Shared bootstrap for the v0.3.0 unit tests: 1 phase, periods 7 and 90, optionally funded pool.
-///      Inherits Events so tests can `emit` them inside vm.expectEmit blocks. `_now()` (live timestamp,
-///      via_ir-safe) is inherited from TestSetUp; never read `block.timestamp` after a warp in these tests.
-abstract contract V030Base is ClaimFunctions, WithdrawalFunctions, Events {
+///      Inherits StakingEvents (test-side copy of src Events, see that file for why) so tests can `emit` them
+///      inside vm.expectEmit blocks. `_now()` (live timestamp, via_ir-safe) is inherited from TestSetUp; never read `block.timestamp` after a warp in these tests.
+abstract contract V030Base is ClaimFunctions, WithdrawalFunctions, StakingEvents {
     uint256 constant PERIOD_SHORT = 7;
     uint256 constant PERIOD_LONG = 90;
     uint256 constant APY = 3000; // bps

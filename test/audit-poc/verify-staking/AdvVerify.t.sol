@@ -16,7 +16,7 @@ contract AlwaysValid1271 {
 }
 
 /// @notice Adversarial verification of the v0.5.0 audit fixes. Written by a reviewer who did not write them.
-contract AdvVerify is V050Base, Errors {
+contract AdvVerify is V050Base {
     // secp256k1 order
     uint256 internal constant N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
 
@@ -36,7 +36,7 @@ contract AdvVerify is V050Base, Errors {
 
         uint256 apy = _baseApy(staking.currentStakingPhase(), P30);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(InvalidVoucherSignature.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector));
         staking.stakeWithVoucher(v, malleated, 1e18, apy);
     }
 
@@ -54,7 +54,7 @@ contract AdvVerify is V050Base, Errors {
         for (uint256 i = 0; i < bad.length; i++) {
             Types.StakeVoucher memory v = voucherFor(alice, P30, 0, 0);
             vm.prank(alice);
-            vm.expectRevert(abi.encodeWithSelector(InvalidVoucherSignature.selector));
+            vm.expectRevert(abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector));
             staking.stakeWithVoucher(v, bad[i], 1e18, apy);
         }
     }
@@ -69,7 +69,7 @@ contract AdvVerify is V050Base, Errors {
 
         uint256 apy = _baseApy(staking.currentStakingPhase(), P30);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(InvalidVoucherSignature.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidVoucherSignature.selector));
         staking.stakeWithVoucher(v, sig, 1e18, apy);
     }
 
@@ -79,7 +79,7 @@ contract AdvVerify is V050Base, Errors {
         Types.StakeVoucher memory v = voucherFor(alice, P30, 0, 0);
         uint256 apy = _baseApy(staking.currentStakingPhase(), P30);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(VoucherSignerNotSet.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherSignerNotSet.selector));
         staking.stakeWithVoucher(v, new bytes(65), 1e18, apy);
     }
 
@@ -120,7 +120,7 @@ contract AdvVerify is V050Base, Errors {
 
         uint256 apy = _baseApy(staking.currentStakingPhase(), P30);
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(VoucherEpochMismatch.selector, wrapped, uint256(1)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherEpochMismatch.selector, wrapped, uint256(1)));
         staking.stakeWithVoucher(v, sig, 1e18, apy);
     }
 
@@ -134,7 +134,7 @@ contract AdvVerify is V050Base, Errors {
         uint256 apy = _baseApy(staking.currentStakingPhase(), P30);
         uint256 t = _now();
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(VoucherExpired.selector, v.validUntil, t));
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherExpired.selector, v.validUntil, t));
         staking.stakeWithVoucher(v, sig, 1e18, apy);
     }
 
@@ -148,7 +148,7 @@ contract AdvVerify is V050Base, Errors {
         uint256 apy = _baseApy(staking.currentStakingPhase(), P30);
         uint256 t = _now();
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(VoucherNotYetValid.selector, type(uint256).max, t));
+        vm.expectRevert(abi.encodeWithSelector(Errors.VoucherNotYetValid.selector, type(uint256).max, t));
         staking.stakeWithVoucher(v, sig, 1e18, apy);
     }
 
@@ -163,7 +163,7 @@ contract AdvVerify is V050Base, Errors {
 
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(VoucherValidityTooLong.selector, v.validUntil, v.issuedAt + VOUCHER_LIFETIME)
+            abi.encodeWithSelector(Errors.VoucherValidityTooLong.selector, v.validUntil, v.issuedAt + VOUCHER_LIFETIME)
         );
         staking.stakeWithVoucher(v, sig, 1e18, apy);
 
@@ -171,7 +171,7 @@ contract AdvVerify is V050Base, Errors {
         vm.warp(v.validUntil - 1);
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(VoucherValidityTooLong.selector, v.validUntil, v.issuedAt + VOUCHER_LIFETIME)
+            abi.encodeWithSelector(Errors.VoucherValidityTooLong.selector, v.validUntil, v.issuedAt + VOUCHER_LIFETIME)
         );
         staking.stakeWithVoucher(v, sig, 1e18, apy);
     }
@@ -219,17 +219,17 @@ contract AdvVerify is V050Base, Errors {
         uint256[] memory ds = new uint256[](0);
 
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(EmptyBatch.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.EmptyBatch.selector));
         staking.freezeDeposits(ws, ds);
 
-        vm.expectRevert(abi.encodeWithSelector(EmptyBatch.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.EmptyBatch.selector));
         staking.unfreezeDeposits(ws, ds);
 
-        vm.expectRevert(abi.encodeWithSelector(EmptyBatch.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.EmptyBatch.selector));
         staking.seizeDeposits(ws, ds);
 
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(EmptyBatch.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.EmptyBatch.selector));
         staking.setWalletsBlocked(ws, true);
     }
 

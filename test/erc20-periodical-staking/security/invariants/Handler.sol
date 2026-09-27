@@ -122,13 +122,16 @@ contract Handler is VoucherHelper {
         legacy = legacy_;
         token = new TestToken(18); // mints 10M * 1e18 to this handler
 
-        vm.prank(owner);
+        // startPrank/stopPrank rather than prank: with dynamic_test_linking, forge 1.7.1 does not consume a plain
+        // vm.prank on a `new` of a src contract, so it would leak into the next call. Same behaviour otherwise.
+        vm.startPrank(owner);
         if (legacy_) {
             // Same ABI for everything the handler touches; cast to the current type.
             staking = ERC20PeriodicalStaking(address(new LegacyERC20PeriodicalStaking(address(token))));
         } else {
             staking = new ERC20PeriodicalStaking(address(token));
         }
+        vm.stopPrank();
 
         vm.prank(owner);
         staking.addContractAdmin(admin);
