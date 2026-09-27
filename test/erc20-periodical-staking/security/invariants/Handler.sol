@@ -9,6 +9,9 @@ import {ERC20PeriodicalStaking} from
 import {ProgramManager} from "../../../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
 // Pre-fix v0.2.4 sources (git 6d63bbe), mirrored under ./legacy so the suite can prove it detects the
 // known incident without touching src/. Only used when the handler is constructed with legacy=true.
+// Deployed from its artifact (LEGACY_ARTIFACT), not with `new`: `new` would inline and re-optimize (via_ir) the
+// whole v0.2.4 contract inside Handler and, through `new Handler`, inside every suite that deploys the handler. The
+// import stays so that a sparse build (`--match-path` on one suite) still compiles this file and its artifact.
 import {ERC20PeriodicalStaking as LegacyERC20PeriodicalStaking} from
     "./legacy/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 import {Errors} from "../../../../src/common/Errors.sol";
@@ -58,6 +61,10 @@ contract Handler is VoucherHelper {
     uint256 internal constant SEED_POOL = 20_000e18;
 
     bytes4 internal constant PANIC_SELECTOR = 0x4e487b71;
+
+    /// @dev Full path: two contracts are named ERC20PeriodicalStaking (src and this mirror).
+    string internal constant LEGACY_ARTIFACT =
+        "test/erc20-periodical-staking/security/invariants/legacy/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol:ERC20PeriodicalStaking";
 
     // ======================================
     // =          Ghost variables           =
@@ -126,8 +133,10 @@ contract Handler is VoucherHelper {
         // vm.prank on a `new` of a src contract, so it would leak into the next call. Same behaviour otherwise.
         vm.startPrank(owner);
         if (legacy_) {
-            // Same ABI for everything the handler touches; cast to the current type.
-            staking = ERC20PeriodicalStaking(address(new LegacyERC20PeriodicalStaking(address(token))));
+            // Same ABI for everything the handler touches; cast to the current type. forge-std deployCode is
+            // vm.getCode + a CREATE from this contract, i.e. exactly what `new` did (same deployer under the
+            // prank, same nonce, same init code), without embedding the bytecode here.
+            staking = ERC20PeriodicalStaking(deployCode(LEGACY_ARTIFACT, abi.encode(address(token))));
         } else {
             staking = new ERC20PeriodicalStaking(address(token));
         }

@@ -36,6 +36,11 @@ abstract contract InvariantBase is Test {
 
     uint256 internal constant LIVENESS_TOPUP = 1_000_000_000e18;
 
+    /// @dev The handler is deployed from its artifact rather than with `new Handler(...)`, so the suites (and
+    ///      test/v050/HarnessSmoke.t.sol) do not inline and re-optimize (via_ir) its creation code. Handler.sol
+    ///      stays imported (the `handler` field's type), which keeps it in every sparse build.
+    string internal constant HANDLER_ARTIFACT = "test/erc20-periodical-staking/security/invariants/Handler.sol:Handler";
+
     // ======================================
     // =        Fuzzer discovery hooks      =
     // ======================================
@@ -52,7 +57,8 @@ abstract contract InvariantBase is Test {
     // ======================================
     /// @param legacy true = fuzz the mirrored v0.2.4 code (must fail), false = fuzz src (must pass).
     function _deploy(bool legacy) internal {
-        handler = new Handler(legacy);
+        // forge-std deployCode = vm.getCode + CREATE from this contract: same deployer, nonce and address as `new`.
+        handler = Handler(deployCode(HANDLER_ARTIFACT, abi.encode(legacy)));
         staking = handler.staking();
         lens = new StakingLens(staking);
         token = handler.token();

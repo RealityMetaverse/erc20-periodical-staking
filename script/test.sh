@@ -28,13 +28,15 @@
 # 500, ~70 CPU-minutes) are that floor; quick after a src body edit ~1.5-2 min. A src edit OUTSIDE a function body
 # (signature, storage, events, NatSpec, even a comment at contract/file level) changes what every test compiles
 # against, so all shards rebuild: ~13 min full, ~7 min quick. Even a body edit recompiles test files that forge
-# treats as mocks (a contract inheriting a src contract or interface, e.g. RewardMathHarness): the attacks and v030
-# shards then take ~1-1.5 min instead of ~20 s.
+# treats as mocks (a contract inheriting a src contract or interface, e.g. RewardMathHarness); those sit in their
+# own small `mocks` shard (see SHARDS) so the other shards recompile only src (~20 s).
 #
 # Settings (environment):
 #   QUICK_INVARIANT_RUNS  quick mode: runs per invariant campaign (default 32)
 #   INVARIANT_SEED        base seed (decimal); process i uses INVARIANT_SEED+i. Default: random, printed.
-#   INVARIANT_PROCS       invariant processes (default: chosen by memory, see pick_inv_procs; capped at the runs)
+#   INVARIANT_PROCS       invariant processes (default: chosen by memory, see pick_inv_procs; capped at the runs).
+#                         1 = no split by seed: one forge process runs every campaign at full runs on all threads,
+#                         the same search as a plain `forge test` (CI uses this; only the compile is sharded)
 #   UNIT_THREADS          threads per shard for the unit/fuzz tests (default 4; they take seconds per shard)
 #   STEP_TIMEOUT          seconds before any single forge process is killed (default 3600)
 #   FORGE                 forge binary (default: forge on PATH, else ~/.foundry/bin/forge)
@@ -83,10 +85,17 @@ export FOUNDRY_SPARSE_MODE=true
 # ~4-6 min cold, all in parallel). `inv` holds only the invariant campaign suites: the campaigns are the longest
 # work, so that shard must compile first. The other files that import the invariant Handler (HarnessSmoke,
 # RewardMathFuzz, SolvencyPoC) go to the light `misc` shard.
+#
+# `mocks` holds the test files forge treats as mocks (a contract that inherits a src contract, see foundry.toml):
+# they recompile on every src edit, even inside a function body, while every other shard then recompiles only src.
+# Alone in a small shard they do not hold a big one back. Only SaturatingRewardMath.t.sol (RewardMathHarness needs the
+# internal reward function) is one; an interface mock goes in its own file under test/shared/mocks/ instead, so the
+# test files that use it stay ordinary. List a new unavoidable mock here.
 INV_DIR=test/erc20-periodical-staking/security/invariants
-SHARDS=(inv v050a v050b attacks v030 auditA auditB misc)
+SHARDS=(inv v050a v050b attacks v030 auditA auditB misc mocks)
 shard_of() {
   case "$1" in
+    test/erc20-periodical-staking/v030/SaturatingRewardMath.t.sol) echo mocks ;;
     "$INV_DIR"/*Invariants.t.sol) echo inv ;;
     test/v050/HarnessSmoke.t.sol | "$INV_DIR"/*) echo misc ;;
     test/v050/Voucher* | test/v050/ApyBps.t.sol) echo v050a ;;
@@ -227,12 +236,15 @@ pick_inv_procs() {
 # Runs the invariant campaigns: INV_PROCS processes, process i with runs_i runs and seed SEED+i.
 run_invariants() {
   local s="$INV_SHARD" base=$((INV_RUNS / INV_PROCS)) extra=$((INV_RUNS % INV_PROCS)) i runs pids=() rc=0
-  local t0=$SECONDS
+  local t0=$SECONDS jobs=(-j 1)
+  # One process (INVARIANT_PROCS=1, what CI uses): forge runs the campaigns in parallel on its own threads, each with
+  # every run, exactly like a plain `forge test` -- no split by seed.
+  [ "$INV_PROCS" -eq 1 ] && jobs=()
   for ((i = 0; i < INV_PROCS; i++)); do
     runs=$((base + (i < extra ? 1 : 0)))
     echo "$i $runs $((SEED + i))" >>"$LOGS/inv-chunks.txt"
     FOUNDRY_INVARIANT_RUNS="$runs" FG_CACHE="$WORK/$s/pcache/$i" \
-      fg "$s" --junit -j 1 --match-test "$INV_RE" --fuzz-seed "$((SEED + i))" \
+      fg "$s" --junit "${jobs[@]}" --match-test "$INV_RE" --fuzz-seed "$((SEED + i))" \
       >"$LOGS/inv-chunk-$i.xml" 2>"$LOGS/inv-chunk-$i.log" &
     pids+=($!)
     sleep 0.5 # spread the start-up (each process loads every artifact at once), which is the memory peak

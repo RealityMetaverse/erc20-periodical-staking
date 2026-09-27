@@ -27,8 +27,14 @@ contract RewardMathHarness is ERC20PeriodicalStaking {
 contract SaturatingRewardMathTest is V030Base {
     RewardMathHarness harness;
 
+    /// @dev deployCode (a plain CREATE from this contract, like `new`) instead of `new`: RewardMathHarness inherits
+    ///      the staking contract, so it is a forge "mock" and recompiles on every src edit. `new` would also inline
+    ///      its creation code into this test contract and via_ir would optimize the whole staking contract a second
+    ///      time on every such edit.
     function _harness() internal {
-        harness = new RewardMathHarness(address(myToken));
+        harness = RewardMathHarness(
+            deployCode("SaturatingRewardMath.t.sol:RewardMathHarness", abi.encode(address(myToken)))
+        );
     }
 
     function test_ReturnsZeroWhenAlreadyPaidExceedsAccrued() public {
