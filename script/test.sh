@@ -131,15 +131,55 @@ done
 rm -rf "$LOGS"
 mkdir -p "$LOGS"
 
-# On Ctrl-C / SIGTERM, stop every child (forge, solc): ignore the signal here, send it to the process group.
-trap 'trap "" INT TERM; kill -TERM 0 2>/dev/null; exit 130' INT TERM
+# On Ctrl-C / SIGTERM, stop every child (forge, solc). `kill -TERM 0` reaches this script's process group, but GNU
+# timeout puts itself and its command in a process group of their own, which that never reaches (nor does the
+# terminal's Ctrl-C). So every timeout runs through tmo, which records its pid in $PIDS while it runs; the trap sends
+# TERM to each (timeout passes it on to forge and solc, and sends KILL --kill-after later) and waits for them to exit,
+# so a re-run does not start next to the old processes.
+PIDS="$LOGS/pids"
+mkdir -p "$PIDS"
+alive() { local st; read -r _ _ st _ 2>/dev/null <"/proc/$1/stat" && [ "$st" != Z ]; }
+on_signal() {
+  trap '' INT TERM
+  set +e
+  kill -TERM 0 2>/dev/null # the background shells first, so no new timeout starts
+  local f p left=() i
+  for f in "$PIDS"/*; do
+    p="${f##*/}"
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    # Only a live timeout: the pid of one that has just exited may have been reused.
+    [ "$(cat "/proc/$p/comm" 2>/dev/null)" = timeout ] && kill -TERM "$p" 2>/dev/null && left+=("$p")
+  done
+  [ ${#left[@]} -gt 0 ] && note "interrupted: stopping ${#left[@]} forge processes"
+  for ((i = 0; i < 400 && ${#left[@]} > 0; i++)); do # up to 40 s (--kill-after is 30)
+    for p in "${!left[@]}"; do alive "${left[$p]}" || unset 'left[p]'; done
+    [ ${#left[@]} -gt 0 ] && sleep 0.1
+  done
+  exit 130
+}
+trap on_signal INT TERM
+
+# `timeout "$@"` with the same stdin, stdout, stderr and exit status, its pid recorded in $PIDS while it runs (for
+# on_signal). The subshell records its own pid and then execs timeout under it, so there is no moment when a timeout
+# runs unrecorded.
+tmo() {
+  local p rc=0
+  (
+    : >"$PIDS/$BASHPID" || true
+    exec timeout "$@"
+  ) <&0 &
+  p=$!
+  wait "$p" || rc=$?
+  rm -f "$PIDS/$p"
+  return "$rc"
+}
 
 # `forge test` on one shard's files, out and cache, with a hard time limit. Usage: fg <shard> <extra forge args...>
 # FG_CACHE overrides the cache dir (the invariant processes each use a private copy, see run_invariants).
 fg() {
   local s="$1"
   shift
-  timeout --kill-after=30 "$STEP_TIMEOUT" "$FORGE" test --match-path "{${GLOB[$s]}}" \
+  tmo --kill-after=30 "$STEP_TIMEOUT" "$FORGE" test --match-path "{${GLOB[$s]}}" \
     --out "$WORK/$s/out" --cache-path "${FG_CACHE:-$WORK/$s/cache}" "$@"
 }
 
@@ -157,7 +197,7 @@ if [ "$MODE" = list-check ]; then
     export FOUNDRY_OPTIMIZER_DETAILS='{yul=true,yulDetails={stackAllocation=true,optimizerSteps=":"}}'
     ref_args=(--out "$WORK/reference/out" --cache-path "$WORK/reference/cache")
   fi
-  FOUNDRY_SPARSE_MODE=false timeout "$STEP_TIMEOUT" "$FORGE" test --list --json "${ref_args[@]}" \
+  FOUNDRY_SPARSE_MODE=false tmo "$STEP_TIMEOUT" "$FORGE" test --list --json "${ref_args[@]}" \
     >"$LOGS/reference.list.json" 2>"$LOGS/reference.list.log" &
   ref_pid=$!
   unset FOUNDRY_OPTIMIZER_DETAILS # the shards below compile with the real settings
