@@ -88,6 +88,8 @@ FORGE="${FORGE:-$(command -v forge || echo "$HOME/.foundry/bin/forge")}"
 CAST="${CAST:-$(command -v cast || echo "$HOME/.foundry/bin/cast")}"
 [ -x "$FORGE" ] || die "forge not found (install Foundry or set FORGE)"
 [ -x "$CAST" ] || die "cast not found (install Foundry or set CAST)"
+# Same build settings as deploy-v050.sh (see the note there on dynamic_test_linking).
+export FOUNDRY_DYNAMIC_TEST_LINKING=false
 
 is_addr() { [[ "${1:-}" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }

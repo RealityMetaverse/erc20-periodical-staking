@@ -16,13 +16,28 @@ fs_permissions = [
 #   - sparse_mode: `forge test --match-path <file>` compiles only that file and its imports (1-2.5 min cold).
 #   - no_match_path: plain `forge test` leaves the invariant campaigns out.
 # Compiler settings are untouched, so the shipped bytecode is identical in every profile.
-# The full run is `FOUNDRY_PROFILE=full forge test`; CI runs it on every pull request to main.
+# The full run is `FOUNDRY_PROFILE=full forge test`. ./script/test.sh full runs the same tests at the same depth on
+# every core (compile shards in parallel, invariant runs split by seed); CI runs it on every pull request to main
+# with the invariants in one process (no split). ./script/test.sh quick is the dev loop (invariants at fewer runs).
+#   - dynamic_test_linking: `new <src contract>(...)` in test/ and script/ is rewritten to vm.deployCode, so test
+#     files no longer inline (and re-optimize under via_ir) their own copy of ERC20PeriodicalStaking, and a src
+#     body edit recompiles src only (~10 s) instead of every test that imports it. Rules that keep it working:
+#       * a test contract must not INHERIT a src contract (use test/shared/StakingEvents.sol, write
+#         Errors.X.selector). Such a file counts as a "mock": it keeps its inlined copy and recompiles on every
+#         src edit. Only test/.../SaturatingRewardMath.t.sol (RewardMathHarness) is left.
+#       * an interface mock (`X is ILimitController`, ...) goes in its own file under test/shared/mocks/, never
+#         inside a test file that deploys src: the whole file would count as a mock.
+#       * never `vm.prank(x); new <src contract>(...)`: forge 1.7.1 deploys as x but does not spend the prank, so
+#         it also applies to the NEXT call. Use vm.startPrank(x); new ...; vm.stopPrank();
+#     It does not touch src compilation (src-only bytecode identical with and without it).
 sparse_mode = true
+dynamic_test_linking = true
 no_match_path = "test/erc20-periodical-staking/security/invariants/**"
 
 # Everything: all test files compiled, invariant campaigns included. Used by CI and before a release.
 [profile.full]
 sparse_mode = false
+dynamic_test_linking = true
 no_match_path = "test/__none__/**"
 
 # script/deploy-v050.sh passes `--rpc-url deploy-v050` so the RPC URL (which may hold a provider key) stays out of

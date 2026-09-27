@@ -9,7 +9,7 @@ import {Errors} from "../../../src/common/Errors.sol";
 /// @notice Round-2 adversarial verification of the NEW permissionless `advanceCursor`.
 ///         Focus: can a third party HARM a wallet with it, and is the "closed" predicate the scan relies on
 ///         genuinely irreversible?
-contract CursorAdversarial is V050Base, Errors {
+contract CursorAdversarial is V050Base {
     // ------------------------------------------------------------------
     // Harm: a third party must never be able to make a wallet's claimAll pay less
     // ------------------------------------------------------------------
@@ -69,7 +69,7 @@ contract CursorAdversarial is V050Base, Errors {
         assertEq(staking.advanceCursor(alice, 0), 1, "cursor should pass the seized deposit and stop at 1");
 
         // seize cleared FLAG_FROZEN, so unfreeze cannot resurrect it.
-        vm.expectRevert(abi.encodeWithSelector(DepositNotFrozen.selector, alice, uint256(0)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.DepositNotFrozen.selector, alice, uint256(0)));
         staking.unfreezeDeposit(alice, 0);
         assertEq(uint256(_status(alice, 0)), uint256(ProgramManager.DepositStatus.SEIZED));
     }

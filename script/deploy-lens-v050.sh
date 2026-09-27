@@ -27,6 +27,8 @@ source "$ENV_FILE"; set +a
 [[ "${DEPLOYER_ADDRESS:-}" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "DEPLOYER_ADDRESS in $ENV_FILE must be a 0x address"
 
 cd "$ROOT"
+# Same build settings as deploy-v050.sh (see the note there on dynamic_test_linking).
+export FOUNDRY_DYNAMIC_TEST_LINKING=false
 # Same patience as deploy-v050.sh: public endpoints time out and drop requests.
 RPC_TIMEOUT="${RPC_TIMEOUT:-120}"
 TX_TIMEOUT="${TX_TIMEOUT:-600}"

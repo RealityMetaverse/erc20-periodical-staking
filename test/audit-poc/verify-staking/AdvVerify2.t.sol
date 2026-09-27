@@ -10,7 +10,7 @@ import {ERC20PeriodicalStaking} from "../../../src/contracts/erc20-periodical-st
 import {StakingLens} from "../../../src/contracts/erc20-periodical-staking/StakingLens.sol";
 
 /// @notice Second adversarial batch: events, treasury, controller-mismatch durability, APY/period bounds.
-contract AdvVerify2 is V050Base, Errors {
+contract AdvVerify2 is V050Base {
     // ---------------- #16 ----------------
 
     /// @dev FIXED (#16): the stakingContract() check is no longer a snapshot. LimitController.stakingContract
@@ -46,7 +46,7 @@ contract AdvVerify2 is V050Base, Errors {
 
         ERC20PeriodicalStaking other = new ERC20PeriodicalStaking(address(token));
         LimitController foreign = new LimitController(address(other));
-        vm.expectRevert(abi.encodeWithSelector(LimitControllerMismatch.selector, address(other)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.LimitControllerMismatch.selector, address(other)));
         staking.setLimitController(address(foreign));
 
         (bool ok,) = address(foreign).call(
@@ -58,10 +58,10 @@ contract AdvVerify2 is V050Base, Errors {
     // ---------------- #34 ----------------
 
     function test_adv34_treasuryRejectsSelfAndZero() public {
-        vm.expectRevert(abi.encodeWithSelector(InvalidTreasury.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidTreasury.selector));
         staking.setTreasury(address(staking));
 
-        vm.expectRevert(abi.encodeWithSelector(ZeroAddressProvided.selector));
+        vm.expectRevert(abi.encodeWithSelector(Errors.ZeroAddressProvided.selector));
         staking.setTreasury(address(0));
 
         // The lens, another contract, and an EOA are all still accepted (no allow-listing).
@@ -112,28 +112,28 @@ contract AdvVerify2 is V050Base, Errors {
         uint256 tooBigPeriod = 36_501;
 
         // setPhasePeriodData(APY)
-        vm.expectRevert(abi.encodeWithSelector(ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
         staking.setPhasePeriodData(Types.PhasePeriodDataType.APY, 0, P30, tooBigApy);
 
         // setMaxExtraApyBps
-        vm.expectRevert(abi.encodeWithSelector(ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
         staking.setMaxExtraApyBps(tooBigApy);
 
         // pushStakingPhase
         uint256[] memory apys = _fill(3, tooBigApy);
         uint256[] memory targets = _fill(3, TARGET);
-        vm.expectRevert(abi.encodeWithSelector(ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
         staking.pushStakingPhase(apys, targets);
 
         // addStakingPeriod: period bound
         uint256[] memory a2 = _fill(2, uint256(500));
         uint256[] memory t2 = _fill(2, TARGET);
-        vm.expectRevert(abi.encodeWithSelector(ValueTooHigh.selector, tooBigPeriod, uint256(36_500)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBigPeriod, uint256(36_500)));
         staking.addStakingPeriod(tooBigPeriod, a2, t2);
 
         // addStakingPeriod: APY bound
         uint256[] memory a3 = _fill(2, tooBigApy);
-        vm.expectRevert(abi.encodeWithSelector(ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
+        vm.expectRevert(abi.encodeWithSelector(Errors.ValueTooHigh.selector, tooBigApy, uint256(1_000_000)));
         staking.addStakingPeriod(180, a3, t2);
     }
 

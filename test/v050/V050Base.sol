@@ -10,14 +10,14 @@ import {ERC20PeriodicalStaking} from "../../src/contracts/erc20-periodical-staki
 import {ProgramManager} from "../../src/contracts/erc20-periodical-staking/ProgramManager.sol";
 import {LimitController} from "../../src/contracts/LimitController.sol";
 import {Errors} from "../../src/common/Errors.sol";
-import {Events} from "../../src/common/Events.sol";
+import {StakingEvents} from "../shared/StakingEvents.sol";
 import {Types} from "../../src/common/Types.sol";
 
 /// @notice Fixture for the v0.4.0 suites: real LimitController with a mock legacy staking contract, voucher
 ///         signer, treasury, funded pool, 2 phases x periods [0, 30, 90].
-/// @dev Inherits Events so tests can `emit` inside vm.expectEmit. Never read `block.timestamp` after a warp in a
-///      test body (via_ir hazard): use `_now()`.
-abstract contract V050Base is VoucherHelper, Events {
+/// @dev Inherits StakingEvents (test-side copy of src Events, see that file for why) so tests can `emit` inside
+///      vm.expectEmit. Never read `block.timestamp` after a warp in a test body (via_ir hazard): use `_now()`.
+abstract contract V050Base is VoucherHelper, StakingEvents {
     Clock internal clock = new Clock();
 
     uint256 internal constant ONE = 1e18;

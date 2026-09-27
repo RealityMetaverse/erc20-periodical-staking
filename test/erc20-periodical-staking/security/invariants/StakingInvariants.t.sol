@@ -64,11 +64,18 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
         vm.stopPrank();
         uint256 env = vm.snapshot();
 
+        SeizeStart memory start;
+        bool haveStart;
         for (uint256 u = 0; u < users.length; u++) {
             uint256 count = staking.checkDepositCountOfAddress(users[u]);
             for (uint256 i = 0; i < count; i++) {
                 if (!staking.isDepositFrozen(users[u], i)) continue;
-                string memory why = _trySeize(users[u], i, treasury, env);
+                // Read once, at the first frozen deposit, in the `env` state -- the state every trial starts from.
+                if (!haveStart) {
+                    start = _seizeStart(users, treasury);
+                    haveStart = true;
+                }
+                string memory why = _trySeize(users[u], i, start, env);
                 if (bytes(why).length != 0) {
                     failureCount++;
                     failures = string.concat(
@@ -83,20 +90,41 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
         assertEq(failureCount, 0, string.concat("FROZEN DEPOSITS NOT SEIZABLE:", failures));
     }
 
+    /// @dev Values of the `env` state that every seize trial used to re-read for itself before its seize. Every trial
+    ///      starts from that same state (vm.revertTo(env)), so reading them once gives each trial identical values.
+    struct SeizeStart {
+        address treasury;
+        uint256 treasuryBalance; // token.balanceOf(treasury)
+        uint256 excess; // _excess()
+        uint256 rewardPool;
+        uint256 openReserved; // _openPeriodicalRewardSum(): sum of _openPeriodicalReward over every user deposit
+    }
+
+    function _seizeStart(address[] memory users, address treasury) private view returns (SeizeStart memory s) {
+        s.treasury = treasury;
+        s.treasuryBalance = token.balanceOf(treasury);
+        s.excess = _excess();
+        s.rewardPool = staking.rewardPool();
+        s.openReserved = _openPeriodicalRewardSum(users);
+    }
+
     /// @dev Runs one seize from the `env` snapshot (all actions closed), reverts back to it, and returns a
     ///      non-empty reason on any mismatch.
-    function _trySeize(address user, uint256 idx, address treasury, uint256 env) private returns (string memory why) {
+    function _trySeize(address user, uint256 idx, SeizeStart memory start, uint256 env)
+        private
+        returns (string memory why)
+    {
         ProgramManager.TokenDeposit memory d = staking.getDeposit(user, idx);
         uint256 cellBefore = staking.getUserPhasePeriodData(Types.DataType.STAKING, user, d.stakingPhase, d.stakingPeriod);
-        uint256 treasuryBefore = token.balanceOf(treasury);
-        uint256 excessBefore = _excess();
-        uint256 poolBefore = staking.rewardPool();
+        _requireDepositSlotLayout(user, idx, d.amount);
 
+        vm.record(); // the seize's own storage writes, for _reservationMatchesAfterSeize
         vm.prank(owner);
         try staking.seizeDeposit(user, idx) {
-            if (token.balanceOf(treasury) - treasuryBefore != d.amount) {
+            (, bytes32[] memory seizeWrites) = vm.accesses(address(staking));
+            if (token.balanceOf(start.treasury) - start.treasuryBalance != d.amount) {
                 why = "payout != principal";
-            } else if (staking.rewardPool() != poolBefore) {
+            } else if (staking.rewardPool() != start.rewardPool) {
                 why = "seize moved rewardPool";
             } else if (staking.checkDepositStatus(user, idx) != ProgramManager.DepositStatus.SEIZED) {
                 why = "status != SEIZED";
@@ -105,9 +133,9 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
                     != cellBefore - d.amount
             ) {
                 why = "STAKING cell not freed";
-            } else if (_excess() != excessBefore) {
+            } else if (_excess() != start.excess) {
                 why = "balance - (staked + pool) changed";
-            } else if (!_reservationMatchesOpenDeposits()) {
+            } else if (!_reservationMatchesAfterSeize(user, idx, d, start.openReserved, seizeWrites)) {
                 why = "REWARD_EXPECTED != open periodical rewards";
             } else {
                 why = _checkSeizedIsFinal(user, idx);
@@ -142,18 +170,97 @@ abstract contract EnforcementInvariantChecks is InvariantBase {
         return token.balanceOf(address(staking)) - staking.totalDataList(Types.DataType.STAKING) - staking.rewardPool();
     }
 
+    /// @dev Full rescan: REWARD_EXPECTED == sum of rewardGenerated over every open periodical deposit of every user.
     function _reservationMatchesOpenDeposits() private view returns (bool) {
-        address[] memory users = handler.getUsers();
-        uint256 total;
+        return _openPeriodicalRewardSum(handler.getUsers()) == staking.totalDataList(Types.DataType.REWARD_EXPECTED);
+    }
+
+    function _openPeriodicalRewardSum(address[] memory users) private view returns (uint256 total) {
         for (uint256 u = 0; u < users.length; u++) {
             // one call per user; getDepositsInRangeBy returns exactly getDeposit(user, i) for every i
             ProgramManager.TokenDeposit[] memory ds =
                 lens.getDepositsInRangeBy(users[u], 0, staking.checkDepositCountOfAddress(users[u]));
             for (uint256 i = 0; i < ds.length; i++) {
-                if (ds[i].withdrawalDate == 0 && ds[i].stakingEndDate != 0) total += ds[i].rewardGenerated;
+                total += _openPeriodicalReward(ds[i]);
             }
         }
+    }
+
+    /// @dev One deposit's term of _openPeriodicalRewardSum.
+    function _openPeriodicalReward(ProgramManager.TokenDeposit memory d) private pure returns (uint256) {
+        return d.withdrawalDate == 0 && d.stakingEndDate != 0 ? d.rewardGenerated : 0;
+    }
+
+    /// @dev Same result as `_reservationMatchesOpenDeposits()` evaluated right after the seize, without re-reading
+    ///      every deposit of every user in every trial.
+    ///      `openReserved` is _openPeriodicalRewardSum() of the pre-seize `env` state and `before` is
+    ///      getDeposit(user, idx) of that same state. A deposit's term reads getDeposit(u, j).{withdrawalDate,
+    ///      stakingEndDate, rewardGenerated}; with stakingEndDate != 0 the status is never INDEFINITE, so getDeposit
+    ///      returns all three straight from the stored PackedDeposit (slots 0 and 1 of element j), and which j
+    ///      exist depends only on the array length. So when the seize wrote neither any user's stakerDepositList
+    ///      length slot nor any element slot other than (user, idx)'s, every other term -- and the set of terms --
+    ///      is unchanged and the post-seize full sum is exactly openReserved - term(before) + term(after).
+    ///      Otherwise it falls back to the full rescan.
+    function _reservationMatchesAfterSeize(
+        address user,
+        uint256 idx,
+        ProgramManager.TokenDeposit memory before,
+        uint256 openReserved,
+        bytes32[] memory seizeWrites
+    ) private view returns (bool) {
+        if (_seizeWroteOtherDepositSlots(user, idx, seizeWrites)) return _reservationMatchesOpenDeposits();
+        uint256 total = openReserved + _openPeriodicalReward(staking.getDeposit(user, idx)) - _openPeriodicalReward(before);
         return total == staking.totalDataList(Types.DataType.REWARD_EXPECTED);
+    }
+
+    /// @dev Storage slot of ProgramManager.stakerDepositList, a mapping(address => PackedDeposit[]), per
+    ///      `forge inspect ERC20PeriodicalStaking storageLayout`. The array length of `u` is at
+    ///      keccak256(abi.encode(u, SLOT)); element j occupies the 2 slots at keccak256(lengthSlot) + 2j (+1), with
+    ///      `amount` in the low 128 bits of the first. Checked on every trial by _requireDepositSlotLayout.
+    uint256 private constant STAKER_DEPOSIT_LIST_SLOT = 8;
+
+    function _depositListLengthSlot(address u) private pure returns (uint256) {
+        return uint256(keccak256(abi.encode(u, STAKER_DEPOSIT_LIST_SLOT)));
+    }
+
+    /// @dev Test-harness guard, not a protocol property: reverts (failing the invariant with this message) if
+    ///      STAKER_DEPOSIT_LIST_SLOT no longer points at stakerDepositList after a src storage change, so the slot
+    ///      arithmetic in _seizeWroteOtherDepositSlots never silently looks at the wrong place.
+    function _requireDepositSlotLayout(address user, uint256 idx, uint256 amount) private view {
+        uint256 lenSlot = _depositListLengthSlot(user);
+        uint256 slot0 = uint256(vm.load(address(staking), bytes32(uint256(keccak256(abi.encode(lenSlot))) + 2 * idx)));
+        require(
+            uint256(vm.load(address(staking), bytes32(lenSlot))) == staking.checkDepositCountOfAddress(user)
+                && uint128(slot0) == amount,
+            "test harness: STAKER_DEPOSIT_LIST_SLOT no longer matches stakerDepositList (forge inspect storageLayout)"
+        );
+    }
+
+    /// @dev True if any written slot is a handler user's stakerDepositList length slot, or lies in a handler user's
+    ///      element area (any index, existing or not) other than the two slots of (user, idx).
+    function _seizeWroteOtherDepositSlots(address user, uint256 idx, bytes32[] memory writes)
+        private
+        view
+        returns (bool)
+    {
+        address[] memory users = handler.getUsers();
+        uint256[] memory lenSlots = new uint256[](users.length);
+        uint256[] memory bases = new uint256[](users.length);
+        for (uint256 u = 0; u < users.length; u++) {
+            lenSlots[u] = _depositListLengthSlot(users[u]);
+            bases[u] = uint256(keccak256(abi.encode(lenSlots[u])));
+        }
+        for (uint256 w = 0; w < writes.length; w++) {
+            uint256 s = uint256(writes[w]);
+            for (uint256 u = 0; u < users.length; u++) {
+                if (s == lenSlots[u]) return true;
+                // 2^64 elements is far beyond any array here; bases are keccak outputs, so no user areas overlap.
+                if (s >= bases[u] && s - bases[u] < (1 << 65)) {
+                    if (users[u] != user || (s - bases[u]) / 2 != idx) return true;
+                }
+            }
+        }
+        return false;
     }
 }
 

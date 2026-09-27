@@ -36,6 +36,11 @@ abstract contract InvariantBase is Test {
 
     uint256 internal constant LIVENESS_TOPUP = 1_000_000_000e18;
 
+    /// @dev The handler is deployed from its artifact rather than with `new Handler(...)`, so the suites (and
+    ///      test/v050/HarnessSmoke.t.sol) do not inline and re-optimize (via_ir) its creation code. Handler.sol
+    ///      stays imported (the `handler` field's type), which keeps it in every sparse build.
+    string internal constant HANDLER_ARTIFACT = "test/erc20-periodical-staking/security/invariants/Handler.sol:Handler";
+
     // ======================================
     // =        Fuzzer discovery hooks      =
     // ======================================
@@ -52,7 +57,8 @@ abstract contract InvariantBase is Test {
     // ======================================
     /// @param legacy true = fuzz the mirrored v0.2.4 code (must fail), false = fuzz src (must pass).
     function _deploy(bool legacy) internal {
-        handler = new Handler(legacy);
+        // forge-std deployCode = vm.getCode + CREATE from this contract: same deployer, nonce and address as `new`.
+        handler = Handler(deployCode(HANDLER_ARTIFACT, abi.encode(legacy)));
         staking = handler.staking();
         lens = new StakingLens(staking);
         token = handler.token();
@@ -92,11 +98,26 @@ abstract contract InvariantBase is Test {
         staking.changeActionAvailability(Types.DataType.CLAIM, true);
         vm.stopPrank();
 
-        deal(address(token), admin, LIVENESS_TOPUP);
+        _setBalance(admin, LIVENESS_TOPUP);
         vm.startPrank(admin);
         token.approve(address(staking), type(uint256).max);
         staking.provideReward(LIVENESS_TOPUP);
         vm.stopPrank();
+    }
+
+    /// @dev Same state change as forge-std `deal(address(token), who, amount)` (no totalSupply adjust): one
+    ///      vm.store of `amount` into who's balance slot. deal() rediscovers that slot with a stdstore search
+    ///      (vm.record, probing stores, several balanceOf calls) on every call, once per check. TestToken is OZ v5
+    ///      ERC20, whose `_balances` mapping is slot 0, so the slot is computed directly. The require is a
+    ///      test-harness guard: if TestToken's layout ever changes, the check fails loudly instead of writing
+    ///      somewhere else.
+    function _setBalance(address who, uint256 amount) internal {
+        bytes32 slot = keccak256(abi.encode(who, uint256(0)));
+        require(
+            uint256(vm.load(address(token), slot)) == token.balanceOf(who),
+            "test harness: TestToken _balances is no longer at slot 0"
+        );
+        vm.store(address(token), slot, bytes32(amount));
     }
 
 
@@ -314,11 +335,13 @@ abstract contract InvariantBase is Test {
         uint256 env = vm.snapshot();
 
         for (uint256 u = 0; u < users.length; u++) {
-            ProgramManager.TokenDeposit[] memory ds = _depositsOf(users[u]);
-            for (uint256 i = 0; i < ds.length; i++) {
+            uint256 count = staking.checkDepositCountOfAddress(users[u]);
+            for (uint256 i = 0; i < count; i++) {
                 if (!_isOpen(staking.checkDepositStatus(users[u], i)) || _isFrozen(users[u], i)) continue;
 
-                ProgramManager.TokenDeposit memory d = ds[i];
+                // Read only for the deposits that get a trial (was: every deposit, up front, via the lens). Each
+                // trial is rolled back to `env` and the time re-warped to `ts`, so this is the same env-state value.
+                ProgramManager.TokenDeposit memory d = staking.getDeposit(users[u], i);
                 if (d.stakingEndDate != 0 && block.timestamp < d.stakingEndDate) vm.warp(d.stakingEndDate);
 
                 bytes memory reason;

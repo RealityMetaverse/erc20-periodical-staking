@@ -10,7 +10,7 @@ import {MockLegacyStaking} from "../../shared/mocks/MockLegacyStaking.sol";
 import {ERC20PeriodicalStaking as LegacyStaking} from
     "../security/invariants/legacy/contracts/erc20-periodical-staking/ERC20PeriodicalStaking.sol";
 
-contract LimitControllerScenarios is LimitControllerFunctions, Errors {
+contract LimitControllerScenarios is LimitControllerFunctions {
     // ======================================
     // =      Constructor Tests             =
     // ======================================
@@ -21,7 +21,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
     }
 
     function test_LimitController_Constructor_ZeroAddress() external {
-        vm.expectRevert(ZeroAddressProvided.selector);
+        vm.expectRevert(Errors.ZeroAddressProvided.selector);
         new LimitController(address(0));
     }
 
@@ -176,7 +176,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         _deployLimitController(address(stakingContract));
 
         vm.prank(limitController.owner());
-        vm.expectRevert(ZeroAddressProvided.selector);
+        vm.expectRevert(Errors.ZeroAddressProvided.selector);
         limitController.setWalletLimit(address(0), 0, 0, 1000 * myTokenDecimals);
     }
 
@@ -264,7 +264,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         limits[2] = 3000 * myTokenDecimals;
 
         vm.prank(limitController.owner());
-        vm.expectRevert(abi.encodeWithSelector(LengthMismatch.selector, wallets.length, limits.length));
+        vm.expectRevert(abi.encodeWithSelector(Errors.LengthMismatch.selector, wallets.length, limits.length));
         limitController.setWalletLimits(wallets, 0, 0, limits);
     }
 
@@ -279,7 +279,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         limits[1] = 2000 * myTokenDecimals;
 
         vm.prank(limitController.owner());
-        vm.expectRevert(ZeroAddressProvided.selector);
+        vm.expectRevert(Errors.ZeroAddressProvided.selector);
         limitController.setWalletLimits(wallets, 0, 0, limits);
     }
 
@@ -400,7 +400,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
 
         // Stake exceeding limit should fail
         _increaseAllowance(userOne, stakeAmount);
-        _expectLimitRevert(userOne, 0, 0, stakeAmount, 0, abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, stakeAmount, limit));
+        _expectLimitRevert(userOne, 0, 0, stakeAmount, 0, abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, stakeAmount, limit));
     }
 
     function test_LimitController_Staking_AtLimit() external {
@@ -459,7 +459,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
             0,
             100 * myTokenDecimals,
             0,
-            abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, 100 * myTokenDecimals, 0)
+            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, 100 * myTokenDecimals, 0)
         );
     }
 
@@ -508,7 +508,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         // Staking with zero limit should fail
         _increaseAllowance(userOne, amountToStake);
         _expectLimitRevert(
-            userOne, 0, 0, amountToStake, 0, abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, amountToStake, 0)
+            userOne, 0, 0, amountToStake, 0, abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, amountToStake, 0)
         );
     }
 
@@ -519,7 +519,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         _setLimitControllerOnStakingContract(address(0));
 
         _increaseAllowance(userOne, amountToStake);
-        _expectLimitRevert(userOne, 0, 0, amountToStake, 0, abi.encodeWithSelector(LimitControllerNotSet.selector));
+        _expectLimitRevert(userOne, 0, 0, amountToStake, 0, abi.encodeWithSelector(Errors.LimitControllerNotSet.selector));
         assertEq(_getUserDepositCount(userOne), 0);
     }
 
@@ -536,7 +536,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         _setLimitControllerOnStakingContract(address(0));
 
         _increaseAllowance(userOne, amountToStake);
-        _expectLimitRevert(userOne, 0, 0, amountToStake, 0, abi.encodeWithSelector(LimitControllerNotSet.selector));
+        _expectLimitRevert(userOne, 0, 0, amountToStake, 0, abi.encodeWithSelector(Errors.LimitControllerNotSet.selector));
 
         // Re-enabling restores staking within the limit.
         _setLimitControllerOnStakingContract(address(limitController));
@@ -610,7 +610,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
             0,
             limit + extra + 1,
             extra,
-            abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, limit + extra + 1, limit + extra)
+            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, limit + extra + 1, limit + extra)
         );
 
         _stakeVWith(stakingContract, userOne, 0, 0, limit + extra, 0, extra);
@@ -621,10 +621,10 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
 
         // A later voucher with the same extra has no headroom left; one without extra neither.
         _expectLimitRevert(
-            userOne, 0, 0, 1e18, extra, abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, 1e18, 0)
+            userOne, 0, 0, 1e18, extra, abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, 1e18, 0)
         );
         _expectLimitRevert(
-            userOne, 0, 0, 1e18, 0, abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, 1e18, 0)
+            userOne, 0, 0, 1e18, 0, abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, 1e18, 0)
         );
 
         // A bigger extra gives exactly the difference.
@@ -656,7 +656,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
             0,
             headroom + 1,
             extra,
-            abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, headroom + 1, headroom)
+            abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, headroom + 1, headroom)
         );
         if (headroom >= minDeposit) {
             _stakeVWith(stakingContract, userOne, 0, 0, headroom, 0, extra);
@@ -732,7 +732,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
 
         _increaseAllowance(userOne, 1000e18);
         _expectLimitRevert(
-            userOne, 0, 0, 41e18, 0, abi.encodeWithSelector(StakingLimitExceeded.selector, userOne, 0, 0, 41e18, 40e18)
+            userOne, 0, 0, 41e18, 0, abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userOne, 0, 0, 41e18, 40e18)
         );
         _stakeV(stakingContract, userOne, 0, 0, 40e18);
         (, used) = limitController.getAllowedAndUsed(userOne, 0, 0);
@@ -794,7 +794,7 @@ contract LimitControllerScenarios is LimitControllerFunctions, Errors {
         _increaseAllowance(userTwo, 1000e18);
         _stakeV(stakingContract, userTwo, 0, 0, 20e18);
         _expectLimitRevert(
-            userTwo, 0, 0, 1e18, 0, abi.encodeWithSelector(StakingLimitExceeded.selector, userTwo, 0, 0, 1e18, 0)
+            userTwo, 0, 0, 1e18, 0, abi.encodeWithSelector(Errors.StakingLimitExceeded.selector, userTwo, 0, 0, 1e18, 0)
         );
         _stakeVWith(stakingContract, userTwo, 0, 0, 5e18, 0, 5e18);
         assertEq(limitController.getUsed(userTwo, 0, 0), 55e18);
